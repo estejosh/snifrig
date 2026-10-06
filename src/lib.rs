@@ -229,6 +229,7 @@ struct Mon {
     alert_times: VecDeque<f64>,
     spawner: String,
     last_burst: f64,
+    rebase: bool,
 }
 
 impl Mon {
@@ -237,7 +238,7 @@ impl Mon {
             dir, interval, buf: vec![0u8; 1 << 20], cycle: 0, series: HashMap::new(), cool: HashMap::new(),
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
-            last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9,
+            last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9, rebase: false,
         }
     }
 
@@ -254,6 +255,11 @@ impl Mon {
         self.alert_times.push_back(t);
         append_capped(&self.dir.join("alerts.jsonl"), &line, ALERT_CAP);
         if !self.quiet { println!("ALERT {} {}", iso(t), msg); }
+        if let Some(u) = fs::read_to_string(self.dir.join("webhook.txt")).ok().map(|s| s.trim().to_string()).filter(|s| s.starts_with("http")) {
+            let body = format!("{{\"source\":\"snifrig\",\"host\":\"{}\",\"t\":\"{}\",\"key\":\"{}\",\"msg\":\"{}\"}}", esc(&std::env::var("COMPUTERNAME").unwrap_or_default()), iso(t), esc(key), esc(msg));
+            post_json(&u, &body);
+            self.rebase = true;
+        }
     }
 }
 
@@ -387,8 +393,8 @@ impl Mon {
         while self.alert_times.front().map_or(false, |&x| t - x > REALERT_SECS) { self.alert_times.pop_front(); }
         let level = if self.alert_times.is_empty() { "ok" } else { "alert" };
         let msg: String = self.last_alert_msg.chars().take(180).collect();
-        let line = format!("{{\"unix\":{:.0},\"level\":\"{}\",\"avail_mb\":{:.0},\"commit_mb\":{:.0},\"alerts_2h\":{},\"last_alert_unix\":{:.0},\"last_alert\":\"{}\"}}",
-            t, level, g.avail_mb, g.commit_mb, self.alert_times.len(), self.last_alert_t, esc(&msg));
+        let line = format!("{{\"unix\":{:.0},\"level\":\"{}\",\"avail_mb\":{:.0},\"commit_mb\":{:.0},\"alerts_2h\":{},\"last_alert_unix\":{:.0},\"last_alert\":\"{}\",\"paused_until\":{:.0}}}",
+            t, level, g.avail_mb, g.commit_mb, self.alert_times.len(), self.last_alert_t, esc(&msg), paused_until(&self.dir));
         let _ = fs::write(self.dir.join("status.json"), line);
     }
 
@@ -401,7 +407,7 @@ impl Mon {
             }
         }
         self.last_own = Some((t, o.cpu));
-        if self.cycle == 3 { self.base = Some((o.private, o.handles)); self.base_threads = o.threads; }
+        if self.cycle == 3 || self.rebase { self.rebase = false; self.base = Some((o.private, o.handles)); self.base_threads = o.threads; }
         let mut why = Vec::new();
         if mb(o.ws) > 48.0 { why.push(format!("working set {:.1} MB over 48", mb(o.ws))); }
         if o.threads > 8 { why.push(format!("{} threads over 8", o.threads)); }
@@ -531,6 +537,9 @@ fn usage() {
     println!("  snifrig --once [--sample SECS]     print a report now (2 samples, default 10 s apart)");
     println!("  snifrig [--interval SECS]          watch loop (default 60), alerts to alerts.jsonl");
     println!("  snifrig install                    start at login (hidden monitor + tray icon), start now");
+    println!("  snifrig pause [MIN]                pause fixing (default 60 min); monitoring continues");
+    println!("  snifrig resume                     resume fixing");
+    println!("  snifrig webhook URL|off            POST alerts as JSON to URL (opt-in, e.g. n8n)");
     println!("  snifrig uninstall                  remove login startup and stop the monitor");
     println!("  snifrig license accept             record acceptance of {}", LIC_VER);
     println!("  snifrig license statement          print a usage statement from local records");
@@ -558,6 +567,9 @@ pub fn run() {
         return;
     }
     match a.first().map(|s| s.as_str()) {
+        Some("pause") => { let m: f64 = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(60.0); let u = now_unix() + m * 60.0; let _ = fs::write(dir.join("mode.json"), format!("{{\"paused_until\":{:.0}}}", u)); println!("fixing paused for {:.0} min. monitoring continues.", m); return; }
+        Some("resume") => { let _ = fs::remove_file(dir.join("mode.json")); println!("fixing resumed."); return; }
+        Some("webhook") => { match a.get(1) { Some(u) if u.starts_with("http") => { let _ = fs::write(dir.join("webhook.txt"), u); println!("webhook saved. test post: {}", if post_json(u, "{\"source\":\"snifrig\",\"msg\":\"test\"}") { "ok" } else { "failed" }); } Some(x) if x == "off" => { let _ = fs::remove_file(dir.join("webhook.txt")); println!("webhook removed."); } _ => println!("usage: snifrig webhook URL|off") } return; }
         Some("install") => { install(&dir, given); return; }
         Some("uninstall") => { uninstall(&dir); return; }
         _ => {}
@@ -775,4 +787,37 @@ fn burst(buf: &mut Vec<u8>) -> String {
             if cl.is_empty() { String::new() } else { format!(", running: {}", cl) }));
     }
     if parts.is_empty() { "burst watch saw no spawners (processes live under 200 ms; check Task Scheduler jobs and services)".into() } else { format!("Spawn burst watch: {}.", parts.join("; ")) }
+}
+
+fn now_unix() -> f64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) }
+
+fn paused_until(dir: &std::path::Path) -> f64 {
+    let u = fs::read_to_string(dir.join("mode.json")).ok().and_then(|s| s.split(':').nth(1).and_then(|v| v.trim_matches(|c: char| !c.is_ascii_digit()).parse::<f64>().ok())).unwrap_or(0.0);
+    if u > now_unix() { u } else { 0.0 }
+}
+
+fn post_json(url: &str, body: &str) -> bool {
+    use windows_sys::Win32::Networking::WinHttp::*;
+    let (https, rest) = match url.strip_prefix("https://") { Some(r) => (true, r), None => (false, url.strip_prefix("http://").unwrap_or(url)) };
+    let (hp, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{}", p))).unwrap_or((rest, "/".into()));
+    let (host, port) = match hp.rsplit_once(':') { Some((h, p)) => (h, p.parse::<u16>().unwrap_or(if https { 443 } else { 80 })), None => (hp, if https { 443 } else { 80 }) };
+    let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let mut ok = false;
+    unsafe {
+        let s = WinHttpOpen(w("snifrig").as_ptr(), WINHTTP_ACCESS_TYPE_NO_PROXY, std::ptr::null(), std::ptr::null(), 0);
+        if s.is_null() { return false; }
+        WinHttpSetTimeouts(s, 5000, 5000, 5000, 5000);
+        let c = WinHttpConnect(s, w(host).as_ptr(), port, 0);
+        if !c.is_null() {
+            let r = WinHttpOpenRequest(c, w("POST").as_ptr(), w(&path).as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null(), if https { WINHTTP_FLAG_SECURE } else { 0 });
+            if !r.is_null() {
+                let h = w("Content-Type: application/json");
+                if WinHttpSendRequest(r, h.as_ptr(), u32::MAX, body.as_ptr() as *const _, body.len() as u32, body.len() as u32, 0) != 0 && WinHttpReceiveResponse(r, std::ptr::null_mut()) != 0 { ok = true; }
+                WinHttpCloseHandle(r);
+            }
+            WinHttpCloseHandle(c);
+        }
+        WinHttpCloseHandle(s);
+    }
+    ok
 }
