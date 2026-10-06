@@ -35,6 +35,10 @@ Right-click for the report, the alerts, the data folder, or to quit.
 Data lives in `%LOCALAPPDATA%\snifrig`: `snifrig.jsonl` (history),
 `alerts.jsonl`, `status.json`. Both logs are size-capped.
 
+## Tray flyout
+
+Left-click the tray icon to see CPU, RAM, GPU and VRAM with the top three consumers of each (for example which process holds your VRAM). Data is collected only while the flyout opens (snifrig --snapshot), using Windows per-process GPU counters, so it adds nothing to the background monitor.
+
 ## Footprint
 
 It checks itself every cycle and exits if it breaks its own budget: working set

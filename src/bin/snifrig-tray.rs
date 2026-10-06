@@ -3,6 +3,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #[path = "../icon.rs"]
 mod icon;
+#[path = "../flyout.rs"]
+mod flyout;
 
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
@@ -159,7 +161,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_TRAY => {
             let ev = (lp as u32) & 0xFFFF;
-            if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU { menu(hwnd); } else if ev == WM_LBUTTONDBLCLK { open_report(); }
+            if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU { menu(hwnd); } else if ev == WM_LBUTTONUP { flyout::show(dir()); }
             0
         }
         WM_TIMER => {
@@ -219,6 +221,7 @@ fn main() {
         TASKBAR_MSG = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         refresh(hwnd, true);
         SetTimer(hwnd, 1, 15000, None);
+        if a.iter().any(|x| x == "--flyout") { flyout::show(dir()); }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);

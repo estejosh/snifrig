@@ -567,6 +567,7 @@ pub fn run() {
         return;
     }
     match a.first().map(|s| s.as_str()) {
+        Some("--snapshot") | Some("snapshot") => { snapshot(&dir); return; }
         Some("pause") => { let m: f64 = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(60.0); let u = now_unix() + m * 60.0; let _ = fs::write(dir.join("mode.json"), format!("{{\"paused_until\":{:.0}}}", u)); println!("fixing paused for {:.0} min. monitoring continues.", m); return; }
         Some("resume") => { let _ = fs::remove_file(dir.join("mode.json")); println!("fixing resumed."); return; }
         Some("webhook") => { match a.get(1) { Some(u) if u.starts_with("http") => { let _ = fs::write(dir.join("webhook.txt"), u); println!("webhook saved. test post: {}", if post_json(u, "{\"source\":\"snifrig\",\"msg\":\"test\"}") { "ok" } else { "failed" }); } Some(x) if x == "off" => { let _ = fs::remove_file(dir.join("webhook.txt")); println!("webhook removed."); } _ => println!("usage: snifrig webhook URL|off") } return; }
@@ -820,4 +821,98 @@ fn post_json(url: &str, body: &str) -> bool {
         WinHttpCloseHandle(s);
     }
     ok
+}
+// ---- on-demand snapshot for the tray flyout: who is using CPU, RAM, GPU and VRAM right now ----
+fn pdh_array(q: isize, path: &str, collect: bool) -> Vec<(String, f64)> {
+    use windows_sys::Win32::System::Performance::*;
+    let _ = collect;
+    let mut out = Vec::new();
+    unsafe {
+        let w: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let mut c: isize = 0;
+        if PdhAddEnglishCounterW(q, w.as_ptr(), 0, &mut c) != 0 { return out; }
+        PdhCollectQueryData(q);
+        std::thread::sleep(Duration::from_millis(1000));
+        PdhCollectQueryData(q);
+        let (mut sz, mut n) = (0u32, 0u32);
+        PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE | 0x0000_8000, &mut sz, &mut n, std::ptr::null_mut());
+        if sz == 0 { return out; }
+        let mut b = vec![0u8; sz as usize + 64];
+        let p = b.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+        if PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE | 0x0000_8000, &mut sz, &mut n, p) == 0 {
+            for i in 0..n as usize {
+                let it = &*p.add(i);
+                let mut l = 0; while *it.szName.add(l) != 0 { l += 1; }
+                let name = String::from_utf16_lossy(std::slice::from_raw_parts(it.szName, l));
+                out.push((name, it.FmtValue.Anonymous.doubleValue));
+            }
+        }
+    }
+    out
+}
+
+fn pid_of(inst: &str) -> Option<u32> { inst.strip_prefix("pid_")?.split('_').next()?.parse().ok() }
+
+fn top_json(mut v: Vec<(String, f64)>, dec: usize) -> String {
+    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    v.iter().filter(|x| x.1 > 0.0).take(3).map(|(n, x)| format!("[\"{}\",{:.*}]", esc(n), dec, x)).collect::<Vec<_>>().join(",")
+}
+
+pub fn snapshot(dir: &std::path::Path) {
+    let mut buf = vec![0u8; 1 << 20];
+    let a = read_procs(&mut buf).unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let q = unsafe { let mut q: isize = 0; if windows_sys::Win32::System::Performance::PdhOpenQueryW(std::ptr::null(), 0, &mut q) != 0 { 0 } else { q } };
+    // GPU counters take ~1 s between samples, which doubles as the CPU sample window.
+    let mut gpu_json = String::new();
+    if q != 0 {
+        let eng = pdh_array(q, "\\GPU Engine(*)\\Utilization Percentage", true);
+        let mem = pdh_array(q, "\\GPU Process Memory(*)\\Dedicated Usage", false);
+        let adp = pdh_array(q, "\\GPU Adapter Memory(*)\\Dedicated Usage", false);
+        let b = read_procs(&mut buf).unwrap_or_default();
+        let names: HashMap<u32, String> = b.iter().map(|p| (p.pid, p.name.clone())).collect();
+        let nm = |pid: u32| names.get(&pid).cloned().unwrap_or_else(|| format!("pid {}", pid));
+        let mut per: HashMap<(u32, String), f64> = HashMap::new();
+        let mut kind: HashMap<String, f64> = HashMap::new();
+        for (inst, v) in &eng {
+            if let (Some(pid), Some(k)) = (pid_of(inst), inst.rsplit("engtype_").next()) {
+                *per.entry((pid, k.to_string())).or_insert(0.0) += v;
+                *kind.entry(k.to_string()).or_insert(0.0) += v;
+            }
+        }
+        let mut best: HashMap<u32, f64> = HashMap::new();
+        for ((pid, _), v) in &per { let e = best.entry(*pid).or_insert(0.0); if *v > *e { *e = *v; } }
+        let util = kind.values().cloned().fold(0.0f64, f64::max).min(100.0);
+        let gtop = top_json(best.iter().map(|(p, v)| (nm(*p), *v)).collect(), 0);
+        let mut vm: HashMap<u32, f64> = HashMap::new();
+        for (inst, v) in &mem { if let Some(pid) = pid_of(inst) { *vm.entry(pid).or_insert(0.0) += v / MB; } }
+        let vtop = top_json(vm.iter().map(|(p, v)| (nm(*p), *v)).collect(), 0);
+        let vused: f64 = adp.iter().map(|x| x.1).sum::<f64>() / MB;
+        if !eng.is_empty() || !mem.is_empty() {
+            gpu_json = format!(",\"gpu\":{{\"util\":{:.0},\"top\":[{}]}},\"vram\":{{\"used_mb\":{:.0},\"top\":[{}]}}", util, gtop, vused, vtop);
+        }
+        unsafe { windows_sys::Win32::System::Performance::PdhCloseQuery(q); }
+        let secs = t0.elapsed().as_secs_f64().max(0.5);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+        let before: HashMap<u32, u64> = a.iter().map(|p| (p.pid, p.cpu)).collect();
+        let mut cpu: Vec<(String, f64)> = Vec::new();
+        let mut total = 0.0;
+        for p in &b {
+            if p.pid == 0 { continue; }
+            if let Some(&c0) = before.get(&p.pid) {
+                let pct = p.cpu.saturating_sub(c0) as f64 / 1e7 / secs / cores * 100.0;
+                total += pct;
+                cpu.push((p.name.clone(), pct));
+            }
+        }
+        let mut agg: HashMap<String, f64> = HashMap::new();
+        for (n, v) in cpu { *agg.entry(n).or_insert(0.0) += v; }
+        let mut ram: HashMap<String, f64> = HashMap::new();
+        for p in &b { *ram.entry(p.name.clone()).or_insert(0.0) += mb(p.private); }
+        let g = read_glob();
+        let line = format!("{{\"unix\":{:.0},\"cpu\":{{\"total\":{:.0},\"top\":[{}]}},\"ram\":{{\"used_mb\":{:.0},\"total_mb\":{:.0},\"top\":[{}]}}{}}}",
+            now_unix(), total.min(100.0), top_json(agg.into_iter().collect(), 0), g.total_mb - g.avail_mb, g.total_mb, top_json(ram.into_iter().collect(), 0), gpu_json);
+        let _ = fs::write(dir.join("snapshot.json"), &line);
+        println!("{}", line);
+    }
 }
