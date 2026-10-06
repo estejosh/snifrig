@@ -114,6 +114,24 @@ unsafe fn open_report() {
     open("cmd.exe", Some(&format!("/k \"\"{}\" --once --dir \"{}\"\"", exe.display(), dir().display())));
 }
 
+static mut RESTARTS: Vec<u64> = Vec::new();
+
+// Restart the hidden monitor if it died: status is stale, its mutex is free, and the user did not stop it. Max 3 per hour.
+unsafe fn watchdog() {
+    if read_status().level != 2 || dir().join("stop").exists() { return; }
+    let h = windows_sys::Win32::System::Threading::OpenMutexW(0x0010_0000, 0, wide("Global\\snifrig-monitor").as_ptr());
+    if !h.is_null() { windows_sys::Win32::Foundation::CloseHandle(h); return; }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let r = &mut *std::ptr::addr_of_mut!(RESTARTS);
+    r.retain(|&t| now - t < 3600);
+    if r.len() >= 3 { return; }
+    if let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrigd.exe"))) {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        if std::process::Command::new(exe).arg("--dir").arg(dir()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0000_0008 | 0x0800_0000).spawn().is_ok() { r.push(now); }
+    }
+}
+
 unsafe fn menu(hwnd: HWND) {
     let st = read_status();
     let m = CreatePopupMenu();
@@ -123,6 +141,9 @@ unsafe fn menu(hwnd: HWND) {
     AppendMenuW(m, MF_STRING, 1, wide("Show report").as_ptr());
     AppendMenuW(m, MF_STRING, 2, wide("Open alerts").as_ptr());
     AppendMenuW(m, MF_STRING, 3, wide("Open data folder").as_ptr());
+    AppendMenuW(m, MF_SEPARATOR, 0, null());
+    AppendMenuW(m, MF_STRING, 6, wide("Pause fixing 1 hour").as_ptr());
+    AppendMenuW(m, MF_STRING, 7, wide("Resume fixing").as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, null());
     AppendMenuW(m, MF_STRING, 4, wide("Quit tray icon").as_ptr());
     AppendMenuW(m, MF_STRING, 5, wide("Stop monitor and quit").as_ptr());
@@ -143,7 +164,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             let flag = dir().join("stop-tray");
-            if flag.exists() { let _ = std::fs::remove_file(&flag); DestroyWindow(hwnd); } else { refresh(hwnd, false); }
+            if flag.exists() { let _ = std::fs::remove_file(&flag); DestroyWindow(hwnd); } else { watchdog(); refresh(hwnd, false); }
             0
         }
         WM_COMMAND => {
@@ -155,6 +176,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     open("notepad.exe", Some(&format!("\"{}\"", p.display())));
                 }
                 3 => open("explorer.exe", Some(&format!("\"{}\"", dir().display()))),
+                6 => { let u = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) + 3600; let _ = std::fs::write(dir().join("mode.json"), format!("{{\"paused_until\":{}}}", u)); }
+                7 => { let _ = std::fs::remove_file(dir().join("mode.json")); }
                 4 => { DestroyWindow(hwnd); }
                 5 => { let _ = std::fs::write(dir().join("stop"), "1"); DestroyWindow(hwnd); }
                 _ => {}
