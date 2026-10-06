@@ -227,6 +227,8 @@ struct Mon {
     last_alert_t: f64,
     last_alert_msg: String,
     alert_times: VecDeque<f64>,
+    spawner: String,
+    last_burst: f64,
 }
 
 impl Mon {
@@ -235,7 +237,7 @@ impl Mon {
             dir, interval, buf: vec![0u8; 1 << 20], cycle: 0, series: HashMap::new(), cool: HashMap::new(),
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
-            last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(),
+            last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9,
         }
     }
 
@@ -326,7 +328,9 @@ impl Mon {
     fn evaluate(&mut self, g: &Glob, t: f64) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let spawn = self.last("g:Proc_per_min");
-        let young = self.young.iter().map(|(n, c)| format!("{}x{}", n, c)).collect::<Vec<_>>().join(", ");
+        if spawn >= 120.0 && t - self.last_burst > 600.0 { self.spawner = burst(&mut self.buf); self.last_burst = t; }
+        let mut young = self.young.iter().map(|(n, c)| format!("{}x{}", n, c)).collect::<Vec<_>>().join(", ");
+        if !self.spawner.is_empty() && spawn >= 120.0 { young.push_str(". "); young.push_str(&self.spawner); }
         for (k, s) in self.series.iter_mut() {
             let (thr, unit, what) = if k.starts_with("tag:") { (25.0, "MB/h", "kernel pool tag") }
                 else if k.starts_with("ph:") { (1500.0, "handles/h", "process handles") }
@@ -673,4 +677,102 @@ fn uninstall(dir: &PathBuf) {
     let _ = fs::write(dir.join("stop-tray"), "1");
     println!("Login startup removed. The monitor and tray exit within a minute.");
     println!("Your data stays in {} (delete that folder to remove it).", dir.display());
+}
+
+// ---------- spawner attribution ----------
+// When the spawn rate spikes, watch the process table every 200 ms for ~5 s and name who is creating processes.
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    fn NtQueryInformationProcess(h: *mut core::ffi::c_void, class: u32, out: *mut u8, len: u32, ret: *mut u32) -> i32;
+}
+use std::collections::HashSet;
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Threading::OpenProcess;
+
+/// Command line of a same-user process (read from its PEB). None if it cannot be read.
+fn cmdline(pid: u32) -> Option<String> {
+    unsafe {
+        let h = OpenProcess(0x0400 | 0x0010, 0, pid); // QUERY_INFORMATION | VM_READ
+        if h.is_null() { return None; }
+        let rd = |addr: usize, buf: &mut [u8]| -> bool {
+            let mut n = 0usize;
+            ReadProcessMemory(h, addr as *const _, buf.as_mut_ptr() as *mut _, buf.len(), &mut n) != 0 && n == buf.len()
+        };
+        let r = (|| {
+            let (mut pbi, mut ret) = ([0u8; 48], 0u32);
+            if NtQueryInformationProcess(h, 0, pbi.as_mut_ptr(), 48, &mut ret) != 0 { return None; }
+            let peb = u64::from_le_bytes(pbi[8..16].try_into().ok()?) as usize;
+            if peb == 0 { return None; }
+            let mut p8 = [0u8; 8];
+            if !rd(peb + 0x20, &mut p8) { return None; }
+            let params = u64::from_le_bytes(p8) as usize;
+            let mut us = [0u8; 16];
+            if !rd(params + 0x70, &mut us) { return None; }
+            let len = u16::from_le_bytes([us[0], us[1]]) as usize;
+            let ptr = u64::from_le_bytes(us[8..16].try_into().ok()?) as usize;
+            if len == 0 || len > 4096 || ptr == 0 { return None; }
+            let mut b = vec![0u8; len];
+            if !rd(ptr, &mut b) { return None; }
+            let w: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            Some(String::from_utf16_lossy(&w))
+        })();
+        CloseHandle(h);
+        r
+    }
+}
+
+/// Reduce a command line to program and script names only. Arguments (which can hold secrets) are dropped.
+fn script_names(cl: &str) -> String {
+    let mut toks: Vec<String> = Vec::new();
+    let (mut cur, mut inq) = (String::new(), false);
+    for c in cl.chars() {
+        match c {
+            '"' => inq = !inq,
+            ' ' if !inq => { if !cur.is_empty() { toks.push(std::mem::take(&mut cur)); } }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() { toks.push(cur); }
+    let base = |t: &str| t.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(t).to_string();
+    let exts = [".sh", ".ps1", ".py", ".bat", ".cmd", ".js", ".vbs", ".exe"];
+    let mut out: Vec<String> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let l = t.to_lowercase();
+        if i == 0 || exts.iter().any(|e| l.ends_with(e)) { out.push(base(t)); }
+        if out.len() >= 4 { break; }
+    }
+    out.join(" ")
+}
+
+fn burst(buf: &mut Vec<u8>) -> String {
+    let mut seen: HashSet<(u32, u64)> = HashSet::new();
+    let mut info: HashMap<u32, (String, u32)> = HashMap::new(); // pid -> (name, parent pid)
+    let mut made: HashMap<u32, HashMap<String, u32>> = HashMap::new(); // parent pid -> child name -> count
+    for round in 0..25 {
+        if let Some(ps) = read_procs(buf) {
+            for p in &ps { info.insert(p.pid, (p.name.clone(), p.ppid)); }
+            for p in &ps {
+                if seen.insert((p.pid, p.created)) && round > 0 {
+                    *made.entry(p.ppid).or_default().entry(p.name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mut rows: Vec<(u32, u32)> = made.iter().map(|(p, m)| (*p, m.values().sum())).collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut parts = Vec::new();
+    for (pid, n) in rows.iter().take(3) {
+        let (name, pp) = info.get(pid).cloned().unwrap_or_else(|| (format!("pid{}", pid), 0));
+        let up = info.get(&pp).map(|x| x.0.clone()).unwrap_or_default();
+        let mut kids: Vec<(&String, &u32)> = made[pid].iter().collect();
+        kids.sort_by(|a, b| b.1.cmp(a.1));
+        let kids = kids.iter().take(3).map(|(k, c)| format!("{} x{}", k, c)).collect::<Vec<_>>().join(", ");
+        let cl = cmdline(*pid).map(|c| script_names(&c)).unwrap_or_default();
+        parts.push(format!("{}#{}{}{} made {} processes in 5 s ({}){}", name, pid,
+            if up.is_empty() { String::new() } else { format!(" (started by {})", up) }, "", n, kids,
+            if cl.is_empty() { String::new() } else { format!(", running: {}", cl) }));
+    }
+    if parts.is_empty() { "burst watch saw no spawners (processes live under 200 ms; check Task Scheduler jobs and services)".into() } else { format!("Spawn burst watch: {}.", parts.join("; ")) }
 }
