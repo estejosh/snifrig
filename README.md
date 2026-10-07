@@ -78,6 +78,11 @@ Windows 10/11 x64. macOS and Linux versions are planned and need their own probe
 
 snifrig makes no network connection unless you set a webhook with `snifrig webhook URL`, and then it only posts alerts to that URL.
 Everything else stays on your computer in `%LOCALAPPDATA%\snifrig`.
+## Fixer
+
+`snifrig-fix` is the paid part of snifrig. It reads the monitor's alerts and, when it is safe, trims, lowers the priority of, terminates or restarts the process behind a leak. Its default mode only logs what it would do. See [fixer/README.md](fixer/README.md) for modes, safety rules, files and commands.
+
+The tray right-click menu lists pending fixes (Approve or Dismiss) and shows the fixer mode, which can be changed from its submenu.
 ## License
 
 Licensed under UFL 3.4, Operational Scope: **Noncommercial**.

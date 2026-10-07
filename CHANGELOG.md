@@ -2,6 +2,12 @@
 
 All notable changes to snifrig are listed here.
 
+## Unreleased
+
+- Fixer (`snifrig-fix`, separately licensed): reads the monitor's alerts and acts on the process behind them. Modes off, dry-run (default), ask and auto. See `fixer/README.md`.
+- Tray approvals: pending fixes appear in the right-click menu with Approve and Dismiss, plus a Fixer mode submenu.
+- Install wiring: `snifrig install` also installs and starts `snifrig-fix.exe` when it is built next to the monitor, with its own login entry (`SnifrigFix`).
+- Flyout: VRAM is shown as a bar, and the flyout scales for display DPI.
 ## 0.1.0
 
 - Monitor: reads kernel tables directly (`NtQuerySystemInformation`). Tracks kernel pool by tag and growth per hour, handle counts and private memory per process (top 25), commit charge, free RAM, paged and non-paged pool, process and token creation rate, and free disk space.

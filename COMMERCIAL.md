@@ -32,6 +32,9 @@ A price change applies only to periods that start after the change (License,
 Section 8). How use made before paying is handled is set by Section 12 of the
 License. This page does not change it.
 
+## Fixer license key
+
+The fixer's ask and auto modes need a fixer license key (`snifrig-fix.key`). The key is issued with a commercial license, at the same per-computer prices listed above, and it is checked offline on each computer. Dry-run mode needs no key.
 ## Getting a license
 
 Email `hello@fungibility.group` with your Computer count, or open an issue titled

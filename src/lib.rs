@@ -24,6 +24,10 @@ const ALERT_CAP: u64 = 256 << 10;
 const REALERT_SECS: f64 = 2.0 * 3600.0;
 const MB: f64 = 1048576.0;
 
+mod gpu_throttle;
+mod slowdown;
+const SLOW_CAP: u64 = 512 << 10;
+
 // ---------- raw readers ----------
 fn u16_at(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
 fn u32_at(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) }
@@ -230,15 +234,26 @@ struct Mon {
     spawner: String,
     last_burst: f64,
     rebase: bool,
+    slow: slowdown::Slow,
+    cpu_prev: HashMap<u32, u64>,
+    cpu_t: f64,
+    t0: Instant,
 }
 
 impl Mon {
     fn new(dir: PathBuf, interval: f64, quiet: bool) -> Self {
+        let mut m = Mon::new_inner(dir.clone(), interval, quiet);
+        m.slow.dir = Some(dir);
+        m
+    }
+
+    fn new_inner(dir: PathBuf, interval: f64, quiet: bool) -> Self {
         Mon {
             dir, interval, buf: vec![0u8; 1 << 20], cycle: 0, series: HashMap::new(), cool: HashMap::new(),
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
             last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9, rebase: false,
+            slow: slowdown::Slow::open(), cpu_prev: HashMap::new(), cpu_t: 0.0, t0: Instant::now(),
         }
     }
 
@@ -316,6 +331,25 @@ impl Mon {
         let ms: Vec<(String, f64)> = by_m.iter().map(|p| (format!("pm:{}#{}", p.name, p.pid), mb(p.private))).collect();
         for (k, v) in hs.into_iter().chain(ms) { self.put(k, t, v); }
 
+        // Windows-slowdown evidence: per-process CPU % of the whole machine since the last cycle.
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+        let dt = t - self.cpu_t;
+        let mut sp: Vec<(u32, String, f64)> = Vec::new();
+        if self.cpu_t > 0.0 && dt > 0.5 {
+            for p in procs.iter().filter(|p| p.pid > 4) {
+                if let Some(&c0) = self.cpu_prev.get(&p.pid) {
+                    let pct = p.cpu.saturating_sub(c0) as f64 / 1e7 / dt / cores * 100.0;
+                    if pct >= 0.5 { sp.push((p.pid, p.name.clone(), pct)); }
+                }
+            }
+        }
+        self.cpu_prev.clear();
+        self.cpu_prev.extend(procs.iter().map(|p| (p.pid, p.cpu)));
+        self.cpu_t = t;
+        for ev in self.slow.sample(t, &sp) {
+            append_capped(&self.dir.join("slowdown.jsonl"), &ev.json(), SLOW_CAP);
+            self.alert(t, &format!("slow:{}", ev.kind), &ev.msg());
+        }
         let alerts = self.evaluate(&g, t);
         for (k, m) in alerts { self.alert(t, &k, &m); }
         self.log_cycle(t, &g);
@@ -407,7 +441,8 @@ impl Mon {
             }
         }
         self.last_own = Some((t, o.cpu));
-        if self.cycle == 3 || self.rebase { self.rebase = false; self.base = Some((o.private, o.handles)); self.base_threads = o.threads; }
+        // baseline after cycle 3 and at least 60 s of uptime: PDH leaves two pool threads alive for ~30 s about 25 s after start
+        if (self.base.is_none() && self.cycle >= 3 && self.t0.elapsed().as_secs() >= 60) || self.rebase { self.rebase = false; self.base = Some((o.private, o.handles)); self.base_threads = o.threads; }
         let mut why = Vec::new();
         if mb(o.ws) > 48.0 { why.push(format!("working set {:.1} MB over 48", mb(o.ws))); }
         if o.threads > 8 { why.push(format!("{} threads over 8", o.threads)); }
@@ -520,6 +555,11 @@ fn report(m: &Mon) {
         println!("\n{} ({}):", title, unit);
         for (n, v) in &p { println!("  {:<32} {:>10.0}", n, v); }
     }
+    println!("\nWindows slowdowns:");
+    println!("  now: {}", m.slow.now_line());
+    let sl = slowdown::summarize(&m.dir);
+    if sl.is_empty() { println!("  none recorded in the last 24 hours."); }
+    for x in sl { println!("  - {}", x); }
     println!("\nFindings:");
     let mut found = 0;
     if l("g:avail") < 1024.0 { found += 1; println!("  - low RAM: {:.0} MB available. Restart the largest process above.", l("g:avail")); }
@@ -536,6 +576,7 @@ fn usage() {
     println!("snifrig - low-footprint Windows leak monitor (UFL 3.4 Noncommercial)\n");
     println!("  snifrig --once [--sample SECS]     print a report now (2 samples, default 10 s apart)");
     println!("  snifrig [--interval SECS]          watch loop (default 60), alerts to alerts.jsonl");
+    println!("  snifrig slowdown [--dir PATH]      summarize evidence of Windows slowing this PC (last 24 h)");
     println!("  snifrig install                    start at login (hidden monitor + tray icon), start now");
     println!("  snifrig pause [MIN]                pause fixing (default 60 min); monitoring continues");
     println!("  snifrig resume                     resume fixing");
@@ -568,9 +609,11 @@ pub fn run() {
     }
     match a.first().map(|s| s.as_str()) {
         Some("--snapshot") | Some("snapshot") => { snapshot(&dir); return; }
+        Some("--gpu-probe") => { gpu_throttle::probe(&dir); return; }
         Some("pause") => { let m: f64 = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(60.0); let u = now_unix() + m * 60.0; let _ = fs::write(dir.join("mode.json"), format!("{{\"paused_until\":{:.0}}}", u)); println!("fixing paused for {:.0} min. monitoring continues.", m); return; }
         Some("resume") => { let _ = fs::remove_file(dir.join("mode.json")); println!("fixing resumed."); return; }
         Some("webhook") => { match a.get(1) { Some(u) if u.starts_with("http") => { let _ = fs::write(dir.join("webhook.txt"), u); println!("webhook saved. test post: {}", if post_json(u, "{\"source\":\"snifrig\",\"msg\":\"test\"}") { "ok" } else { "failed" }); } Some(x) if x == "off" => { let _ = fs::remove_file(dir.join("webhook.txt")); println!("webhook removed."); } _ => println!("usage: snifrig webhook URL|off") } return; }
+        Some("slowdown") => { let l = slowdown::summarize(&dir); if l.is_empty() { println!("No Windows slowdowns recorded in the last 24 hours."); } else { for x in l { println!("{}", x); } } return; }
         Some("install") => { install(&dir, given); return; }
         Some("uninstall") => { uninstall(&dir); return; }
         _ => {}
