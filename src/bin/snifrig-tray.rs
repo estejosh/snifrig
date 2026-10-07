@@ -189,6 +189,9 @@ unsafe fn menu(hwnd: HWND) {
     AppendMenuW(m, MF_SEPARATOR, 0, null());
     if fixer_exe().is_none() {
         AppendMenuW(m, MF_STRING | MF_GRAYED, 0, wide("Fixer not installed").as_ptr());
+    } else if !dir().join("snifrig-fix.key").exists() {
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, wide("Fixer: needs a key").as_ptr());
+        AppendMenuW(m, MF_STRING, 8, wide("Fixer pricing").as_ptr());
     } else {
         let ids = &mut *std::ptr::addr_of_mut!(MENU_IDS);
         ids.clear();
@@ -243,6 +246,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 3 => open("explorer.exe", Some(&format!("\"{}\"", dir().display()))),
                 6 => { let u = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) + 3600; let _ = std::fs::write(dir().join("mode.json"), format!("{{\"paused_until\":{}}}", u)); }
                 7 => { let _ = std::fs::remove_file(dir().join("mode.json")); }
+                8 => open("https://github.com/estejosh/snifrig/blob/main/PRICING.md", None), // only on the user's click
                 c @ 100..=105 => {
                     let ids = &*std::ptr::addr_of!(MENU_IDS);
                     if let Some(id) = ids.get(((c - 100) / 2) as usize) { run_fix(&[if c % 2 == 0 { "approve" } else { "dismiss" }, id]); }
@@ -274,7 +278,8 @@ fn main() {
     let _ = std::fs::create_dir_all(&d);
     DIR.set(d).ok();
     unsafe {
-        let mn = wide("Global\\snifrig-tray");
+        // one tray per data dir: the default dir keeps the plain name, a custom --dir (tests) gets its own
+        let mn = wide(&if dir().display().to_string().eq_ignore_ascii_case(&snifrig::default_dir().display().to_string()) { "Global\\snifrig-tray".to_string() } else { format!("Global\\snifrig-tray-{}", dir().display().to_string().replace(|c: char| !c.is_ascii_alphanumeric(), "_")) });
         CreateMutexW(null(), 0, mn.as_ptr());
         if GetLastError() == 183 { return; }
         let hi = GetModuleHandleW(null());
@@ -290,7 +295,9 @@ fn main() {
         TASKBAR_MSG = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         refresh(hwnd, true);
         SetTimer(hwnd, 1, 15000, None);
-        if a.iter().any(|x| x == "--flyout") { flyout::show(dir()); }
+        let fly = a.iter().any(|x| x == "--flyout");
+        if fly { flyout::show(dir()); }
+        else if std::env::var("SNIFRIG_NO_NOTICE_TEST").as_deref() != Ok("1") { snifrig::notice::show(); } // UFL 2D Notice, once per tray run
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);

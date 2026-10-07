@@ -1,11 +1,15 @@
 //! snifrig-fix: reads the monitor's alerts and fixes what it safely can.
 //!   snifrig-fix [--dir D]                 watch loop (every 30 s); stops when D\stop-fix exists
 //!   snifrig-fix once                      process new alerts once and exit
-//!   snifrig-fix mode off|dry-run|ask|auto set the mode (default dry-run)
+//!   snifrig-fix mode off|dry-run|ask|auto set the mode (default dry-run; every mode needs a key)
 //!   snifrig-fix status                    mode, pause, license, pending count
 //!   snifrig-fix pending                   list fixes waiting for approval
 //!   snifrig-fix approve ID | dismiss ID   act on a pending fix
 //!   snifrig-fix license install PATH      install a license key
+//!   snifrig-fix license accept            accept UFL-3.7 for this component (or --accept-license "UFL-3.7 snifrig-fix")
+//!   snifrig-fix license status | machine-id
+//! PAID component: every command except license install/status/accept, machine-id and help needs a valid
+//! key and a recorded acceptance, otherwise it prints why on stderr and exits with code 2. No trial.
 
 use snifrig_fix::{actions, ledger, license, now_unix, plan, policy::Policy, proc, Action, Mode, Subject, Target, Verdict};
 use std::path::{Path, PathBuf};
@@ -19,7 +23,7 @@ fn policy(dir: &Path) -> Policy {
         mode: ledger::read_mode(dir),
         now: now_unix(),
         paused_until: ledger::paused_until(dir),
-        licensed: license::status(dir).licensed,
+        licensed: true, // the hard gate in main() already required a valid key
         allow: ledger::read_list(dir, "fix-allow.txt"),
         extra_deny: ledger::read_list(dir, "fix-deny.txt"),
         recent_auto: ledger::recent_auto(dir),
@@ -111,14 +115,57 @@ fn dismiss(dir: &Path, id: &str) -> Result<String, String> {
     Ok(format!("dismissed {} on {}", item.action, item.name))
 }
 
+const DENIED: &str = "snifrig-fix is the paid part of Snifrig and needs a valid key. Prices: https://github.com/estejosh/snifrig/blob/main/PRICING.md";
+const USAGE: &str = "usage: snifrig-fix [once|status|pending|mode M|approve ID|dismiss ID|machine-id|license install PATH|license accept|license status] [--dir D] [--accept-license \"UFL-3.7 snifrig-fix\"]";
+const ACCEPT_PHRASE: &str = "UFL-3.7 snifrig-fix";
+
+/// The hard gate: a valid key and a recorded acceptance, or Err(reason).
+fn gate(dir: &Path) -> Result<(), String> {
+    license::check(dir)?;
+    if !license::accepted(dir) {
+        return Err("UFL-3.7 has not been accepted for snifrig-fix on this machine; run: snifrig-fix license accept".into());
+    }
+    Ok(())
+}
+
+fn accept(dir: &Path, given: Option<String>) -> Result<String, String> {
+    let said = match given {
+        Some(g) => g,
+        None => {
+            println!("Component snifrig-fix, UFL 3.7, Operational Scope: Paid. Published Price: {}. Without a valid key the fixer will not run.", license::PRICING_URL);
+            println!("To accept, type exactly: I accept {}", ACCEPT_PHRASE);
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).map_err(|e| format!("cannot read input: {}", e))?;
+            line.trim_start_matches('\u{feff}').trim_end_matches(|c| c == '\r' || c == '\n').strip_prefix("I accept ").unwrap_or("").to_string()
+        }
+    };
+    if said != ACCEPT_PHRASE { return Err(format!("not accepted; the exact text is: I accept {} (flag form: --accept-license \"{}\")", ACCEPT_PHRASE, ACCEPT_PHRASE)); }
+    license::record_acceptance(dir)?;
+    Ok("accepted UFL-3.7 for snifrig-fix (recorded locally in fix-accepted.json, nothing sent)".into())
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let flag = |n: &str| a.iter().position(|x| x == n).and_then(|i| a.get(i + 1)).cloned();
     let dir = flag("--dir").map(PathBuf::from).unwrap_or_else(default_dir);
     let _ = std::fs::create_dir_all(&dir);
-    let cmd: Vec<&str> = a.iter().map(|s| s.as_str()).filter(|s| !s.starts_with("--")).collect();
-    let cmd: Vec<&str> = match flag("--dir") { Some(d) => cmd.into_iter().filter(|s| *s != d).collect(), None => cmd };
+    let mut cmd: Vec<&str> = Vec::new();
+    let mut skip = false;
+    for s in a.iter().map(|s| s.as_str()) {
+        if skip { skip = false; continue; }
+        if s == "--dir" || s == "--accept-license" { skip = true; continue; }
+        if !s.starts_with("--") { cmd.push(s); }
+    }
+    let help = a.iter().any(|x| matches!(x.as_str(), "--help" | "-h" | "help" | "/?"));
+    let exempt = help || matches!(cmd.as_slice(), ["license", "install", _] | ["license"] | ["license", "status"] | ["license", "accept"] | ["machine-id"]);
+    if !exempt {
+        if let Err(why) = gate(&dir) {
+            eprintln!("{}\n{}", DENIED, why);
+            std::process::exit(2);
+        }
+    }
     let out = |r: Result<String, String>| match r { Ok(m) => println!("{}", m), Err(e) => { eprintln!("{}", e); std::process::exit(1) } };
+    if help { println!("{}", USAGE); return; }
     match cmd.as_slice() {
         ["mode", m] => match Mode::parse(m) {
             Some(m) => { ledger::write_mode(&dir, m); println!("fixer mode: {}", m.as_str()); }
@@ -129,14 +176,22 @@ fn main() {
             let l = license::status(&dir);
             println!("mode: {}", p.mode.as_str());
             println!("paused: {}", if p.now < p.paused_until { format!("yes, {:.0} min left", (p.paused_until - p.now) / 60.0) } else { "no".into() });
-            println!("license: {}", if l.licensed { format!("{} ({} computers, expires {})", l.holder, l.computers, l.expires) } else { format!("none ({})", l.note) });
+            println!("license: {}", if l.licensed { format!("{} ({} seats, valid until {})", l.licensee, l.seats, l.not_after) } else { format!("none ({})", l.note) });
             println!("pending: {}", ledger::load_pending(&dir).len());
         }
         ["pending"] => for p in ledger::load_pending(&dir) { println!("{}  {} {}#{}  {}", p.id, p.action, p.name, p.pid, p.why); },
         ["approve", id] => out(approve(&dir, id)),
         ["dismiss", id] => out(dismiss(&dir, id)),
         ["license", "install", path] => out(license::install(&dir, Path::new(path))),
-        ["license"] | ["license", "status"] => { let l = license::status(&dir); println!("{}", if l.licensed { format!("licensed to {}", l.holder) } else { l.note }); }
+        ["license", "accept"] => out(accept(&dir, flag("--accept-license"))),
+        ["machine-id"] => match license::machine_hash() {
+            Some(h) => println!("{}", h),
+            None => out(Err("cannot read the machine id".into())),
+        },
+        ["license"] | ["license", "status"] => {
+            let l = license::status(&dir);
+            println!("{}", if l.licensed { format!("licensed to {}, valid until {}; UFL-3.7 accepted: {}", l.licensee, l.not_after, if license::accepted(&dir) { "yes" } else { "no" }) } else { format!("{} (UFL-3.7 accepted: {})", l.note, if license::accepted(&dir) { "yes" } else { "no" }) });
+        }
         ["once"] => { let n = process_once(&dir); println!("processed; {} automatic actions", n); }
         [] => loop {
             let stop = dir.join("stop-fix");
@@ -144,6 +199,6 @@ fn main() {
             process_once(&dir);
             for _ in 0..60 { if stop.exists() { break; } std::thread::sleep(std::time::Duration::from_millis(500)); }
         },
-        _ => out(Err("usage: snifrig-fix [once|status|pending|mode M|approve ID|dismiss ID|license install PATH] [--dir D]".into())),
+        _ => out(Err(USAGE.into())),
     }
 }

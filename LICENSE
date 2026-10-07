@@ -1,9 +1,10 @@
-The Usufruct License (UFL) — Version 3.4
+The Usufruct License (UFL) — Version 3.7
 Canonical text, whitepaper, and FAQ: https://github.com/estejosh/UFL-Usufruct-License
 
-Copyright (c) 2026 Joshua D. Hale
+Copyright (c) 2026 estejosh
 
-Operational Scope: Noncommercial
+Operational Scope: Unconditional (the Software outside the Components below)
+Component snifrig-fix: Paid (fixer/**)
 
 ## 1. Grant of Use
 
@@ -21,8 +22,84 @@ grant is licensed under Section 8, on the terms of this license.
 The Operational Scope declared above states the only limit, if any, on
 Section 1's free grant. Exactly one scope applies to this Software:
 
-Noncommercial — Section 1's free grant is limited to non-commercial use.
-Commercial use of the Software is Paid Use under Section 8.
+Unconditional — Section 1's grant is unconditional: it includes running
+the Software, deploying it, integrating with it, and operating a product
+or service built on top of it, commercially or otherwise, at any scale,
+with no further condition.
+
+Components. This Release may declare Components in the header above. A
+Component is a part of the Software that the header identifies by file
+path, glob, directory, or package name, and for which it states its own
+Operational Scope. A path or glob is read relative to the root of the
+Release, where * matches within one path segment and ** matches across
+segments; a name that is not a path identifies the package of that name
+in the Release. The scope stated first governs all of the Software that
+no Component covers. Each Component is governed by the scope the header
+states for it. The statement above that exactly one scope applies is
+read as applying once to the Software outside the Components and once to
+each Component. In the scope that governs a Component, "the Software"
+means that Component, and in the scope stated first it means the
+Software outside the Components. A file or package that more than one
+Component covers belongs to the Component the header lists first.
+
+A use of a Component is any use of the Software that runs code of that
+Component, whether directly or through a call from other code. Code of a
+Component that is present in a copy of the Software but is never run is
+not used. A Licensee that uses only the Software outside the Components,
+and Components whose scope leaves that use free, owes nothing for any
+Component whose scope withholds a use. A Component whose scope withholds
+a use does not make any other part of the Software Paid Use and does not
+limit the Licensee's rights in any other part of it.
+
+Sections 8 through 13 apply to each Component whose scope withholds a
+use as if that Component were the whole Software. Each such Component
+has its own Published Price, which is a price for that Component only.
+Amounts owed, usage statements under Section 10, output marks under
+Section 11, and Retroactive Licenses under Section 12 are figured
+Component by Component, and each mark identifies only the Component that
+produced the output. Paying for Paid Use of one part of the Software
+covers only that part. The step that Section 9 requires is presented,
+for each Component whose scope withholds a use, before that Component
+first runs. It names this license's version, the Component, and its
+scope, and shows where that Component's Published Price is published.
+Sections 1C, 2 through 7, 14, and 15 treat the Software and all of its
+Components as one.
+
+A Release that declares Components makes the choice described in Section
+2C once for the Software outside the Components and once for each
+Component. The name of each Component, the paths or packages that
+identify it, and its scope are filled in as the copyright year, holder,
+and project name are, and no other term of this license changes. The
+scope of a Component may be any Operational Scope in this Section 1A
+except Seat-Limited and Decentralized. The scope of the Software outside
+the Components may be any Operational Scope except Decentralized, which
+applies only to a Release without Components. The statement of the
+Release's Ruling License under Section 1C names this version, the scope
+stated first, and each Component with its scope.
+
+Component snifrig-fix (covers fixer/**):
+Paid — Section 1's free grant is limited to reading and studying the
+Software's source. Every other use of the Software, Non-Production Use
+included, by any Licensee, whether an organization or an individual and
+whether for business or personal purposes, is Paid Use under Section 8.
+The Licensor may publish a Published Price of zero, or one that covers
+only a trial period.
+
+Splitting the Software. A Licensor may split the Software into parts
+that carry different Operational Scopes, for example a free core and a
+paid part, where this license allows Components, if the split is honest
+and clearly drawn. The header must name each part by path, glob,
+directory, or package and state its scope. The Licensor's README,
+pricing page, and any listing of the Software must describe each part's
+scope as the header states it, and must not describe as free a part that
+the header withholds. Parts are divided by what the Software is, never
+by who the user is. A Licensor must not move code between parts, or
+build the parts to depend on one another, in order to put a use that
+this license grants free into a paid part. Where the header and the
+Licensor's other statements disagree, or the header leaves a part
+unclear, the reading more favorable to the Licensee governs. A Licensor
+who does not draw the split this way has not split this license, and the
+whole Software takes the scope the header states first.
 
 ## 1B. Definitions
 
@@ -53,7 +130,7 @@ Release the Licensee uses.
 
 With each Release, the Licensor states which version of this license,
 and which Operational Scope, governs that Release (its "Ruling
-License"). The statement names both, for example "UFL 3.4, Operational
+License"). The statement names both, for example "UFL 3.7, Operational
 Scope: Noncommercial", and appears where users get the Release: in its
 release notes, its tag, or its package metadata. The Release includes
 the full text of its Ruling License. If a Release does not state its
@@ -73,6 +150,20 @@ license, under a different Operational Scope, or under other terms. A
 Licensee who uses that later Release does so under its Ruling License. A
 Licensee who keeps using an earlier Release keeps the Ruling License
 that Release states.
+
+A Licensor may move the Software to a later version of this license at
+any time, for the Releases it publishes after the move, by stating that
+version as the Ruling License of each of them. The Licensor gives notice
+of the move in the release notes of the first Release under the later
+version and wherever else it announces Releases, such as its README,
+repository, or website. The notice names the version moved from and the
+version moved to, and says what changed in the Operational Scope, if
+anything. A Licensor moves only forward: once a Release is published
+under a version of this license, no later Release is published under an
+earlier version. The one exception is a Release that only patches an
+earlier Release for that Release's users, which keeps the earlier
+Release's Ruling License. A move changes the Releases made after it and
+no earlier Release.
 
 ## 2. Reserved Rights
 
@@ -152,6 +243,64 @@ named in Section 7. An adopted proposal becomes a new official version,
 never a retroactive edit: once a version of this license is published,
 its text is not changed, and a project that wants a later version's
 provisions adopts that version's text in full.
+
+## 2D. Notice Screens
+
+A Licensor may build into the Software a Notice Screen: one short, timed
+screen shown when the Software starts, that promotes the Licensor's own
+products or services, or those of anyone the Licensor chooses. The
+Licensor may apply it to the whole Software or only to named Components.
+A Licensor that does this states in the step described in Section 9
+which parts of the Software show it, what it is, how long it lasts, and
+that it appears only at startup, and the Licensee completes that step
+before first use. A Notice Screen is a term of the free grant for the
+parts it covers: the Licensee agrees to see it, in exchange for use that
+would otherwise cost the Published Price. A Licensee who does not want
+to see it can pay the Published Price under Section 8 where the
+Published Price allows, and a Licensor may let a paid use end the Notice
+Screen.
+
+A Notice Screen must: (a) appear once, at startup, and never again
+during that run; (b) end by itself after the time the step states, and
+let the user close it sooner by a plain action, including from the
+keyboard; (c) never keep the Software from doing its work for longer
+than that time, never cover the whole screen, never take focus from,
+cover, or block any other window, and leave the user free to load and
+use other windows and programs while it shows; (d) be text, images, or
+links shipped inside the Release, with no sound, no flashing, no window
+outside the Software, and no link opened unless the user chooses; (e) be
+labeled as a notice or as sponsored; (f) stay out of output that
+machines read, such as exit codes, logs, and structured data, and out of
+non-interactive runs; and (g) involve no ad network, no measurement of
+who saw or clicked it, and no network call to show it.
+
+Dark patterns and pop-up nagging are not allowed under this license. A
+Notice Screen must not: look like an error, a warning from the system, a
+security alert, or part of the Software's own output; hide, disable,
+delay, or disguise the way to close it; restart its timer or lengthen
+its time after it is closed; use wording that shames, frightens, or
+pressures the user; pre-select a purchase or any consent; ask for more
+than a plain choice to continue or close; reappear after it is closed,
+at any other time, or in a way that grows over time; or collect or send
+any data. The Licensor states, to the best of its knowledge, that the
+content of each Notice Screen, including content that promotes anyone
+else, is lawful and not deceptive, and the Licensor alone is responsible
+for that content.
+
+A screen that does not meet this section is not a term of the free
+grant. The Licensee has not agreed to it, may remove or disable it,
+including in a copy the Licensee distributes, and the Licensor may not
+treat doing so as a breach.
+
+Section 10 is unchanged: showing a Notice Screen is never a report of
+use, and a Notice Screen is not a way for the Licensor to learn who runs
+the Software.
+
+A Licensee will not remove, hide, or alter a Notice Screen that meets
+this section, in its own use or in a copy it distributes under Section 2
+or 2A, unless the step says that the Licensee may hide it for the
+Licensee's own use. This section does not require a Licensor to include
+any Notice Screen and does not change any Operational Scope.
 
 ## 3. Why "Usufruct"
 
@@ -238,6 +387,18 @@ renews at the Published Price in effect when the next period begins. A
 change to the Published Price applies only to periods that begin after
 the change. If the Licensor has not published a price for a withheld
 use, that use is not available under this license.
+
+A Licensor may build a part of the Software that is Paid Use so that it
+does not run until the Licensee enters a valid license key (a "key").
+The Software checks the key on the Licensee's own machine, without any
+network call, as Section 10 requires. A key is issued to the Licensee
+for the period the Published Price covers, may expire when that period
+ends, and may be reissued a limited number of times in a period, as the
+Published Price states. A Licensee will not use a key outside the Seats
+or devices the Published Price covers, will not use a key issued to
+someone else, and will not bypass, patch, disable, or forge the check or
+a key. A part built this way is not used until a valid key is entered.
+Nothing in this license requires a Licensor to build any part this way.
 
 ## 9. Acceptance
 
@@ -376,5 +537,5 @@ to the greatest extent the law allows.
 
 ---
 SPDX identifier: UFL is not on the official SPDX license list. Per SPDX
-convention for licenses outside that list, use `LicenseRef-UFL-3.4-N` —
-not a bare `UFL-3.4-N`, which would misrepresent it as SPDX-registered.
+convention for licenses outside that list, use `LicenseRef-UFL-3.7-U.P-snifrig-fix` —
+not a bare `UFL-3.7-U.P-snifrig-fix`, which would misrepresent it as SPDX-registered.

@@ -24,6 +24,7 @@ const ALERT_CAP: u64 = 256 << 10;
 const REALERT_SECS: f64 = 2.0 * 3600.0;
 const MB: f64 = 1048576.0;
 
+pub mod notice;
 mod gpu_throttle;
 mod slowdown;
 const SLOW_CAP: u64 = 512 << 10;
@@ -462,8 +463,8 @@ impl Mon {
     }
 }
 
-// ---------- license (UFL 3.4 Noncommercial: sections 9 and 10; local records only, no network) ----------
-const LIC_VER: &str = "UFL-3.4";
+// ---------- license (UFL 3.7 Unconditional: sections 9 and 10; local records only, no network) ----------
+const LIC_VER: &str = "UFL-3.7";
 static ALERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn json_str(s: &str, key: &str) -> Option<String> {
@@ -476,16 +477,12 @@ pub fn json_num(s: &str, key: &str) -> u64 {
     s.find(&pat).map(|i| s[i + pat.len()..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)).unwrap_or(0)
 }
 
-fn who() -> String {
-    format!("{}@{}", std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into()), std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into()))
-}
-
 fn accepted(dir: &PathBuf) -> bool {
     fs::read_to_string(dir.join("license-accepted.json")).ok().and_then(|s| json_str(&s, "license")).as_deref() == Some(LIC_VER)
 }
 
 fn record_acceptance(dir: &PathBuf) {
-    let line = format!("{{\"license\":\"{}\",\"scope\":\"Noncommercial\",\"accepted_at\":\"{}\",\"accepted_by\":\"{}\"}}", LIC_VER, iso(now()), esc(&who()));
+    let line = format!("{{\"license\":\"{}\",\"scope\":\"Unconditional\",\"notice\":true,\"unix\":{}}}", LIC_VER, now() as u64);
     let _ = fs::write(dir.join("license-accepted.json"), line);
 }
 
@@ -494,15 +491,16 @@ fn ensure_accepted(dir: &PathBuf, given: Option<String>) -> bool {
     if accepted(dir) { return true; }
     let given = given.or_else(|| std::env::var("SNIFRIG_ACCEPT_LICENSE").ok());
     if given.as_deref() == Some(LIC_VER) { record_acceptance(dir); return true; }
-    eprintln!("Snifrig is licensed under the Usufruct License {} (Operational Scope: Noncommercial).", LIC_VER);
-    eprintln!("Free for home and other non-commercial use. Commercial use is Paid Use: see COMMERCIAL.md.");
+    eprintln!("Snifrig is licensed under the Usufruct License (UFL) 3.7, Operational Scope: Unconditional. The monitor is free for everyone.");
+    eprintln!("Notice Screen (UFL Section 2D): the tray shows one short Notice when it starts (at most 8 seconds, once per login, closes on click or Esc, never takes focus). Interactive command-line reports end with one Notice line. You cannot turn the Notice off.");
+    eprintln!("The fixer, snifrig-fix, is a separate paid component with its own acceptance step.");
+    eprintln!("Full license: LICENSE in the install folder or https://github.com/estejosh/snifrig/blob/main/LICENSE");
     eprintln!("Type exactly `I accept {}` to continue, or run with --accept-license {}:", LIC_VER, LIC_VER);
     let mut line = String::new();
     let ok = std::io::stdin().read_line(&mut line).is_ok() && line.trim() == format!("I accept {}", LIC_VER);
     if ok { record_acceptance(dir); } else { eprintln!("Not accepted. Exiting."); }
     ok
 }
-
 fn bump_stats(dir: &PathBuf, cycles: u64) {
     let p = dir.join("stats.json");
     let old = fs::read_to_string(&p).unwrap_or_default();
@@ -512,21 +510,18 @@ fn bump_stats(dir: &PathBuf, cycles: u64) {
     let _ = fs::write(&p, line);
 }
 
-/// Section 10: a statement built from local records. The signer fills in the use declaration.
+/// Section 10: a statement built from local records.
 fn statement(dir: &PathBuf) {
     let acc = fs::read_to_string(dir.join("license-accepted.json")).unwrap_or_default();
     let st = fs::read_to_string(dir.join("stats.json")).unwrap_or_default();
-    println!("SNIFRIG USAGE STATEMENT (UFL 3.4 section 10)");
-    println!("Software: Snifrig   License: {}   Operational Scope: Noncommercial", LIC_VER);
-    println!("Period covered: {} to {}", json_str(&acc, "accepted_at").or_else(|| json_str(&st, "first_run")).unwrap_or_else(|| "(no local record)".into()), iso(now()));
-    println!("Accepted by (local record): {}", json_str(&acc, "accepted_by").unwrap_or_else(|| "(none)".into()));
+    let since = match json_num(&acc, "unix") { 0 => json_str(&st, "first_run").unwrap_or_else(|| "(no local record)".into()), u => iso(u as f64) };
+    println!("SNIFRIG USAGE STATEMENT (UFL 3.7 section 10)");
+    println!("Software: Snifrig   License: {}   Operational Scope: Unconditional", LIC_VER);
+    println!("Period covered: {} to {}", since, iso(now()));
+    println!("Accepted (local record): {}", if json_str(&acc, "license").as_deref() == Some(LIC_VER) { "yes" } else { "no" });
     println!("Computers measured here: 1 ({})", std::env::var("COMPUTERNAME").unwrap_or_else(|_| "this computer".into()));
     println!("Work processed (kept locally): {} sampling cycles, {} alerts", json_num(&st, "cycles"), json_num(&st, "alerts"));
     println!();
-    println!("Made any use the Noncommercial scope withholds (commercial use) in this period?  [ ] No   [ ] Yes");
-    println!("If yes, extent measured as the Published Price measures it (Computers): ______");
-    println!();
-    println!("Signed: ____________________   Name/authority: ____________________   Date: ____________");
     println!("This statement contains no content of processed data and no identity of any client or customer.");
     println!("Snifrig never sends this anywhere. Send it to the Licensor only on written request, at most once in 12 months.");
 }
@@ -573,7 +568,7 @@ fn report(m: &Mon) {
 }
 
 fn usage() {
-    println!("snifrig - low-footprint Windows leak monitor (UFL 3.4 Noncommercial)\n");
+    println!("snifrig - low-footprint Windows leak monitor (UFL 3.7, Operational Scope: Unconditional)\n");
     println!("  snifrig --once [--sample SECS]     print a report now (2 samples, default 10 s apart)");
     println!("  snifrig [--interval SECS]          watch loop (default 60), alerts to alerts.jsonl");
     println!("  snifrig slowdown [--dir PATH]      summarize evidence of Windows slowing this PC (last 24 h)");
@@ -632,6 +627,7 @@ pub fn run() {
         m.step();
         report(&m);
         bump_stats(&dir, 2);
+        if !has("--quiet") && !has("--json") && std::io::IsTerminal::is_terminal(&std::io::stdout()) { println!("\nNotice: {}", notice::NOTICE_TEXT); }
         return;
     }
 
@@ -714,6 +710,7 @@ fn install(dir: &PathBuf, given: Option<String>) {
         if from == to { continue; }
         if let Err(e) = fs::copy(&from, &to) { eprintln!("could not copy {}: {}", n, e); failed = true; }
     }
+    if let Some(lic) = sd.parent().and_then(|p| p.parent()).map(|r| r.join("LICENSE")).filter(|p| p.exists()) { let _ = fs::copy(&lic, bin.join("LICENSE")); } // so the acceptance text's reference is true
     let mut fix = false; // optional, separately licensed fixer: install it only if it was built next to us
     let fsrc = sd.join("snifrig-fix.exe");
     if fsrc.exists() && fsrc != bin.join("snifrig-fix.exe") {

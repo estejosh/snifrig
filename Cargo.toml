@@ -1,9 +1,9 @@
 [package]
 name = "snifrig"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Low-footprint Windows leak monitor: kernel pool tags, handles, commit, spawn churn. One process, no children."
-license-file = "LICENSE"
+license = "LicenseRef-UFL-3.7-U.P-snifrig-fix"
 
 [dependencies]
 windows-sys = { version = "0.59", features = [

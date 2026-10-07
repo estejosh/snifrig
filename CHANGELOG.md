@@ -2,12 +2,24 @@
 
 All notable changes to snifrig are listed here.
 
-## Unreleased
+## License change
 
-- Fixer (`snifrig-fix`, separately licensed): reads the monitor's alerts and acts on the process behind them. Modes off, dry-run (default), ask and auto. See `fixer/README.md`.
+- Starting with v0.2.0, snifrig moved from UFL 3.4 Noncommercial to UFL 3.7.
+- The monitor (everything outside `fixer/`) is licensed under UFL 3.7, Operational Scope: Unconditional. It is free for everyone, companies included.
+- The fixer `snifrig-fix` is a paid Component (`LicenseRef-UFL-3.7-U.P-snifrig-fix`). It needs a key in every mode. See `PRICING.md`.
+- Earlier releases and commits keep the license they were published under (UFL 3.4 Noncommercial).
+- UFL 1C: projects move forward only.
+
+## 0.2.0 — 2026-10-07
+
+- Windows slowdown evidence: `snifrig slowdown` summarizes evidence of Windows slowing this PC over the last 24 hours.
+- Notice Screen (UFL Section 2D): the tray shows one short Notice at startup (max 8 s, once per login, closes on click or Esc, never takes focus). Interactive command-line reports end with one Notice line. It cannot be turned off, and nothing is sent anywhere.
+- Fixer (`snifrig-fix`, paid Component): reads the monitor's alerts and acts on the process behind them. Modes off, dry-run, ask and auto. Every mode needs a valid key; there is no trial and no free dry-run. See `fixer/README.md`.
+- Fixer keys: offline Ed25519-signed files, valid for 30 days, tied to the paid period, optionally bound to one machine (`snifrig-fix machine-id`). Install with `snifrig-fix license install PATH`, accept with `snifrig-fix license accept`.
 - Tray approvals: pending fixes appear in the right-click menu with Approve and Dismiss, plus a Fixer mode submenu.
 - Install wiring: `snifrig install` also installs and starts `snifrig-fix.exe` when it is built next to the monitor, with its own login entry (`SnifrigFix`).
 - Flyout: VRAM is shown as a bar, and the flyout scales for display DPI.
+
 ## 0.1.0
 
 - Monitor: reads kernel tables directly (`NtQuerySystemInformation`). Tracks kernel pool by tag and growth per hour, handle counts and private memory per process (top 25), commit charge, free RAM, paged and non-paged pool, process and token creation rate, and free disk space.

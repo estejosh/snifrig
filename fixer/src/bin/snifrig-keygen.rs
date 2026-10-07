@@ -1,12 +1,14 @@
-//! Josh's license signing tool.
+//! Josh's license signing tool. Issues the same keys as the UFL reference keygen.py.
 //!   snifrig-keygen new-keypair OUTDIR   writes OUTDIR\snifrig-fix-signing.secret (never commit it)
-//!                                       and prints the public key as 64 hex chars and as a Rust array.
-//!   snifrig-keygen sign --secret PATH --holder NAME --computers N --expires YYYY-MM-DD [--id ID]
+//!                                       and prints the public key as hex, base64url (keygen.py style)
+//!                                       and as a Rust [u8; 32] literal.
+//!   snifrig-keygen sign --secret PATH --licensee NAME --seats N --issued YYYY-MM-DD
+//!                       --not-after YYYY-MM-DD [--machine HASH]
 //!                                       prints one key line (format in fixer/src/license.rs).
+//! HASH is what `snifrig-fix machine-id` prints on the buyer's machine.
 //! Refuses to write the secret inside a git working tree (walks up looking for .git).
 use ed25519_compact::{KeyPair, SecretKey, Seed};
-use snifrig_fix::json::esc;
-use snifrig_fix::license::b64_encode;
+use snifrig_fix::license::{b64_encode, build_payload, valid_date};
 use std::path::Path;
 
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
@@ -39,6 +41,7 @@ fn new_keypair(outdir: &str) -> Result<(), String> {
     let pk: &[u8] = kp.pk.as_ref();
     println!("secret written to {} (keep it off git)", file.display());
     println!("public key hex: {}", hex(pk));
+    println!("public key base64url: {}", b64_encode(pk));
     println!("public key rust: [{}]", pk.iter().map(|b| format!("0x{:02x}", b)).collect::<Vec<_>>().join(", "));
     Ok(())
 }
@@ -48,13 +51,19 @@ fn sign(args: &[String]) -> Result<(), String> {
     let need = |name: &str| get(name).ok_or(format!("missing {}", name));
     let secret = std::fs::read_to_string(need("--secret")?).map_err(|e| format!("cannot read secret: {}", e))?;
     let sk = unhex(secret.trim()).and_then(|b| SecretKey::from_slice(&b).ok()).ok_or("secret file is not a valid key")?;
-    let holder = need("--holder")?;
-    let computers: u32 = need("--computers")?.parse().map_err(|_| "--computers must be a number")?;
-    let expires = need("--expires")?;
-    let b = expires.as_bytes();
-    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' { return Err("--expires must look like YYYY-MM-DD".into()); }
-    let id = get("--id").unwrap_or_else(|| format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
-    let payload = format!(r#"{{"v":1,"holder":"{}","computers":{},"expires":"{}","id":"{}"}}"#, esc(&holder), computers, expires, esc(&id));
+    let licensee = need("--licensee")?;
+    let seats: u32 = need("--seats")?.parse().map_err(|_| "--seats must be a number")?;
+    let (issued, not_after) = (need("--issued")?, need("--not-after")?);
+    if !valid_date(&issued) { return Err("--issued must look like YYYY-MM-DD".into()); }
+    if !valid_date(&not_after) { return Err("--not-after must look like YYYY-MM-DD".into()); }
+    if not_after < issued { return Err("--not-after is before --issued".into()); }
+    let machine = get("--machine");
+    if let Some(m) = &machine {
+        if m.len() != 64 || !m.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err("--machine must be 64 lowercase hex chars (from `snifrig-fix machine-id`)".into());
+        }
+    }
+    let payload = build_payload(&licensee, seats, &issued, &not_after, machine.as_deref());
     let sig = sk.sign(payload.as_bytes(), None);
     println!("{}.{}", b64_encode(payload.as_bytes()), b64_encode(sig.as_ref()));
     Ok(())
@@ -65,7 +74,7 @@ fn main() {
     let r = match args.first().map(|s| s.as_str()) {
         Some("new-keypair") if args.len() == 2 => new_keypair(&args[1]),
         Some("sign") => sign(&args[1..]),
-        _ => Err("usage: snifrig-keygen new-keypair OUTDIR | sign --secret PATH --holder NAME --computers N --expires YYYY-MM-DD [--id ID]".into()),
+        _ => Err("usage: snifrig-keygen new-keypair OUTDIR | sign --secret PATH --licensee NAME --seats N --issued YYYY-MM-DD --not-after YYYY-MM-DD [--machine HASH]".into()),
     };
     if let Err(e) = r {
         eprintln!("error: {}", e);
