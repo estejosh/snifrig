@@ -22,6 +22,38 @@ static mut ICONS: [HICON; 3] = [null_mut(); 3]; // 0 ok, 1 alert, 2 monitor not 
 static mut LAST_ALERT: u64 = 0;
 static mut FIRST: bool = true;
 static mut TASKBAR_MSG: u32 = 0;
+static mut SEEN: Vec<String> = Vec::new(); // pending fix ids already announced
+static mut MENU_IDS: Vec<String> = Vec::new(); // pending ids behind the current menu's Approve/Dismiss (100+2i, 101+2i)
+const MODES: [&str; 4] = ["off", "dry-run", "ask", "auto"]; // menu ids 110..113
+
+struct Pend { id: String, action: String, name: String, pid: u64, why: String }
+
+fn read_pending() -> Vec<Pend> {
+    let s = std::fs::read_to_string(dir().join("pending.json")).unwrap_or_default();
+    s.split('{').skip(2).filter_map(|c| {
+        let id = snifrig::json_str(c, "id")?;
+        Some(Pend { id, action: snifrig::json_str(c, "action").unwrap_or_default(), name: snifrig::json_str(c, "name").unwrap_or_default(),
+            pid: snifrig::json_num(c, "pid"), why: snifrig::json_str(c, "why").unwrap_or_default() })
+    }).collect()
+}
+
+fn fixer_exe() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrig-fix.exe"))).filter(|p| p.exists())
+}
+
+fn fix_mode() -> String {
+    std::fs::read_to_string(dir().join("fix-mode.txt")).map(|s| s.trim().to_string()).unwrap_or_else(|_| "dry-run".into())
+}
+
+fn run_fix(args: &[&str]) {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    if let Some(exe) = fixer_exe() {
+        let _ = std::process::Command::new(exe).args(args).arg("--dir").arg(dir()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0800_0000).spawn();
+    }
+}
+
+fn esc(s: &str) -> String { s.replace('&', "&&") }
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
 fn dir() -> &'static PathBuf { DIR.get().unwrap() }
@@ -102,6 +134,14 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         n.dwInfoFlags = NIIF_WARNING;
     }
     if st.last_alert_unix > LAST_ALERT { LAST_ALERT = st.last_alert_unix; }
+    let seen = &mut *std::ptr::addr_of_mut!(SEEN);
+    if let Some(p) = read_pending().into_iter().find(|p| !seen.contains(&p.id)) {
+        n.uFlags |= NIF_INFO;
+        put(&mut n.szInfoTitle, "Snifrig fixer");
+        put(&mut n.szInfo, &format!("Snifrig wants to {} {}. Right-click to approve.", p.action, p.name));
+        n.dwInfoFlags = NIIF_WARNING;
+    }
+    for p in read_pending() { if !seen.contains(&p.id) { seen.push(p.id); } }
     FIRST = false;
     Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &n);
 }
@@ -147,6 +187,29 @@ unsafe fn menu(hwnd: HWND) {
     AppendMenuW(m, MF_STRING, 6, wide("Pause fixing 1 hour").as_ptr());
     AppendMenuW(m, MF_STRING, 7, wide("Resume fixing").as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, null());
+    if fixer_exe().is_none() {
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, wide("Fixer not installed").as_ptr());
+    } else {
+        let ids = &mut *std::ptr::addr_of_mut!(MENU_IDS);
+        ids.clear();
+        for (i, p) in read_pending().into_iter().take(3).enumerate() {
+            let sub = CreatePopupMenu();
+            let why: String = p.why.chars().take(60).collect();
+            if !why.is_empty() { AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, wide(&esc(&why)).as_ptr()); }
+            AppendMenuW(sub, MF_STRING, 100 + 2 * i, wide("Approve").as_ptr());
+            AppendMenuW(sub, MF_STRING, 101 + 2 * i, wide("Dismiss").as_ptr());
+            let label = if p.pid > 0 { format!("Fix: {} {} (pid {})", p.action, p.name, p.pid) } else { format!("Fix: {} {}", p.action, p.name) };
+            AppendMenuW(m, MF_STRING | MF_POPUP, sub as usize, wide(&esc(&label)).as_ptr());
+            ids.push(p.id);
+        }
+        let fm = CreatePopupMenu();
+        let cur = fix_mode();
+        for (i, md) in MODES.iter().enumerate() {
+            AppendMenuW(fm, MF_STRING | if *md == cur { MF_CHECKED } else { 0 }, 110 + i, wide(md).as_ptr());
+        }
+        AppendMenuW(m, MF_STRING | MF_POPUP, fm as usize, wide("Fixer mode").as_ptr());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, null());
     AppendMenuW(m, MF_STRING, 4, wide("Quit tray icon").as_ptr());
     AppendMenuW(m, MF_STRING, 5, wide("Stop monitor and quit").as_ptr());
     let mut pt = POINT { x: 0, y: 0 };
@@ -180,6 +243,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 3 => open("explorer.exe", Some(&format!("\"{}\"", dir().display()))),
                 6 => { let u = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) + 3600; let _ = std::fs::write(dir().join("mode.json"), format!("{{\"paused_until\":{}}}", u)); }
                 7 => { let _ = std::fs::remove_file(dir().join("mode.json")); }
+                c @ 100..=105 => {
+                    let ids = &*std::ptr::addr_of!(MENU_IDS);
+                    if let Some(id) = ids.get(((c - 100) / 2) as usize) { run_fix(&[if c % 2 == 0 { "approve" } else { "dismiss" }, id]); }
+                }
+                c @ 110..=113 => run_fix(&["mode", MODES[(c - 110) as usize]]),
                 4 => { DestroyWindow(hwnd); }
                 5 => { let _ = std::fs::write(dir().join("stop"), "1"); DestroyWindow(hwnd); }
                 _ => {}

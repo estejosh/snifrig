@@ -670,11 +670,20 @@ fn install(dir: &PathBuf, given: Option<String>) {
         if from == to { continue; }
         if let Err(e) = fs::copy(&from, &to) { eprintln!("could not copy {}: {}", n, e); failed = true; }
     }
+    let mut fix = false; // optional, separately licensed fixer: install it only if it was built next to us
+    let fsrc = sd.join("snifrig-fix.exe");
+    if fsrc.exists() && fsrc != bin.join("snifrig-fix.exe") {
+        let _ = fs::write(dir.join("stop-fix"), "1");
+        std::thread::sleep(Duration::from_secs(3));
+        let _ = fs::remove_file(dir.join("stop-fix"));
+        match fs::copy(&fsrc, bin.join("snifrig-fix.exe")) { Ok(_) => fix = true, Err(e) => eprintln!("could not copy snifrig-fix.exe: {}", e) }
+    }
     if failed { eprintln!("Install stopped. Build all three programs first (cargo build --release) and run install from that folder."); std::process::exit(1); }
     let q = |n: &str| format!("\"{}\" --dir \"{}\"", bin.join(n).display(), dir.display());
     if !(set_run("Snifrig", &q("snifrigd.exe")) && set_run("SnifrigTray", &q("snifrig-tray.exe"))) {
         eprintln!("Could not write the login startup entries."); std::process::exit(1);
     }
+    if fix && set_run("SnifrigFix", &q("snifrig-fix.exe")) { let _ = fs::remove_file(dir.join("stop-fix")); spawn_detached(&bin.join("snifrig-fix.exe"), dir); }
     spawn_detached(&bin.join("snifrigd.exe"), dir);
     spawn_detached(&bin.join("snifrig-tray.exe"), dir);
     println!("Installed. Snifrig now starts at login (hidden monitor + tray icon) and is running.");
@@ -686,6 +695,8 @@ fn install(dir: &PathBuf, given: Option<String>) {
 fn uninstall(dir: &PathBuf) {
     del_run("Snifrig");
     del_run("SnifrigTray");
+    del_run("SnifrigFix");
+    let _ = fs::write(dir.join("stop-fix"), "1");
     let _ = fs::write(dir.join("stop"), "1");
     let _ = fs::write(dir.join("stop-tray"), "1");
     println!("Login startup removed. The monitor and tray exit within a minute.");

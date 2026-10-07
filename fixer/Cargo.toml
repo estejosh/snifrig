@@ -1,0 +1,25 @@
+[package]
+name = "snifrig-fix"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE"
+description = "Snifrig fixer: acts on what the snifrig monitor finds. Licensed separately from the monitor."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "snifrig-fix"
+path = "src/main.rs"
+
+[[bin]]
+name = "snifrig-keygen"
+path = "src/bin/snifrig-keygen.rs"
+
+[dependencies]
+ed25519-compact = { version = "2", default-features = false, features = ["random"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
+    "Win32_System_ProcessStatus", "Win32_System_Services",
+    "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug",
+] }
