@@ -705,7 +705,8 @@ fn install(dir: &PathBuf, given: Option<String>) {
         let _ = fs::remove_file(dir.join("stop"));
     }
     let _ = fs::write(dir.join("stop-tray"), "1"); // and the tray, so its exe can be replaced
-    std::thread::sleep(Duration::from_secs(4));
+    for _ in 0..40 { if !dir.join("stop-tray").exists() { break; } std::thread::sleep(Duration::from_millis(500)); } // tray checks every 15 s
+    std::thread::sleep(Duration::from_millis(700));
     let _ = fs::remove_file(dir.join("stop-tray"));
     let mut failed = false;
     for n in ["snifrig.exe", "snifrigd.exe", "snifrig-tray.exe"] {
