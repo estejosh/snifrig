@@ -200,6 +200,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 fn main() {
+    unsafe { SetProcessDPIAware(); }
     let a: Vec<String> = std::env::args().collect();
     let d = a.iter().position(|x| x == "--dir").and_then(|i| a.get(i + 1)).map(PathBuf::from).unwrap_or_else(snifrig::default_dir);
     let _ = std::fs::create_dir_all(&d);

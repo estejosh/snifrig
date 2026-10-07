@@ -7,8 +7,9 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const W: i32 = 380;
-const H: i32 = 318;
+const BW: i32 = 380;
+const BH: i32 = 318;static mut DPI: i32 = 96;
+fn sc(n: i32) -> i32 { unsafe { n * *std::ptr::addr_of!(DPI) / 96 } }
 static mut FLY: HWND = null_mut();
 static mut SNAP: String = String::new();
 static mut FDIR: Option<PathBuf> = None;
@@ -73,11 +74,12 @@ pub unsafe fn show(dir: &Path) {
         RegisterClassW(&wc);
         REG = true;
     }
+    { let sdc = GetDC(null_mut()); let d = GetDeviceCaps(sdc, LOGPIXELSX as i32); ReleaseDC(null_mut(), sdc); DPI = if d >= 96 { d } else { 96 }; }
     let mut wa: RECT = std::mem::zeroed();
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as *mut _, 0);
-    let (x, y) = (wa.right - W - 12, wa.bottom - H - 12);
+    let (x, y) = (wa.right - sc(BW) - sc(12), wa.bottom - sc(BH) - sc(12));
     FLY = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, cls.as_ptr(), wide("Snifrig").as_ptr(), WS_POPUP | WS_VISIBLE | WS_BORDER,
-        x, y, W, H, null_mut(), null_mut(), hi, null());
+        x, y, sc(BW), sc(BH), null_mut(), null_mut(), hi, null());
     SetForegroundWindow(FLY);
     SetTimer(FLY, 1, 1700, None);
 }
@@ -85,27 +87,27 @@ pub unsafe fn show(dir: &Path) {
 unsafe fn text(dc: HDC, x: i32, y: i32, s: &str, col: u32, right: bool) {
     SetTextColor(dc, col);
     let w = wide(s);
-    let mut r = RECT { left: x, top: y, right: if right { W - 20 } else { W - 20 }, bottom: y + 20 };
+    let mut r = RECT { left: x, top: y, right: sc(BW) - sc(20), bottom: y + sc(20) };
     DrawTextW(dc, w.as_ptr(), -1, &mut r, DT_SINGLELINE | DT_END_ELLIPSIS | if right { DT_RIGHT } else { DT_LEFT });
 }
 
 unsafe fn row(dc: HDC, y: i32, label: &str, val: &str, frac: f64, top: &[(String, f64)], unit: &str, big: HFONT, small: HFONT) {
     let old = SelectObject(dc, big);
-    text(dc, 20, y, label, rgb(0xD9, 0xA4, 0x41), false);
-    text(dc, 20, y, val, rgb(0xE7, 0xDC, 0xC0), true);
+    text(dc, sc(20), y, label, rgb(0xD9, 0xA4, 0x41), false);
+    text(dc, sc(20), y, val, rgb(0xE7, 0xDC, 0xC0), true);
     SelectObject(dc, small);
-    let (bx, by, bw) = (20, y + 26, W - 40);
+    let (bx, by, bw) = (sc(20), y + sc(26), sc(BW) - sc(40));
     let track = CreateSolidBrush(rgb(0x2A, 0x32, 0x3A));
-    FillRect(dc, &RECT { left: bx, top: by, right: bx + bw, bottom: by + 8 }, track);
+    FillRect(dc, &RECT { left: bx, top: by, right: bx + bw, bottom: by + sc(8) }, track);
     DeleteObject(track);
     if frac >= 0.0 {
         let col = if frac > 0.9 { rgb(0xE0, 0x5A, 0x4A) } else { rgb(0x3F, 0xB8, 0xE8) };
         let b = CreateSolidBrush(col);
-        FillRect(dc, &RECT { left: bx, top: by, right: bx + ((bw as f64) * frac.min(1.0)) as i32, bottom: by + 8 }, b);
+        FillRect(dc, &RECT { left: bx, top: by, right: bx + ((bw as f64) * frac.min(1.0)) as i32, bottom: by + sc(8) }, b);
         DeleteObject(b);
     }
     let t = if top.is_empty() { "-".to_string() } else { top.iter().map(|(n, v)| format!("{}  {}{}", n, v, unit)).collect::<Vec<_>>().join("   ") };
-    text(dc, 20, by + 14, &t, rgb(0x9A, 0xA5, 0xAE), false);
+    text(dc, sc(20), by + sc(14), &t, rgb(0x9A, 0xA5, 0xAE), false);
     SelectObject(dc, old);
 }
 
@@ -113,32 +115,37 @@ unsafe fn paint(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut ps);
     let bg = CreateSolidBrush(rgb(0x14, 0x18, 0x1C));
-    FillRect(dc, &RECT { left: 0, top: 0, right: W, bottom: H }, bg);
+    FillRect(dc, &RECT { left: 0, top: 0, right: sc(BW), bottom: sc(BH) }, bg);
     DeleteObject(bg);
     SetBkMode(dc, TRANSPARENT as i32);
     let face = wide("Segoe UI");
-    let big = CreateFontW(-17, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
-    let small = CreateFontW(-13, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+    let big = CreateFontW(-sc(17), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+    let small = CreateFontW(-sc(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
     let s = &*std::ptr::addr_of!(SNAP);
     let old = SelectObject(dc, big);
-    text(dc, 20, 12, "SNIFRIG", rgb(0xD9, 0xA4, 0x41), false);
+    text(dc, sc(20), sc(12), "SNIFRIG", rgb(0xD9, 0xA4, 0x41), false);
     SelectObject(dc, small);
     if s.is_empty() {
-        text(dc, 20, 14, "sampling...", rgb(0x9A, 0xA5, 0xAE), true);
+        text(dc, sc(20), sc(14), "sampling...", rgb(0x9A, 0xA5, 0xAE), true);
     } else {
         let (c, r, g, v) = (section(s, "cpu"), section(s, "ram"), section(s, "gpu"), section(s, "vram"));
         let cpu = num(c, "total");
-        row(dc, 46, "CPU", &format!("{:.0}%", cpu), cpu / 100.0, &pairs(c), "%", big, small);
+        row(dc, sc(46), "CPU", &format!("{:.0}%", cpu), cpu / 100.0, &pairs(c), "%", big, small);
         let (ru, rt) = (num(r, "used_mb"), num(r, "total_mb").max(1.0));
         let rtop: Vec<(String, f64)> = pairs(r).into_iter().map(|(n, x)| (n, (x / 1024.0 * 10.0).round() / 10.0)).collect();
-        row(dc, 116, "RAM", &format!("{:.1} / {:.0} GB", ru / 1024.0, rt / 1024.0), ru / rt, &rtop, " GB", big, small);
+        row(dc, sc(116), "RAM", &format!("{:.1} / {:.0} GB", ru / 1024.0, rt / 1024.0), ru / rt, &rtop, " GB", big, small);
         if g.is_empty() {
-            row(dc, 186, "GPU", "no counters", -1.0, &[], "", big, small);
+            row(dc, sc(186), "GPU", "no counters", -1.0, &[], "", big, small);
         } else {
             let gu = num(g, "util");
-            row(dc, 186, "GPU", &format!("{:.0}%", gu), gu / 100.0, &pairs(g), "%", big, small);
+            row(dc, sc(186), "GPU", &format!("{:.0}%", gu), gu / 100.0, &pairs(g), "%", big, small);
             let vtop: Vec<(String, f64)> = pairs(v).into_iter().map(|(n, x)| (n, (x / 1024.0 * 10.0).round() / 10.0)).collect();
-            row(dc, 256, "VRAM", &format!("{:.1} GB used", num(v, "used_mb") / 1024.0), -1.0, &vtop, " GB", big, small);
+            let (vu, vt) = (num(v, "used_mb"), num(v, "total_mb"));
+            if vt > 0.0 {
+                row(dc, sc(256), "VRAM", &format!("{:.1} / {:.0} GB", vu / 1024.0, vt / 1024.0), vu / vt, &vtop, " GB", big, small);
+            } else {
+                row(dc, sc(256), "VRAM", &format!("{:.1} GB used", vu / 1024.0), -1.0, &vtop, " GB", big, small);
+            }
         }
     }
     SelectObject(dc, old);

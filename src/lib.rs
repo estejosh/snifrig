@@ -858,6 +858,29 @@ fn top_json(mut v: Vec<(String, f64)>, dec: usize) -> String {
     v.iter().filter(|x| x.1 > 0.0).take(3).map(|(n, x)| format!("[\"{}\",{:.*}]", esc(n), dec, x)).collect::<Vec<_>>().join(",")
 }
 
+fn vram_total_mb() -> Option<f64> {
+    use windows_sys::Win32::System::Registry::*;
+    let mut best = 0u64;
+    for i in 0..10 {
+        let key: Vec<u16> = format!("SYSTEM\\CurrentControlSet\\Control\\Class\\{{4d36e968-e325-11ce-bfc1-08002be10318}}\\{:04}", i).encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let mut h: HKEY = std::ptr::null_mut();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.as_ptr(), 0, KEY_READ, &mut h) != 0 { continue; }
+            for name in ["HardwareInformation.qwMemorySize", "HardwareInformation.MemorySize"] {
+                let n: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                let (mut ty, mut v, mut sz) = (0u32, 0u64, 8u32);
+                if RegQueryValueExW(h, n.as_ptr(), std::ptr::null(), &mut ty, &mut v as *mut u64 as *mut u8, &mut sz) == 0 && (ty == REG_QWORD || ty == REG_DWORD) {
+                    let val = if ty == REG_DWORD { v & 0xFFFF_FFFF } else { v };
+                    best = best.max(val);
+                    if ty == REG_QWORD { break; }
+                }
+            }
+            RegCloseKey(h);
+        }
+    }
+    if best > 0 { Some(best as f64 / MB) } else { None }
+}
+
 pub fn snapshot(dir: &std::path::Path) {
     let mut buf = vec![0u8; 1 << 20];
     let a = read_procs(&mut buf).unwrap_or_default();
@@ -888,8 +911,9 @@ pub fn snapshot(dir: &std::path::Path) {
         for (inst, v) in &mem { if let Some(pid) = pid_of(inst) { *vm.entry(pid).or_insert(0.0) += v / MB; } }
         let vtop = top_json(vm.iter().map(|(p, v)| (nm(*p), *v)).collect(), 0);
         let vused: f64 = adp.iter().map(|x| x.1).sum::<f64>() / MB;
+        let vt = vram_total_mb().map(|t| format!(",\"total_mb\":{:.0}", t)).unwrap_or_default();
         if !eng.is_empty() || !mem.is_empty() {
-            gpu_json = format!(",\"gpu\":{{\"util\":{:.0},\"top\":[{}]}},\"vram\":{{\"used_mb\":{:.0},\"top\":[{}]}}", util, gtop, vused, vtop);
+            gpu_json = format!(",\"gpu\":{{\"util\":{:.0},\"top\":[{}]}},\"vram\":{{\"used_mb\":{:.0}{},\"top\":[{}]}}", util, gtop, vused, vt, vtop);
         }
         unsafe { windows_sys::Win32::System::Performance::PdhCloseQuery(q); }
         let secs = t0.elapsed().as_secs_f64().max(0.5);
@@ -916,3 +940,5 @@ pub fn snapshot(dir: &std::path::Path) {
         println!("{}", line);
     }
 }
+#[cfg(test)]
+mod tests;
