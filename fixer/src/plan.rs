@@ -7,6 +7,8 @@
 //!   g:paged / g:nonpaged / g:commit   system-wide growth
 //!   x:avail          available RAM under 1 GB
 //!   x:commit         commit charge over 90% of the limit
+//!   dup:<name>#<pid> idle twin of an identical running process
+//!   x:vram           graphics memory 95% full
 //!   big:<TAG>        a pool tag over 1 GB
 //!   self             the monitor tripped its own budget guard
 //! Any message may carry "Spawn burst watch: <name>#<pid> ..." naming a process that
@@ -39,6 +41,15 @@ pub fn plan(a: &Alert) -> Intent {
             return mk(Subject::Pid { name, pid }, Action::Terminate,
                 "its private memory keeps growing; restarting it gives the memory back");
         }
+    }
+    if let Some(rest) = k.strip_prefix("dup:") {
+        if let Some((name, pid)) = split_name_pid(rest) {
+            return mk(Subject::Pid { name, pid }, Action::Terminate,
+                "it is an idle duplicate of another running copy");
+        }
+    }
+    if k == "x:vram" {
+        return mk(Subject::None, Action::Report, "graphics memory is full; closing a graphics app is a human decision");
     }
     if let Some(rest) = k.strip_prefix("ph:") {
         if let Some((name, pid)) = split_name_pid(rest) {

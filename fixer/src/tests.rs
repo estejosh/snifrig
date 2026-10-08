@@ -285,3 +285,31 @@ fn mode_parse_and_as_str() {
     assert_eq!(Mode::parse("AUTO"), None);
     assert_eq!(Mode::parse("bogus"), None);
 }
+
+#[test]
+fn dup_key_plans_terminate_on_that_pid() {
+    let i = plan(&alert("dup:llama-server.exe#43988", "llama-server.exe is running twice"));
+    assert_eq!(i.subject, Subject::Pid { name: "llama-server.exe".into(), pid: 43988 });
+    assert_eq!(i.action, Action::Terminate);
+    assert_eq!(i.why, "it is an idle duplicate of another running copy");
+}
+
+#[test]
+fn dup_key_without_pid_is_report_only() {
+    assert_eq!(plan(&alert("dup:llama-server.exe", "")).action, Action::Report);
+}
+
+#[test]
+fn dup_llama_server_not_denied_but_arbiter_still_is() {
+    let llama = tgt("llama-server.exe", r"X:\llama.cpp-bin\llama-server.exe -m deepseek-r1-8b.gguf --port 18090", 600.0);
+    assert!(denied(&llama, &Action::Terminate, &[]).is_none());
+    let arb = tgt("pythonw.exe", r"pythonw.exe C:\NATV-ops\gpu_arbiter.py", 600.0);
+    assert!(denied(&arb, &Action::Terminate, &[]).is_some());
+}
+
+#[test]
+fn vram_key_is_report_only() {
+    let i = plan(&alert("x:vram", "Graphics memory is full (23.9 of 24 GB)."));
+    assert_eq!(i.subject, Subject::None);
+    assert_eq!(i.action, Action::Report);
+}

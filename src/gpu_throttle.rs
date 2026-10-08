@@ -27,6 +27,7 @@ struct Nvml {
     limit: FnDevU32,
     clock: FnClock,
     max_clock: FnClock,
+    meminfo: Option<unsafe extern "C" fn(Dev, *mut [u64; 3]) -> i32>,
 }
 
 const NVML_TEMPERATURE_GPU: u32 = 0;
@@ -67,7 +68,8 @@ fn init() -> Option<Nvml> {
         if by_index(0, &mut d) != 0 || d.is_null() {
             return None;
         }
-        Some(Nvml { dev: d as usize, reasons, temp, power, limit, clock, max_clock })
+        let meminfo = sym(lib, b"nvmlDeviceGetMemoryInfo\0");
+        Some(Nvml { dev: d as usize, reasons, temp, power, limit, clock, max_clock, meminfo })
     }
 }
 
@@ -89,15 +91,29 @@ pub fn probe(dir: &std::path::Path) {
     let last = rs.pop().unwrap();
     let held: Vec<&str> = last.reasons.iter().filter(|r| rs.iter().all(|g| g.reasons.contains(r))).copied().collect();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let line = format!("{{\"unix\":{},\"reasons\":\"{}\",\"temp_c\":{},\"power_w\":{:.0},\"limit_w\":{:.0},\"sm_mhz\":{},\"sm_max_mhz\":{}}}",
-        now, held.join(","), last.temp_c, last.power_w, last.limit_w, last.sm_mhz, last.sm_max_mhz);
+    let (used_mb, total_mb) = mem_mb().unwrap_or((0, 0));
+    let line = format!("{{\"unix\":{},\"reasons\":\"{}\",\"temp_c\":{},\"power_w\":{:.0},\"limit_w\":{:.0},\"sm_mhz\":{},\"sm_max_mhz\":{},\"used_mb\":{},\"total_mb\":{}}}",
+        now, held.join(","), last.temp_c, last.power_w, last.limit_w, last.sm_mhz, last.sm_max_mhz, used_mb, total_mb);
     let tmp = dir.join("gpu.json.tmp");
     if std::fs::write(&tmp, line).is_ok() { let _ = std::fs::rename(&tmp, dir.join("gpu.json")); }
 }
 
-pub fn read() -> Option<GpuThrottle> {
+fn nvml() -> Option<&'static Nvml> {
     static N: OnceLock<Option<Nvml>> = OnceLock::new();
-    let n = N.get_or_init(init).as_ref()?;
+    N.get_or_init(init).as_ref()
+}
+
+/// (used, total) graphics memory in MB of GPU 0, via NVML. Used by the probe only.
+pub fn mem_mb() -> Option<(u64, u64)> {
+    let n = nvml()?;
+    let f = n.meminfo?;
+    let mut m = [0u64; 3]; // total, free, used (bytes)
+    if unsafe { f(n.dev as Dev, &mut m) } != 0 { return None; }
+    Some((m[2] >> 20, m[0] >> 20))
+}
+
+pub fn read() -> Option<GpuThrottle> {
+    let n = nvml()?;
     let d = n.dev as Dev;
     unsafe {
         let (mut r, mut t, mut p, mut l, mut c, mut m) = (0u64, 0u32, 0u32, 0u32, 0u32, 0u32);

@@ -27,6 +27,7 @@ const MB: f64 = 1048576.0;
 pub mod notice;
 pub mod verdict;
 mod gpu_throttle;
+mod dupes;
 mod slowdown;
 const SLOW_CAP: u64 = 512 << 10;
 
@@ -237,6 +238,7 @@ struct Mon {
     last_burst: f64,
     rebase: bool,
     slow: slowdown::Slow,
+    dup_det: dupes::Dupes,
     recent_slow: VecDeque<(f64, String)>,
     pub dupes: Vec<String>,
     verdict: Option<verdict::Verdict>,
@@ -258,7 +260,7 @@ impl Mon {
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
             last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9, rebase: false,
-            slow: slowdown::Slow::open(), recent_slow: VecDeque::new(), dupes: Vec::new(), verdict: None, cpu_prev: HashMap::new(), cpu_t: 0.0, t0: Instant::now(),
+            slow: slowdown::Slow::open(), recent_slow: VecDeque::new(), dupes: Vec::new(), dup_det: dupes::Dupes::new(), verdict: None, cpu_prev: HashMap::new(), cpu_t: 0.0, t0: Instant::now(),
         }
     }
 
@@ -358,6 +360,8 @@ impl Mon {
         }
         let alerts = self.evaluate(&g, t);
         for (k, m) in alerts { self.alert(t, &k, &m); }
+        let dir = self.dir.clone();
+        for (k, m) in self.dup_det.check(t, &dir, &procs) { self.alert(t, &k, &m); }
         self.log_cycle(t, &g);
         self.write_status(t, &g);
         if self.cycle % 30 == 0 {
