@@ -14,7 +14,11 @@ static mut FLY: HWND = null_mut();
 static mut SNAP: String = String::new();
 static mut FDIR: Option<PathBuf> = None;
 static mut REG: bool = false;
+static mut HEAD: String = String::new();
+static mut CAUSES: Vec<String> = Vec::new();
+static mut EXTRA: i32 = 0; // extra height for the verdict block, in 96-dpi px
 
+pub fn now_s() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
 fn rgb(r: u32, g: u32, b: u32) -> u32 { r | (g << 8) | (b << 16) }
 
@@ -77,9 +81,18 @@ pub unsafe fn show(dir: &Path) {
     { let sdc = GetDC(null_mut()); let d = GetDeviceCaps(sdc, LOGPIXELSX as i32); ReleaseDC(null_mut(), sdc); DPI = if d >= 96 { d } else { 96 }; }
     let mut wa: RECT = std::mem::zeroed();
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as *mut _, 0);
-    let (x, y) = (wa.right - sc(BW) - sc(12), wa.bottom - sc(BH) - sc(12));
+    {
+        let st = std::fs::read_to_string(dir.join("status.json")).unwrap_or_default();
+        let fresh = crate::flyout::now_s().saturating_sub(num(&st, "unix") as u64) < 180;
+        let h = if fresh { st.find("\"headline\":\"").map(|i| st[i + 12..].split('"').next().unwrap_or("").to_string()).unwrap_or_default() } else { String::new() };
+        let c = if fresh && !h.is_empty() { snifrig::verdict::causes_from_status(&st) } else { Vec::new() };
+        EXTRA = if h.is_empty() { 0 } else { 8 + 36 + 34 * c.len().min(3) as i32 };
+        HEAD = h;
+        CAUSES = c;
+    }
+    let (x, y) = (wa.right - sc(BW) - sc(12), wa.bottom - sc(BH + EXTRA) - sc(12));
     FLY = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, cls.as_ptr(), wide("Snifrig").as_ptr(), WS_POPUP | WS_VISIBLE | WS_BORDER,
-        x, y, sc(BW), sc(BH), null_mut(), null_mut(), hi, null());
+        x, y, sc(BW), sc(BH + EXTRA), null_mut(), null_mut(), hi, null());
     SetForegroundWindow(FLY);
     SetTimer(FLY, 1, 1700, None);
 }
@@ -115,7 +128,7 @@ unsafe fn paint(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = BeginPaint(hwnd, &mut ps);
     let bg = CreateSolidBrush(rgb(0x14, 0x18, 0x1C));
-    FillRect(dc, &RECT { left: 0, top: 0, right: sc(BW), bottom: sc(BH) }, bg);
+    FillRect(dc, &RECT { left: 0, top: 0, right: sc(BW), bottom: sc(BH + EXTRA) }, bg);
     DeleteObject(bg);
     SetBkMode(dc, TRANSPARENT as i32);
     let face = wide("Segoe UI");
@@ -125,26 +138,43 @@ unsafe fn paint(hwnd: HWND) {
     let old = SelectObject(dc, big);
     text(dc, sc(20), sc(12), "SNIFRIG", rgb(0xD9, 0xA4, 0x41), false);
     SelectObject(dc, small);
+    let hl = &*std::ptr::addr_of!(HEAD);
+    if !hl.is_empty() {
+        let mut y = sc(40);
+        let wrap = |dc: HDC, s: &str, h: i32, col: u32, y: &mut i32| {
+            SetTextColor(dc, col);
+            let w = wide(s);
+            let mut r = RECT { left: sc(20), top: *y, right: sc(BW) - sc(20), bottom: *y + sc(h) };
+            DrawTextW(dc, w.as_ptr(), -1, &mut r, DT_WORDBREAK | DT_END_ELLIPSIS);
+            *y += sc(h);
+        };
+        SelectObject(dc, big);
+        let sev_col = rgb(0xE0, 0x5A, 0x4A);
+        SelectObject(dc, small);
+        wrap(dc, hl, 36, sev_col, &mut y);
+        for c in (&*std::ptr::addr_of!(CAUSES)).iter().take(3) { wrap(dc, &format!("- {}", c), 34, rgb(0xE7, 0xDC, 0xC0), &mut y); }
+    }
+    let ex = sc(EXTRA);
     if s.is_empty() {
         text(dc, sc(20), sc(14), "sampling...", rgb(0x9A, 0xA5, 0xAE), true);
     } else {
         let (c, r, g, v) = (section(s, "cpu"), section(s, "ram"), section(s, "gpu"), section(s, "vram"));
         let cpu = num(c, "total");
-        row(dc, sc(46), "CPU", &format!("{:.0}%", cpu), cpu / 100.0, &pairs(c), "%", big, small);
+        row(dc, ex + sc(46), "CPU", &format!("{:.0}%", cpu), cpu / 100.0, &pairs(c), "%", big, small);
         let (ru, rt) = (num(r, "used_mb"), num(r, "total_mb").max(1.0));
         let rtop: Vec<(String, f64)> = pairs(r).into_iter().map(|(n, x)| (n, (x / 1024.0 * 10.0).round() / 10.0)).collect();
-        row(dc, sc(116), "RAM", &format!("{:.1} / {:.0} GB", ru / 1024.0, rt / 1024.0), ru / rt, &rtop, " GB", big, small);
+        row(dc, ex + sc(116), "RAM", &format!("{:.1} / {:.0} GB", ru / 1024.0, rt / 1024.0), ru / rt, &rtop, " GB", big, small);
         if g.is_empty() {
-            row(dc, sc(186), "GPU", "no counters", -1.0, &[], "", big, small);
+            row(dc, ex + sc(186), "GPU", "no counters", -1.0, &[], "", big, small);
         } else {
             let gu = num(g, "util");
-            row(dc, sc(186), "GPU", &format!("{:.0}%", gu), gu / 100.0, &pairs(g), "%", big, small);
+            row(dc, ex + sc(186), "GPU", &format!("{:.0}%", gu), gu / 100.0, &pairs(g), "%", big, small);
             let vtop: Vec<(String, f64)> = pairs(v).into_iter().map(|(n, x)| (n, (x / 1024.0 * 10.0).round() / 10.0)).collect();
             let (vu, vt) = (num(v, "used_mb"), num(v, "total_mb"));
             if vt > 0.0 {
-                row(dc, sc(256), "VRAM", &format!("{:.1} / {:.0} GB", vu / 1024.0, vt / 1024.0), vu / vt, &vtop, " GB", big, small);
+                row(dc, ex + sc(256), "VRAM", &format!("{:.1} / {:.0} GB", vu / 1024.0, vt / 1024.0), vu / vt, &vtop, " GB", big, small);
             } else {
-                row(dc, sc(256), "VRAM", &format!("{:.1} GB used", vu / 1024.0), -1.0, &vtop, " GB", big, small);
+                row(dc, ex + sc(256), "VRAM", &format!("{:.1} GB used", vu / 1024.0), -1.0, &vtop, " GB", big, small);
             }
         }
     }

@@ -22,6 +22,9 @@ static mut ICONS: [HICON; 3] = [null_mut(); 3]; // 0 ok, 1 alert, 2 monitor not 
 static mut LAST_ALERT: u64 = 0;
 static mut FIRST: bool = true;
 static mut TASKBAR_MSG: u32 = 0;
+static mut LAST_HEAD: String = String::new();
+static mut HEAD_SHOWN: Vec<(String, u64)> = Vec::new(); // headline balloons already shown, with time
+static mut LAST_BALLOON: u64 = 0;
 static mut SEEN: Vec<String> = Vec::new(); // pending fix ids already announced
 static mut MENU_IDS: Vec<String> = Vec::new(); // pending ids behind the current menu's Approve/Dismiss (100+2i, 101+2i)
 const MODES: [&str; 4] = ["off", "dry-run", "ask", "auto"]; // menu ids 110..113
@@ -63,7 +66,7 @@ fn put(dst: &mut [u16], s: &str) {
     dst[w.len()] = 0;
 }
 
-struct Status { level: usize, avail_mb: u64, alerts: u64, last_alert_unix: u64, last_alert: String }
+struct Status { level: usize, avail_mb: u64, alerts: u64, last_alert_unix: u64, last_alert: String, severity: u64, headline: String, causes: Vec<String> }
 
 fn read_status() -> Status {
     let s = std::fs::read_to_string(dir().join("status.json")).unwrap_or_default();
@@ -74,6 +77,9 @@ fn read_status() -> Status {
     Status {
         level, avail_mb: snifrig::json_num(&s, "avail_mb"), alerts: snifrig::json_num(&s, "alerts_2h"),
         last_alert_unix: snifrig::json_num(&s, "last_alert_unix"), last_alert: snifrig::json_str(&s, "last_alert").unwrap_or_default(),
+        severity: if fresh { snifrig::json_num(&s, "severity") } else { 0 },
+        headline: if fresh { snifrig::json_str(&s, "headline").unwrap_or_default() } else { String::new() },
+        causes: if fresh { snifrig::verdict::causes_from_status(&s) } else { Vec::new() },
     }
 }
 
@@ -126,8 +132,27 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         1 => format!("Snifrig: {} alert(s). {}", st.alerts, st.last_alert),
         _ => "Snifrig: monitor not running".to_string(),
     };
+    let tip = if !st.headline.is_empty() && st.level != 2 { format!("Snifrig: {}", st.headline) } else { tip };
     put(&mut n.szTip, &tip);
-    if !FIRST && st.level == 1 && st.last_alert_unix > LAST_ALERT {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let head_ball = {
+        let shown = &mut *std::ptr::addr_of_mut!(HEAD_SHOWN);
+        shown.retain(|x| now.saturating_sub(x.1) < 7200);
+        let last = &mut *std::ptr::addr_of_mut!(LAST_HEAD);
+        let changed = *last != st.headline;
+        *last = st.headline.clone();
+        changed && st.severity >= 1 && !st.headline.is_empty() && now.saturating_sub(LAST_BALLOON) >= 1800 && !shown.iter().any(|x| x.0 == st.headline)
+    };
+    if head_ball {
+        let shown = &mut *std::ptr::addr_of_mut!(HEAD_SHOWN);
+        shown.push((st.headline.clone(), now));
+        LAST_BALLOON = now;
+        n.uFlags |= NIF_INFO;
+        put(&mut n.szInfoTitle, "Your PC is slow");
+        put(&mut n.szInfo, &match st.causes.first() { Some(c) => format!("{} {}", st.headline, c), None => st.headline.clone() });
+        n.dwInfoFlags = NIIF_WARNING;
+    }
+    if !FIRST && st.level == 1 && st.last_alert_unix > LAST_ALERT && st.headline.is_empty() {
         n.uFlags |= NIF_INFO;
         put(&mut n.szInfoTitle, "Snifrig alert");
         put(&mut n.szInfo, &st.last_alert);
@@ -177,7 +202,7 @@ unsafe fn watchdog() {
 unsafe fn menu(hwnd: HWND) {
     let st = read_status();
     let m = CreatePopupMenu();
-    let head = format!("Snifrig: {}", ["OK", "ALERT", "monitor not running"][st.level]);
+    let head = if st.headline.is_empty() { format!("Snifrig: {}", ["OK", "ALERT", "monitor not running"][st.level]) } else { esc(&st.headline) };
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, wide(&head).as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, null());
     AppendMenuW(m, MF_STRING, 1, wide("Show report").as_ptr());

@@ -25,6 +25,7 @@ const REALERT_SECS: f64 = 2.0 * 3600.0;
 const MB: f64 = 1048576.0;
 
 pub mod notice;
+pub mod verdict;
 mod gpu_throttle;
 mod slowdown;
 const SLOW_CAP: u64 = 512 << 10;
@@ -236,6 +237,9 @@ struct Mon {
     last_burst: f64,
     rebase: bool,
     slow: slowdown::Slow,
+    recent_slow: VecDeque<(f64, String)>,
+    pub dupes: Vec<String>,
+    verdict: Option<verdict::Verdict>,
     cpu_prev: HashMap<u32, u64>,
     cpu_t: f64,
     t0: Instant,
@@ -254,7 +258,7 @@ impl Mon {
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
             last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9, rebase: false,
-            slow: slowdown::Slow::open(), cpu_prev: HashMap::new(), cpu_t: 0.0, t0: Instant::now(),
+            slow: slowdown::Slow::open(), recent_slow: VecDeque::new(), dupes: Vec::new(), verdict: None, cpu_prev: HashMap::new(), cpu_t: 0.0, t0: Instant::now(),
         }
     }
 
@@ -349,6 +353,7 @@ impl Mon {
         self.cpu_t = t;
         for ev in self.slow.sample(t, &sp) {
             append_capped(&self.dir.join("slowdown.jsonl"), &ev.json(), SLOW_CAP);
+            self.recent_slow.push_back((t, ev.kind.to_string()));
             self.alert(t, &format!("slow:{}", ev.kind), &ev.msg());
         }
         let alerts = self.evaluate(&g, t);
@@ -424,12 +429,37 @@ impl Mon {
     }
 
     /// Small status file the tray reads: level (ok/alert), free RAM, alerts in the last 2 h, newest alert.
+    fn make_verdict(&mut self, t: f64, g: &Glob) {
+        while self.recent_slow.front().map_or(false, |x| t - x.0 > 900.0) { self.recent_slow.pop_front(); }
+        let procs: Vec<verdict::ProcMem> = self.series.iter().filter(|(k, s)| k.starts_with("pm:") && s.last_seen == self.cycle).filter_map(|(k, s)| {
+            let (n, pid) = k[3..].rsplit_once('#')?;
+            Some(verdict::ProcMem { name: n.to_string(), pid: pid.parse().unwrap_or(0), mb: s.v.back()?.1, growth_mb_h: s.trend(60).map(|x| x.0) })
+        }).collect();
+        let nl = self.slow.now_line();
+        let reads = nl.split("page reads ").nth(1).and_then(|r| r.split('/').next()).and_then(|r| r.trim().parse::<f64>().ok());
+        let vram = fs::read_to_string(self.dir.join("snapshot.json")).ok().filter(|s| t - (json_num(s, "unix") as f64) < 600.0).and_then(|s| {
+            let v = &s[s.find("\"vram\":{")?..];
+            let (u, tt) = (json_num(v, "used_mb") as f64, json_num(v, "total_mb") as f64);
+            if tt > 0.0 { Some((u, tt)) } else { None }
+        });
+        let input = verdict::VerdictInput {
+            commit_pct: if g.limit_mb > 0.0 { g.commit_mb / g.limit_mb * 100.0 } else { 0.0 }, avail_mb: g.avail_mb, total_mb: g.total_mb,
+            page_reads_per_s: reads, procs, vram_mb: vram, evidence: self.recent_slow.iter().map(|x| x.1.clone()).collect(), dupes: self.dupes.clone(),
+        };
+        self.verdict = verdict::verdict(&input);
+    }
+
     fn write_status(&mut self, t: f64, g: &Glob) {
+        self.make_verdict(t, g);
         while self.alert_times.front().map_or(false, |&x| t - x > REALERT_SECS) { self.alert_times.pop_front(); }
         let level = if self.alert_times.is_empty() { "ok" } else { "alert" };
         let msg: String = self.last_alert_msg.chars().take(180).collect();
         let line = format!("{{\"unix\":{:.0},\"level\":\"{}\",\"avail_mb\":{:.0},\"commit_mb\":{:.0},\"alerts_2h\":{},\"last_alert_unix\":{:.0},\"last_alert\":\"{}\",\"paused_until\":{:.0}}}",
             t, level, g.avail_mb, g.commit_mb, self.alert_times.len(), self.last_alert_t, esc(&msg), paused_until(&self.dir));
+        let mut line = line;
+        line.pop();
+        let (sev, hl, cs) = match &self.verdict { Some(v) => (v.severity, v.headline.clone(), v.causes.iter().map(|c| format!("\"{}\"", esc(c))).collect::<Vec<_>>().join(",")), None => (0, String::new(), String::new()) };
+        line.push_str(&format!(",\"severity\":{},\"headline\":\"{}\",\"causes\":[{}]}}", sev, esc(&hl), cs));
         let _ = fs::write(self.dir.join("status.json"), line);
     }
 
@@ -618,6 +648,22 @@ pub fn run() {
     unsafe {
         SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
         SetPriorityClass(GetCurrentProcess(), 0x0010_0000); // PROCESS_MODE_BACKGROUND_BEGIN: lowers IO and memory priority too
+    }
+    if a.first().map(|s| s.as_str()) == Some("why") {
+        let st = fs::read_to_string(dir.join("status.json")).unwrap_or_default();
+        let live = monitor_running(&dir) && json_str(&st, "headline").is_some();
+        let (head, causes) = if live { (json_str(&st, "headline").unwrap_or_default(), verdict::causes_from_status(&st)) } else {
+            let mut m = Mon::new(dir.clone(), 5.0, true);
+            m.step();
+            std::thread::sleep(Duration::from_secs(5));
+            m.step();
+            m.verdict.as_ref().map(|v| (v.headline.clone(), v.causes.clone())).unwrap_or_default()
+        };
+        if head.is_empty() { println!("Nothing is slowing your PC down right now."); } else {
+            println!("{}", head);
+            for (i, c) in causes.iter().enumerate() { println!("  {}. {}", i + 1, c); }
+        }
+        return;
     }
     if has("--once") {
         let secs: f64 = flag("--sample").and_then(|s| s.parse().ok()).unwrap_or(10.0f64).max(1.0);
