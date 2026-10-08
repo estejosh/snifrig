@@ -1,6 +1,6 @@
 // UFL Section 2D Notice. estejosh writes the final copy; change only these two consts.
 pub const NOTICE_TITLE: &str = "Notice";
-pub const NOTICE_TEXT: &str = "Snifrig is free and made by estejosh. More tools: github.com/estejosh";
+pub const NOTICE_TEXT: &str = "snifrig snif is free, snifrig fix is paid";
 
 // The tray's Notice window: static text, no network, no tracking, no links, no sound.
 // Never takes focus. Closes after 8 s (one timer, never restarted), on any click, or on Esc.
