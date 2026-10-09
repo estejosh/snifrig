@@ -130,7 +130,7 @@ pub fn listening_pids() -> HashSet<u32> {
 }
 
 /// HH:MM local time of a FILETIME.
-fn hhmm(ft: u64) -> String {
+pub(crate) fn hhmm(ft: u64) -> String {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
     use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
     unsafe {

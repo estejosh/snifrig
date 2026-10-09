@@ -12,7 +12,12 @@ pub struct VerdictInput {
     pub vram_mb: Option<(f64, f64)>, // used, total
     pub evidence: Vec<String>,       // slow:* kinds seen in the last 15 min
     pub dupes: Vec<String>,          // duplicate-process findings, already phrased with an action
+    pub cpu_pct: Option<f64>,        // total CPU %, set only after 3 consecutive busy cycles (>= 60)
+    pub cpu_hogs: Vec<CpuHog>,       // sustained CPU-hog findings
 }
+
+/// A process (or same-name group) that has averaged a lot of CPU for 10+ minutes.
+pub struct CpuHog { pub name: String, pub pid: u32, pub pct: f64, pub minutes: f64 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verdict { pub severity: u8, pub headline: String, pub causes: Vec<String> }
@@ -33,6 +38,22 @@ fn action(name: &str, pid: u32) -> String {
         "dwm" => "Sign out and back in to reset it.".into(),
         _ => format!("Close or restart it (pid {}).", pid),
     }
+}
+
+fn cap(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+fn cpu_causes(i: &VerdictInput) -> Vec<String> {
+    let mut h: Vec<&CpuHog> = i.cpu_hogs.iter().collect();
+    h.sort_by(|a, b| b.pct.partial_cmp(&a.pct).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<String> = h.iter().take(3).map(|x| {
+        let act = if crate::cpuhog::auto_restarts(&x.name) { "End it; Windows restarts it." } else { "Close or restart it." };
+        format!("{} is using about {:.0}% of a CPU core ({:.0} min, pid {}). {}", cap(&crate::cpuhog::friendly(&x.name)), x.pct, x.minutes, x.pid, act)
+    }).collect();
+    if out.is_empty() { out.push("Open Task Manager, sort by CPU, and close what you are not using.".into()); }
+    out
 }
 
 fn size(mb: f64) -> String {
@@ -59,6 +80,11 @@ pub fn verdict(i: &VerdictInput) -> Option<Verdict> {
     }
     if has("paging") || i.page_reads_per_s.map_or(false, |r| r > 500.0) {
         return v(1, "Windows is reading memory back from disk, which makes everything lag.", mem_causes(i));
+    }
+    if i.cpu_pct.map_or(false, |c| c >= 60.0) || !i.cpu_hogs.is_empty() {
+        let top = i.cpu_hogs.iter().max_by(|a, b| a.pct.partial_cmp(&b.pct).unwrap_or(std::cmp::Ordering::Equal));
+        let h = match top { Some(t) => format!("Your CPU is busy, mostly with {}.", crate::cpuhog::friendly(&t.name)), None => "Your CPU is busy.".to_string() };
+        return v(1, &h, cpu_causes(i));
     }
     if has("cpu-throttle") || has("thermal") {
         return v(1, "Your CPU is being slowed down (power or heat).", vec!["Check fans, dust and the power plan (use Balanced or High performance).".into()]);
@@ -102,7 +128,7 @@ mod tests {
     use super::*;
 
     fn base() -> VerdictInput {
-        VerdictInput { commit_pct: 40.0, avail_mb: 20000.0, total_mb: 65536.0, page_reads_per_s: None, procs: vec![], vram_mb: None, evidence: vec![], dupes: vec![] }
+        VerdictInput { commit_pct: 40.0, avail_mb: 20000.0, total_mb: 65536.0, page_reads_per_s: None, procs: vec![], vram_mb: None, evidence: vec![], dupes: vec![], cpu_pct: None, cpu_hogs: vec![] }
     }
     fn p(n: &str, pid: u32, mb: f64, g: Option<f64>) -> ProcMem { ProcMem { name: n.into(), pid, mb, growth_mb_h: g } }
 
@@ -168,6 +194,34 @@ mod tests {
             assert!(v.headline.starts_with(start), "{}", k);
             assert_eq!(v.causes.len(), 1);
         }
+    }
+
+    fn hog(n: &str, pid: u32, pct: f64) -> CpuHog { CpuHog { name: n.into(), pid, pct, minutes: 10.0 } }
+
+    #[test]
+    fn cpu_hog_names_top_process_and_lists_actions() {
+        let mut i = base();
+        i.cpu_hogs = vec![hog("comet.exe", 7, 90.0), hog("StartMenuExperienceHost.exe", 5, 98.0)];
+        let v = verdict(&i).unwrap();
+        assert_eq!(v.severity, 1);
+        assert_eq!(v.headline, "Your CPU is busy, mostly with the Windows Start menu.");
+        assert_eq!(v.causes.len(), 2);
+        assert_eq!(v.causes[0], "The Windows Start menu is using about 98% of a CPU core (10 min, pid 5). End it; Windows restarts it.");
+        assert_eq!(v.causes[1], "Comet browser is using about 90% of a CPU core (10 min, pid 7). Close or restart it.");
+    }
+
+    #[test]
+    fn sustained_total_cpu_is_busy_and_memory_wins() {
+        let mut i = base();
+        i.cpu_pct = Some(64.0);
+        let v = verdict(&i).unwrap();
+        assert_eq!(v.headline, "Your CPU is busy.");
+        assert_eq!(v.causes.len(), 1);
+        i.cpu_pct = Some(59.0);
+        assert!(verdict(&i).is_none());
+        i.cpu_pct = Some(70.0);
+        i.commit_pct = 95.0;
+        assert!(verdict(&i).unwrap().headline.starts_with("Your PC is short on memory"));
     }
 
     #[test]

@@ -313,3 +313,22 @@ fn vram_key_is_report_only() {
     assert_eq!(i.subject, Subject::None);
     assert_eq!(i.action, Action::Report);
 }
+
+#[test]
+fn cpu_key_terminates_auto_restarting_hosts() {
+    for n in ["StartMenuExperienceHost.exe", "SearchHost.exe", "ShellExperienceHost.exe", "TextInputHost.exe"] {
+        let i = plan(&alert(&format!("cpu:{}#77", n), ""));
+        assert_eq!(i.subject, Subject::Pid { name: n.into(), pid: 77 });
+        assert_eq!(i.action, Action::Terminate, "{}", n);
+        assert_eq!(i.why, "it is stuck using a full CPU core; Windows restarts it automatically");
+    }
+}
+
+#[test]
+fn cpu_key_lowers_priority_for_other_processes() {
+    let i = plan(&alert("cpu:comet.exe#4321", ""));
+    assert_eq!(i.subject, Subject::Pid { name: "comet.exe".into(), pid: 4321 });
+    assert_eq!(i.action, Action::LowerPriority);
+    assert_eq!(i.why, "it is using a lot of CPU; lowering its priority keeps the PC responsive without closing it");
+    assert_eq!(plan(&alert("cpu:comet.exe#x", "")).action, Action::Report);
+}

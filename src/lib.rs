@@ -28,6 +28,7 @@ pub mod notice;
 pub mod verdict;
 mod gpu_throttle;
 mod dupes;
+mod cpuhog;
 mod slowdown;
 const SLOW_CAP: u64 = 512 << 10;
 
@@ -244,6 +245,9 @@ struct Mon {
     verdict: Option<verdict::Verdict>,
     cpu_prev: HashMap<u32, u64>,
     cpu_t: f64,
+    cpuhog: cpuhog::CpuHogs,
+    busy_streak: u32,
+    total_cpu_pct: Option<f64>,
     t0: Instant,
 }
 
@@ -260,7 +264,7 @@ impl Mon {
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
             last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9, rebase: false,
-            slow: slowdown::Slow::open(), recent_slow: VecDeque::new(), dupes: Vec::new(), dup_det: dupes::Dupes::new(), verdict: None, cpu_prev: HashMap::new(), cpu_t: 0.0, t0: Instant::now(),
+            slow: slowdown::Slow::open(), recent_slow: VecDeque::new(), dupes: Vec::new(), dup_det: dupes::Dupes::new(), verdict: None, cpu_prev: HashMap::new(), cpu_t: 0.0, cpuhog: cpuhog::CpuHogs::new(), busy_streak: 0, total_cpu_pct: None, t0: Instant::now(),
         }
     }
 
@@ -342,13 +346,19 @@ impl Mon {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         let dt = t - self.cpu_t;
         let mut sp: Vec<(u32, String, f64)> = Vec::new();
+        let mut hs_in: Vec<cpuhog::Sample> = Vec::new();
         if self.cpu_t > 0.0 && dt > 0.5 {
             for p in procs.iter().filter(|p| p.pid > 4) {
                 if let Some(&c0) = self.cpu_prev.get(&p.pid) {
-                    let pct = p.cpu.saturating_sub(c0) as f64 / 1e7 / dt / cores * 100.0;
+                    let d = p.cpu.saturating_sub(c0) as f64 / 1e7;
+                    let pct = d / dt / cores * 100.0;
                     if pct >= 0.5 { sp.push((p.pid, p.name.clone(), pct)); }
+                    hs_in.push(cpuhog::Sample { pid: p.pid, name: p.name.clone(), created: p.created, delta_s: d, total_s: p.cpu as f64 / 1e7 });
                 }
             }
+            let total: f64 = sp.iter().map(|x| x.2).sum();
+            self.busy_streak = if total >= 60.0 { self.busy_streak + 1 } else { 0 };
+            self.total_cpu_pct = if self.busy_streak >= 3 { Some(total) } else { None };
         }
         self.cpu_prev.clear();
         self.cpu_prev.extend(procs.iter().map(|p| (p.pid, p.cpu)));
@@ -357,6 +367,9 @@ impl Mon {
             append_capped(&self.dir.join("slowdown.jsonl"), &ev.json(), SLOW_CAP);
             self.recent_slow.push_back((t, ev.kind.to_string()));
             self.alert(t, &format!("slow:{}", ev.kind), &ev.msg());
+        }
+        if !hs_in.is_empty() {
+            for h in self.cpuhog.update(t, dt, &hs_in, &dupes::hhmm) { self.alert(t, &h.key, &h.msg); }
         }
         let alerts = self.evaluate(&g, t);
         for (k, m) in alerts { self.alert(t, &k, &m); }
@@ -449,6 +462,7 @@ impl Mon {
         let input = verdict::VerdictInput {
             commit_pct: if g.limit_mb > 0.0 { g.commit_mb / g.limit_mb * 100.0 } else { 0.0 }, avail_mb: g.avail_mb, total_mb: g.total_mb,
             page_reads_per_s: reads, procs, vram_mb: vram, evidence: self.recent_slow.iter().map(|x| x.1.clone()).collect(), dupes: self.dupes.clone(),
+            cpu_pct: self.total_cpu_pct, cpu_hogs: self.cpuhog.hot.iter().map(|h| verdict::CpuHog { name: h.name.clone(), pid: h.pid, pct: h.pct, minutes: h.minutes }).collect(),
         };
         self.verdict = verdict::verdict(&input);
     }

@@ -200,3 +200,29 @@ fn tag_hint_unknown_tag_falls_back() {
     assert!(tag_hint("ZZZZ").starts_with("unknown tag"));
     assert!(tag_hint("").starts_with("unknown tag"));
 }
+/// Live check, no action taken: cargo test --release live_cpu -- --ignored --nocapture
+#[test]
+#[ignore]
+fn live_cpu_over_20s() {
+    let mut buf = vec![0u8; 1 << 20];
+    let a = read_procs(&mut buf).unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_secs(20));
+    let b = read_procs(&mut buf).unwrap_or_default();
+    let dt = t0.elapsed().as_secs_f64();
+    let prev: HashMap<u32, u64> = a.iter().map(|p| (p.pid, p.cpu)).collect();
+    let mut rows: Vec<(String, u32, f64)> = Vec::new();
+    let mut samples = Vec::new();
+    for p in b.iter().filter(|p| p.pid > 4) {
+        if let Some(&c0) = prev.get(&p.pid) {
+            let d = p.cpu.saturating_sub(c0) as f64 / 1e7;
+            rows.push((p.name.clone(), p.pid, d / dt * 100.0));
+            samples.push(cpuhog::Sample { pid: p.pid, name: p.name.clone(), created: p.created, delta_s: d, total_s: p.cpu as f64 / 1e7 });
+        }
+    }
+    rows.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap());
+    for r in rows.iter().take(10) { println!("{:>6.1}% of a core  {} (pid {})", r.2, r.0, r.1); }
+    let mut h = cpuhog::CpuHogs::new();
+    let out = h.update(0.0, dt, &samples, &|_| "?".into());
+    println!("detector after 20 s (needs 10 min of history, so none expected): {} alerts", out.len());
+}

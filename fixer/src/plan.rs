@@ -7,6 +7,7 @@
 //!   g:paged / g:nonpaged / g:commit   system-wide growth
 //!   x:avail          available RAM under 1 GB
 //!   x:commit         commit charge over 90% of the limit
+//!   cpu:<name>#<pid> process (or name group) using a lot of CPU for 10+ minutes
 //!   dup:<name>#<pid> idle twin of an identical running process
 //!   x:vram           graphics memory 95% full
 //!   big:<TAG>        a pool tag over 1 GB
@@ -15,6 +16,9 @@
 //! is spawning children in a loop (the token-leak pattern snifrig was built to find).
 
 use crate::{Action, Alert, Intent, Subject};
+
+/// Windows shell hosts that the system relaunches by itself, so ending a stuck one is safe.
+const AUTO_RESTART: [&str; 4] = ["startmenuexperiencehost.exe", "searchhost.exe", "shellexperiencehost.exe", "textinputhost.exe"];
 
 /// Splits "python.exe#1234" into ("python.exe", 1234).
 pub fn split_name_pid(s: &str) -> Option<(String, u32)> {
@@ -40,6 +44,16 @@ pub fn plan(a: &Alert) -> Intent {
         if let Some((name, pid)) = split_name_pid(rest) {
             return mk(Subject::Pid { name, pid }, Action::Terminate,
                 "its private memory keeps growing; restarting it gives the memory back");
+        }
+    }
+    if let Some(rest) = k.strip_prefix("cpu:") {
+        if let Some((name, pid)) = split_name_pid(rest) {
+            if AUTO_RESTART.contains(&name.to_ascii_lowercase().as_str()) {
+                return mk(Subject::Pid { name, pid }, Action::Terminate,
+                    "it is stuck using a full CPU core; Windows restarts it automatically");
+            }
+            return mk(Subject::Pid { name, pid }, Action::LowerPriority,
+                "it is using a lot of CPU; lowering its priority keeps the PC responsive without closing it");
         }
     }
     if let Some(rest) = k.strip_prefix("dup:") {
