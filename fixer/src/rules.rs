@@ -39,7 +39,9 @@ pub struct Rule {
 }
 
 fn parse_affinity(v: &str) -> Result<u64, String> {
-    if v.contains('-') || v.contains(',') {
+    // A bare decimal number is a core index (affinity=15 means core 15), never a hex mask;
+    // hex masks need 0x or a-f digits. Treating 15 as 0x15 pinned a game to cores 0, 2 and 4.
+    if v.contains('-') || v.contains(',') || v.chars().all(|c| c.is_ascii_digit()) {
         let mut m = 0u64;
         for part in v.split(',') {
             let (a, b) = match part.split_once('-') {
@@ -307,7 +309,8 @@ mod rule_tests {
         assert_eq!(rule("a.exe affinity=ff").affinity, Some(0xff));
         assert_eq!(rule("a.exe affinity=0x0F").affinity, Some(0xf));
         assert_eq!(rule("a.exe affinity=0,2,4-5").affinity, Some(0b110101));
-        assert!(parse_line("a.exe affinity=0").is_err());
+        assert_eq!(rule("a.exe affinity=0").affinity, Some(1));
+        assert_eq!(rule("a.exe affinity=15").affinity, Some(0x8000));
         assert!(parse_line("a.exe affinity=5-2").is_err());
         assert!(parse_line("a.exe affinity=0-64").is_err());
     }
