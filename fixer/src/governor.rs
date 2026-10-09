@@ -69,8 +69,33 @@ impl Mood {
     pub fn calm(&self) -> bool { self.calm_ticks >= CALM_TICKS }
 }
 
-/// Pure policy. `seen` is every live process this tick; `demoted` the current demotions.
+/// What the learner knows, as plain data so `decide_with` stays pure. Names are lowercase.
+#[derive(Clone, Debug)]
+pub struct Hints {
+    /// Names the user keeps undoing: never demoted.
+    pub protect: HashSet<String>,
+    /// Names demoting did not help for (enough tries, low success chance): never demoted.
+    pub blocked: HashSet<String>,
+    /// Chance that demoting this name helps; others get `default_prob`.
+    pub prob: HashMap<String, f64>,
+    pub default_prob: f64,
+    /// Extra weight from the local brain's view of what the program is (1.0 = neutral).
+    pub boost: HashMap<String, f64>,
+    /// Deepest level the brain allows for this name (default MAX_LEVEL).
+    pub max_level: HashMap<String, u8>,
+}
+
+impl Default for Hints {
+    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new() } }
+}
+
+/// Pure policy without learning hints.
 pub fn decide(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap<Key, Demotion>) -> Vec<Step> {
+    decide_with(total_pct, mood, seen, demoted, &Hints::default())
+}
+
+/// Pure policy. `seen` is every live process this tick; `demoted` the current demotions.
+pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap<Key, Demotion>, hints: &Hints) -> Vec<Step> {
     let mut out = Vec::new();
     let live: HashMap<Key, &Seen> = seen.iter().map(|s| (s.key, s)).collect();
     let fg_names: Vec<&str> = seen.iter().filter(|s| s.foreground).map(|s| s.name.as_str()).collect();
@@ -92,9 +117,13 @@ pub fn decide(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap<Key,
     let mut cands: Vec<&Seen> = seen.iter()
         .filter(|s| !s.protected && !s.foreground && !fg_names.contains(&s.name.as_str()))
         .filter(|s| s.core_pct >= MIN_CORE_PCT)
-        .filter(|s| demoted.get(&s.key).map_or(true, |d| d.level < MAX_LEVEL))
+        .filter(|s| { let n = s.name.to_lowercase(); !hints.protect.contains(&n) && !hints.blocked.contains(&n) })
+        .filter(|s| { let cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(MAX_LEVEL).min(MAX_LEVEL); demoted.get(&s.key).map_or(0, |d| d.level) < cap })
         .collect();
-    cands.sort_by(|a, b| b.core_pct.partial_cmp(&a.core_pct).unwrap_or(std::cmp::Ordering::Equal));
+    // Biggest user first, weighted by how often demoting that name has helped.
+    let weight = |s: &Seen| { let n = s.name.to_lowercase();
+        s.core_pct * hints.prob.get(&n).copied().unwrap_or(hints.default_prob) * hints.boost.get(&n).copied().unwrap_or(1.0) };
+    cands.sort_by(|a, b| weight(b).partial_cmp(&weight(a)).unwrap_or(std::cmp::Ordering::Equal));
     for s in cands.into_iter().take(MAX_DEMOTIONS_PER_TICK) {
         let lvl = demoted.get(&s.key).map_or(0, |d| d.level) + 1;
         out.push(Step::Demote { key: s.key, name: s.name.clone(), to_level: lvl,
@@ -130,6 +159,12 @@ pub struct Governor {
     last_procs: Vec<Proc>, // the snapshot of the latest tick, for the rule enforcer
     /// Total CPU use measured on the latest tick (0-100).
     pub total_pct: f64,
+    /// CPU (share of one core) of the foreground app on the latest tick, if there is one.
+    pub fg_cpu_pct: Option<f64>,
+    /// Busiest background-or-not processes of the latest tick (lowercase name, core %), biggest first, at most 5.
+    pub top: Vec<(String, f64)>,
+    /// What the learner suggests; refreshed by the watch loop.
+    pub hints: Hints,
     /// Whether current demotions were really applied (false = dry run bookkeeping only).
     pub acting: bool,
 }
@@ -141,7 +176,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, acting: false }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -187,9 +222,14 @@ impl Governor {
         let total_pct = (busy_sum / self.cores).min(100.0);
         self.total_pct = total_pct;
         self.mood.update(total_pct);
+        self.fg_cpu_pct = seen.iter().find(|s| s.foreground).map(|s| s.core_pct);
+        let mut top: Vec<(String, f64)> = seen.iter().filter(|s| s.core_pct >= 5.0).map(|s| (s.name.to_lowercase(), s.core_pct)).collect();
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        top.truncate(5);
+        self.top = top;
 
         let mut changes = Vec::new();
-        for step in decide(total_pct, &self.mood, &seen, &self.demoted) {
+        for step in decide_with(total_pct, &self.mood, &seen, &self.demoted, &self.hints) {
             match step {
                 Step::Forget { key } => { self.demoted.remove(&key); }
                 Step::Demote { key, name, to_level, reason } => {
@@ -283,6 +323,27 @@ mod gov_tests {
         assert!(matches!(&steps[0], Step::Restore { to_level: 0, .. }));
         let steps = decide(20.0, &Mood { busy_ticks: 0, calm_ticks: CALM_TICKS + (RESTORE_EVERY - CALM_TICKS % RESTORE_EVERY) % RESTORE_EVERY }, &[s(1, "ffmpeg.exe", 5.0)], &d);
         assert!(matches!(&steps[0], Step::Restore { to_level: 2, .. }));
+    }
+
+    #[test]
+    fn hints_protect_block_and_weight() {
+        let m = Mood { busy_ticks: BUSY_TICKS, calm_ticks: 0 };
+        let seen = vec![s(1, "A.exe", 300.0), s(2, "b.exe", 200.0), s(3, "c.exe", 100.0)];
+        let mut h = Hints::default();
+        h.protect.insert("a.exe".into());
+        let steps = decide_with(95.0, &m, &seen, &HashMap::new(), &h);
+        assert!(matches!(&steps[0], Step::Demote { key: (2, 1), .. }) && matches!(&steps[1], Step::Demote { key: (3, 1), .. }));
+        let mut h = Hints::default();
+        h.blocked.insert("b.exe".into());
+        let steps = decide_with(95.0, &m, &seen, &HashMap::new(), &h);
+        assert!(!steps.iter().any(|x| matches!(x, Step::Demote { key: (2, 1), .. })));
+        // a never-helpful big user (0.2) is tried after a smaller one that always helps (0.9)
+        let mut h = Hints::default();
+        h.prob.insert("a.exe".into(), 0.2);
+        h.prob.insert("c.exe".into(), 0.9);
+        let steps = decide_with(95.0, &m, &seen, &HashMap::new(), &h);
+        assert!(matches!(&steps[0], Step::Demote { key: (2, 1), .. }), "b 200*1.0 first");
+        assert!(matches!(&steps[1], Step::Demote { key: (3, 1), .. }), "c 100*0.9 beats a 300*0.2");
     }
 
     #[test]
