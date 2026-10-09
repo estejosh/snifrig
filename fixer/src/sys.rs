@@ -95,6 +95,30 @@ pub fn snapshot(buf: &mut Vec<u8>) -> Vec<Proc> {
     Vec::new()
 }
 
+/// (commit %, available physical MB) from GlobalMemoryStatusEx; None if the call fails.
+pub fn memory_status() -> Option<(f64, f64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    unsafe {
+        let mut m: MEMORYSTATUSEX = std::mem::zeroed();
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut m) == 0 || m.ullTotalPageFile == 0 { return None; }
+        let used = m.ullTotalPageFile.saturating_sub(m.ullAvailPageFile) as f64;
+        Some((used / m.ullTotalPageFile as f64 * 100.0, m.ullAvailPhys as f64 / 1048576.0))
+    }
+}
+
+/// Seconds to add to unix time to get local time (daylight saving included).
+pub fn local_offset_secs() -> i64 {
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    unsafe {
+        let mut z: TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let r = GetTimeZoneInformation(&mut z);
+        if r == 0xFFFF_FFFF { return 0; }
+        let bias = z.Bias + if r == 2 { z.DaylightBias } else { z.StandardBias };
+        -(bias as i64) * 60
+    }
+}
+
 pub fn foreground_pid() -> Option<u32> {
     unsafe {
         let w = GetForegroundWindow();

@@ -17,6 +17,8 @@ pub mod sha256;
 pub mod sys;
 pub mod governor;
 pub mod rules;
+pub mod learn;
+pub mod baseline;
 
 /// What the fixer can do, mildest first.
 #[derive(Clone, Debug, PartialEq)]

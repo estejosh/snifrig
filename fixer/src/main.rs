@@ -13,7 +13,7 @@
 //! PAID component: every command except license install/status/accept, machine-id and help needs a valid
 //! key and a recorded acceptance, otherwise it prints why on stderr and exits with code 2. No trial.
 
-use snifrig_fix::{actions, ledger, license, now_unix, plan, policy::Policy, proc, rules, Action, Mode, Subject, Target, Verdict};
+use snifrig_fix::{actions, baseline::Baseline, ledger, learn::{self, Feedback, Learner, Metrics, Trigger}, license, now_unix, plan, policy::Policy, proc, rules, sys, Action, Mode, Subject, Target, Verdict};
 use std::path::{Path, PathBuf};
 
 fn default_dir() -> PathBuf {
@@ -49,9 +49,13 @@ fn refine(action: &Action, t: &Target) -> Action {
     }
 }
 
-fn process_once(dir: &Path) -> usize {
+fn process_once(dir: &Path) -> usize { process_once_ex(dir).0 }
+
+/// Like process_once, and also returns what ran: (action kind, lowercase name, metric it was meant to help).
+fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
     let (alerts, off) = ledger::new_alerts(dir, ledger::read_offset(dir));
     let mut acted = 0;
+    let mut ran = Vec::new();
     for a in &alerts {
         let it = plan::plan(a);
         let targets = resolve(&it.subject);
@@ -73,6 +77,7 @@ fn process_once(dir: &Path) -> usize {
                         Err(e) => ("failed", format!("auto: {}", e)),
                     };
                     ledger::record(dir, a, &action, Some(t), status, &note);
+                    if status == "done" { ran.push((learn::action_kind(&action.label()), t.name.to_lowercase(), learn::trigger_for(&action.label(), &a.msg))); }
                     acted += 1;
                 }
                 Verdict::Queue => {
@@ -86,7 +91,7 @@ fn process_once(dir: &Path) -> usize {
         }
     }
     ledger::write_offset(dir, off);
-    acted
+    (acted, ran)
 }
 
 /// Record governor changes. `acted` false means dry run: logged as "would".
@@ -117,6 +122,12 @@ fn approve(dir: &Path, id: &str) -> Result<String, String> {
     let r = actions::run(&action, &t);
     let (status, note) = match &r { Ok(m) => ("done", format!("approved: {}", m)), Err(e) => ("failed", format!("approved: {}", e)) };
     ledger::record(dir, &alert, &action, Some(&t), status, &note);
+    if r.is_ok() {
+        let mut f = Feedback::new("approve", "fix", &learn::action_kind(&action.label()), &t.name);
+        f.trigger = learn::trigger_for(&action.label(), &item.msg).as_str().into();
+        f.start = true;
+        learn::append_feedback(dir, &f);
+    }
     r
 }
 
@@ -129,6 +140,7 @@ fn dismiss(dir: &Path, id: &str) -> Result<String, String> {
     let action = Action::parse(&item.action).unwrap_or(Action::Report);
     let t = Target { pid: item.pid, name: item.name.clone(), ..Default::default() };
     ledger::record(dir, &alert, &action, Some(&t), "dismissed", "dismissed by user");
+    learn::append_feedback(dir, &Feedback::new("dismiss", "fix", &learn::action_kind(&action.label()), &item.name));
     Ok(format!("dismissed {} on {}", item.action, item.name))
 }
 
@@ -160,6 +172,7 @@ fn log_enf(dir: &Path, applied: Vec<rules::Applied>, acting: bool) {
 
 /// Pick up `gov-undo-<pid>` request files written by `governor undo`.
 fn handle_undo(dir: &Path, gov: &mut snifrig_fix::governor::Governor, act: bool) {
+    // The undo request files are the only signal the loop sees directly; the learner reads it back from the feedback file.
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let fname = e.file_name().to_string_lossy().to_string();
@@ -170,6 +183,7 @@ fn handle_undo(dir: &Path, gov: &mut snifrig_fix::governor::Governor, act: bool)
             let alert = snifrig_fix::Alert { t: String::new(), key: format!("gov:undo#{}", pid), msg: String::new() };
             ledger::record(dir, &alert, &Action::Report, None, "refused", &format!("undo asked for pid {} but the governor has not changed it", pid));
         } else {
+            for c in &changes { learn::append_feedback(dir, &Feedback::new("undo", "governor", "demote", &c.name)); }
             log_gov(dir, changes, act);
         }
     }
@@ -199,9 +213,22 @@ fn watch(dir: &Path) {
     let mut sugg = rules::suggestions(dir);
     let stop = dir.join("stop-fix");
     let (mut n, mut last_key, mut last_write) = (0u64, String::new(), 0.0f64);
+    let mut learner = Learner::load(dir);
+    let mut base = Baseline::load(dir);
+    base.set_tz(sys::local_offset_secs());
+    let metrics = |gov: &snifrig_fix::governor::Governor| {
+        let (commit_pct, avail_mb) = sys::memory_status().unwrap_or((0.0, 0.0));
+        Metrics { total_cpu_pct: gov.total_pct, commit_pct, avail_mb, fg_cpu_pct: gov.fg_cpu_pct }
+    };
     loop {
         if stop.exists() { let _ = std::fs::remove_file(&stop); break; }
-        if n % 30 == 0 { process_once(dir); }
+        if n % 30 == 0 {
+            let (_, ran) = process_once_ex(dir);
+            if !ran.is_empty() {
+                let m = metrics(&gov);
+                for (action, name, trig) in ran { learner.start("fix", &action, &name, trig, now_unix(), m.clone()); }
+            }
+        }
         if n > 0 && n % 30 == 0 {
             let mt = rules::mtime(dir);
             if mt != rules_mt {
@@ -225,11 +252,40 @@ fn watch(dir: &Path) {
             gov.acting = act;
             enf.acting = act;
             let changes = gov.tick(now_unix(), act);
+            if act {
+                let fresh: Vec<&str> = changes.iter().filter(|c| c.result.is_ok() && c.from == 0 && c.to == 1).map(|c| c.name.as_str()).collect();
+                if !fresh.is_empty() {
+                    let m = metrics(&gov);
+                    for name in fresh { learner.start("governor", "demote", name, Trigger::Cpu, now_unix(), m.clone()); }
+                }
+            }
             log_gov(dir, changes, act);
             let applied = enf.tick(gov.procs(), &rule_set);
+            if act {
+                let m = metrics(&gov);
+                for a in applied.iter().filter(|a| a.result.is_ok() && !matches!(a.kind, "refused" | "max_instances")) {
+                    learner.start("rule", a.kind, &a.name, Trigger::Cpu, now_unix(), m.clone());
+                }
+            }
             log_enf(dir, applied, act);
         }
         handle_undo(dir, &mut gov, act);
+        if n % 10 == 0 {
+            let (now, m) = (now_unix(), metrics(&gov));
+            learner.poll_feedback(now, &m);
+            learner.tick(now, &m);
+            gov.hints = learner.hints();
+            for note in learner.take_notes() {
+                let alert = snifrig_fix::Alert { t: String::new(), key: "learn:blocked".into(), msg: note.clone() };
+                ledger::record(dir, &alert, &Action::Report, None, "refused", &note);
+            }
+        }
+        if n > 0 && n % 60 == 0 {
+            let (now, m) = (now_unix(), metrics(&gov));
+            let top: Vec<String> = gov.top.iter().map(|(name, _)| name.clone()).collect();
+            base.update(now, m.total_cpu_pct, m.commit_pct, &top);
+            base.maybe_save(dir, now);
+        }
         let (full, key) = state_json(&gov, act, &sugg);
         if key != last_key || now_unix() - last_write >= 10.0 {
             rules::write_atomic(&dir.join("governor.json"), &full);
@@ -240,6 +296,7 @@ fn watch(dir: &Path) {
         std::thread::sleep(std::time::Duration::from_millis(1000));
     }
     { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); }
+    base.save(dir, now_unix());
     let _ = std::fs::remove_file(dir.join("governor.json"));
 }
 
@@ -361,7 +418,14 @@ fn main() {
             }
             Err(_) => out(Err("usage: snifrig-fix governor undo PID".into())),
         },
-        ["rule", "add", rest @ ..] if !rest.is_empty() => out(rules::add(&dir, &rest.join(" ")).map(|t| format!("added rule: {}", t))),
+        ["rule", "add", rest @ ..] if !rest.is_empty() => {
+            let r = rules::add(&dir, &rest.join(" "));
+            if r.is_ok() {
+                let pat = rest.join(" ").split_whitespace().next().unwrap_or("").to_lowercase();
+                learn::append_feedback(&dir, &Feedback::new("rule_added", "rule", "add", &pat));
+            }
+            out(r.map(|t| format!("added rule: {}", t)))
+        }
         ["rule", "list"] => {
             let lines = rules::rule_lines(&dir);
             if lines.is_empty() { println!("no rules yet; add one with: snifrig-fix rule add \"ffmpeg*.exe priority=below_normal cap=60\""); }
