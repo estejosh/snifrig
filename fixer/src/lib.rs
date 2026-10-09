@@ -16,6 +16,7 @@ pub mod proc;
 pub mod sha256;
 pub mod sys;
 pub mod governor;
+pub mod brain;
 pub mod rules;
 pub mod learn;
 pub mod baseline;

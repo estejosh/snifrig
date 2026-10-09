@@ -79,10 +79,14 @@ pub struct Hints {
     /// Chance that demoting this name helps; others get `default_prob`.
     pub prob: HashMap<String, f64>,
     pub default_prob: f64,
+    /// Extra weight from the local brain's view of what the program is (1.0 = neutral).
+    pub boost: HashMap<String, f64>,
+    /// Deepest level the brain allows for this name (default MAX_LEVEL).
+    pub max_level: HashMap<String, u8>,
 }
 
 impl Default for Hints {
-    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0 } }
+    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new() } }
 }
 
 /// Pure policy without learning hints.
@@ -114,10 +118,11 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
         .filter(|s| !s.protected && !s.foreground && !fg_names.contains(&s.name.as_str()))
         .filter(|s| s.core_pct >= MIN_CORE_PCT)
         .filter(|s| { let n = s.name.to_lowercase(); !hints.protect.contains(&n) && !hints.blocked.contains(&n) })
-        .filter(|s| demoted.get(&s.key).map_or(true, |d| d.level < MAX_LEVEL))
+        .filter(|s| { let cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(MAX_LEVEL).min(MAX_LEVEL); demoted.get(&s.key).map_or(0, |d| d.level) < cap })
         .collect();
     // Biggest user first, weighted by how often demoting that name has helped.
-    let weight = |s: &Seen| s.core_pct * hints.prob.get(&s.name.to_lowercase()).copied().unwrap_or(hints.default_prob);
+    let weight = |s: &Seen| { let n = s.name.to_lowercase();
+        s.core_pct * hints.prob.get(&n).copied().unwrap_or(hints.default_prob) * hints.boost.get(&n).copied().unwrap_or(1.0) };
     cands.sort_by(|a, b| weight(b).partial_cmp(&weight(a)).unwrap_or(std::cmp::Ordering::Equal));
     for s in cands.into_iter().take(MAX_DEMOTIONS_PER_TICK) {
         let lvl = demoted.get(&s.key).map_or(0, |d| d.level) + 1;

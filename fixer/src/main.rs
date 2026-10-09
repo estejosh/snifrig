@@ -215,6 +215,7 @@ fn watch(dir: &Path) {
     let (mut n, mut last_key, mut last_write) = (0u64, String::new(), 0.0f64);
     let mut learner = Learner::load(dir);
     let mut base = Baseline::load(dir);
+    let brain = snifrig_fix::brain::Brain::start(dir);
     base.set_tz(sys::local_offset_secs());
     let metrics = |gov: &snifrig_fix::governor::Governor| {
         let (commit_pct, avail_mb) = sys::memory_status().unwrap_or((0.0, 0.0));
@@ -275,6 +276,15 @@ fn watch(dir: &Path) {
             learner.poll_feedback(now, &m);
             learner.tick(now, &m);
             gov.hints = learner.hints();
+            // Ask the local brain (OpenJev) what the busiest programs are; it answers later, off this thread.
+            for (name, pct) in gov.top.iter().take(5) {
+                if *pct < 5.0 { continue; }
+                if let Some(p) = gov.procs().iter().find(|p| p.name.eq_ignore_ascii_case(name)) {
+                    let parent = gov.procs().iter().find(|q| q.pid == p.ppid).map(|q| q.name.clone()).unwrap_or_default();
+                    brain.want(name, &sys::cmdline(p.pid), &parent);
+                }
+            }
+            snifrig_fix::brain::apply(&mut gov.hints, &brain.cache());
             for note in learner.take_notes() {
                 let alert = snifrig_fix::Alert { t: String::new(), key: "learn:blocked".into(), msg: note.clone() };
                 ledger::record(dir, &alert, &Action::Report, None, "refused", &note);
