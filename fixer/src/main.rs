@@ -87,6 +87,21 @@ fn process_once(dir: &Path) -> usize {
     acted
 }
 
+/// Record governor changes. `acted` false means dry run: logged as "would".
+fn log_gov(dir: &Path, changes: Vec<snifrig_fix::governor::Change>, acted: bool) {
+    for c in changes {
+        let alert = snifrig_fix::Alert { t: String::new(), key: format!("gov:{}#{}", c.name, c.pid), msg: c.reason.clone() };
+        let t = Target { pid: c.pid, name: c.name.clone(), ..Default::default() };
+        let action = if c.to > c.from { Action::LowerPriority } else { Action::Report };
+        let (status, note) = match (&c.result, acted) {
+            (_, false) => ("would", format!("governor level {} -> {}: {}", c.from, c.to, c.reason)),
+            (Ok(()), true) => ("done", format!("auto: governor level {} -> {}: {}", c.from, c.to, c.reason)),
+            (Err(e), true) => ("failed", format!("governor level {} -> {}: {}", c.from, c.to, e)),
+        };
+        ledger::record(dir, &alert, &action, Some(&t), status, &note);
+    }
+}
+
 fn approve(dir: &Path, id: &str) -> Result<String, String> {
     let mut items = ledger::load_pending(dir);
     let i = items.iter().position(|x| x.id == id).ok_or("no pending fix with that id")?;
@@ -193,11 +208,29 @@ fn main() {
             println!("{}", if l.licensed { format!("licensed to {}, valid until {}; UFL-3.7 accepted: {}", l.licensee, l.not_after, if license::accepted(&dir) { "yes" } else { "no" }) } else { format!("{} (UFL-3.7 accepted: {})", l.note, if license::accepted(&dir) { "yes" } else { "no" }) });
         }
         ["once"] => { let n = process_once(&dir); println!("processed; {} automatic actions", n); }
-        [] => loop {
+        [] => {
+            // Governor ticks every second; alert processing every 30 ticks.
+            let mut gov = snifrig_fix::governor::Governor::new(ledger::read_list(&dir, "fix-deny.txt"), snifrig_fix::rules::pinned_names(&dir));
             let stop = dir.join("stop-fix");
-            if stop.exists() { let _ = std::fs::remove_file(&stop); break; }
-            process_once(&dir);
-            for _ in 0..60 { if stop.exists() { break; } std::thread::sleep(std::time::Duration::from_millis(500)); }
+            let mut n: u64 = 0;
+            loop {
+                if stop.exists() { let _ = std::fs::remove_file(&stop); break; }
+                if n % 30 == 0 { process_once(&dir); }
+                let mode = ledger::read_mode(&dir);
+                let paused = now_unix() < ledger::paused_until(&dir);
+                if mode == Mode::Off || paused {
+                    if !gov.demoted.is_empty() { let a = gov.acting; log_gov(&dir, gov.restore_all(a), a); }
+                } else {
+                    let act = matches!(mode, Mode::Ask | Mode::Auto);
+                    if act != gov.acting && !gov.demoted.is_empty() { let a = gov.acting; log_gov(&dir, gov.restore_all(a), a); }
+                    gov.acting = act;
+                    let changes = gov.tick(now_unix(), act);
+                    log_gov(&dir, changes, act);
+                }
+                n += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+            { let a = gov.acting; log_gov(&dir, gov.restore_all(a), a); }
         },
         _ => out(Err(USAGE.into())),
     }
