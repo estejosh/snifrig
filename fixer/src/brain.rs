@@ -47,7 +47,8 @@ pub fn shape(v: &Verdict) -> (f64, u8) {
         "interactive" | "game" if important => (0.3, 1), // efficiency mode at most
         "interactive" | "game" => (0.6, 2),
         "system" => (0.5, 1),
-        "media_batch" | "dev_build" | "sync_backup" | "ai_model" | "background" if !important => (1.5, 3),
+        "ai_model" => (1.0, 2), // local models the owner runs: never idle-starved
+        "media_batch" | "dev_build" | "sync_backup" | "background" if !important => (1.5, 3),
         _ => (1.0, 3),
     }
 }
@@ -76,6 +77,7 @@ pub fn request_body(name: &str, cmdline: &str, parent: &str) -> String {
 
 /// Parse the response. Pure, for tests. Tolerates field order.
 pub fn parse_response(body: &str, now: f64) -> Option<Verdict> {
+    let body = &compact(body);
     let kpos = body.find("\"kind\"")?;
     let kind_part = &body[kpos..];
     let kind = str_field(kind_part, "choice")?;
@@ -84,6 +86,18 @@ pub fn parse_response(body: &str, now: f64) -> Option<Verdict> {
     let importance = num_field(&body[ipos..], "score").unwrap_or(2.0);
     if !KINDS.iter().any(|(k, _)| *k == kind) { return None; }
     Some(Verdict { kind, confidence, importance, unix: now })
+}
+
+/// Drop whitespace outside strings, so `"k": "v"` (Python's json style) reads like `"k":"v"`.
+fn compact(s: &str) -> String {
+    let (mut out, mut in_str, mut esc) = (String::with_capacity(s.len()), false, false);
+    for c in s.chars() {
+        if in_str {
+            out.push(c);
+            if esc { esc = false } else if c == '\\' { esc = true } else if c == '"' { in_str = false }
+        } else if c == '"' { in_str = true; out.push(c) } else if !c.is_whitespace() { out.push(c) }
+    }
+    out
 }
 
 /// Minimal HTTP/1.1 POST over a plain TCP socket to a loopback server.
@@ -126,7 +140,7 @@ impl Brain {
                 g.queued.remove(&name);
                 match res {
                     Ok(v) => { g.cache.insert(name, v); save_cache(&p, &g.cache); g.last_err.clear(); }
-                    Err(e) => { g.last_err = e; }
+                    Err(e) => { let _ = std::fs::write(p.with_file_name("brain-error.txt"), format!("{} {}: {}\n", crate::now_unix() as u64, name, e)); g.last_err = e; }
                 }
             }
         });
@@ -148,6 +162,13 @@ impl Brain {
     pub fn cache(&self) -> HashMap<String, Verdict> { self.shared.lock().map(|g| g.cache.clone()).unwrap_or_default() }
     pub fn last_error(&self) -> String { self.shared.lock().map(|g| g.last_err.clone()).unwrap_or_default() }
     pub fn cache_path(&self) -> &Path { &self.path }
+}
+
+/// One synchronous question, for `snifrig-fix brain <name>`; returns the verdict or the raw reply on failure.
+pub fn ask_now(dir: &Path, name: &str, cmdline: &str, parent: &str) -> Result<Verdict, String> {
+    let url = std::fs::read_to_string(dir.join("jev.txt")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_URL.to_string());
+    let body = post(&url, &request_body(name, cmdline, parent))?;
+    parse_response(&body, crate::now_unix()).ok_or_else(|| format!("unreadable answer: {}", body.chars().take(600).collect::<String>()))
 }
 
 fn load_cache(path: &Path) -> HashMap<String, Verdict> {
@@ -181,6 +202,15 @@ mod brain_tests {
         assert!(b.starts_with("{\"state\":\""));
         assert!(b.contains("\"type\":\"choice\"") && b.contains("\"type\":\"score\""));
         assert!(b.contains("\\\"X:\\\\a.mp4\\\""), "quotes and backslashes escaped: {}", b);
+    }
+
+    #[test]
+    fn parses_spaced_python_json() {
+        let body = r#"{"answers": {"kind": {"type": "choice", "choice": "game", "probabilities": {"game": 0.97}, "confidence": 0.97}, "importance": {"type": "score", "score": 3.0, "probabilities": {"4": 0.5}, "confidence": 0.5}}, "model": "x y"}"#;
+        let v = parse_response(body, 1.0).unwrap();
+        assert_eq!(v.kind, "game");
+        assert!((v.confidence - 0.97).abs() < 1e-9 && (v.importance - 3.0).abs() < 1e-9);
+        assert_eq!(shape(&v), (0.3, 1));
     }
 
     #[test]

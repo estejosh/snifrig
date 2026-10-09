@@ -393,6 +393,14 @@ fn main() {
     let out = |r: Result<String, String>| match r { Ok(m) => println!("{}", m), Err(e) => { eprintln!("{}", e); std::process::exit(1) } };
     if help { println!("{}", USAGE); return; }
     match cmd.as_slice() {
+        ["brain", name] => {
+            let found = sys::snapshot(&mut Vec::new()).into_iter().find(|p| p.name.eq_ignore_ascii_case(name));
+            let cmd = found.as_ref().map(|p| sys::cmdline(p.pid)).unwrap_or_default();
+            out(snifrig_fix::brain::ask_now(&dir, name, &cmd, "").map(|v| {
+                let (w, max) = snifrig_fix::brain::shape(&v);
+                format!("{}: kind {} (confidence {:.2}), importance {:.2} -> weight {:.1}, deepest level {}", name, v.kind, v.confidence, v.importance, w, max)
+            }))
+        }
         ["mode", m] => match Mode::parse(m) {
             Some(m) => { ledger::write_mode(&dir, m); println!("fixer mode: {}", m.as_str()); }
             None => out(Err("mode must be off, dry-run, ask or auto".into())),
