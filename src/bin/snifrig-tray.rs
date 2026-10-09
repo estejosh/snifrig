@@ -27,6 +27,7 @@ static mut HEAD_SHOWN: Vec<(String, u64)> = Vec::new(); // headline balloons alr
 static mut LAST_BALLOON: u64 = 0;
 static mut SEEN: Vec<String> = Vec::new(); // pending fix ids already announced
 static mut MENU_IDS: Vec<String> = Vec::new(); // pending ids behind the current menu's Approve/Dismiss (100+2i, 101+2i)
+static mut GOV_CMDS: Vec<Vec<String>> = Vec::new(); // fixer args behind Governor menu ids 200+i
 const MODES: [&str; 4] = ["off", "dry-run", "ask", "auto"]; // menu ids 110..113
 
 struct Pend { id: String, action: String, name: String, pid: u64, why: String }
@@ -133,6 +134,12 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         _ => "Snifrig: monitor not running".to_string(),
     };
     let tip = if !st.headline.is_empty() && st.level != 2 { format!("Snifrig: {}", st.headline) } else { tip };
+    let gn = if fixer_exe().is_some() && dir().join("snifrig-fix.key").exists() { flyout::gov_read(dir()).map_or(0, |g| g.held.len()) } else { 0 };
+    let tip = if gn > 0 {
+        let suf = format!(" \u{b7} governor holding {}", gn);
+        let base: String = tip.chars().take(127usize.saturating_sub(suf.encode_utf16().count())).collect();
+        format!("{}{}", base, suf)
+    } else { tip };
     put(&mut n.szTip, &tip);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let head_ball = {
@@ -236,6 +243,30 @@ unsafe fn menu(hwnd: HWND) {
             AppendMenuW(fm, MF_STRING | if *md == cur { MF_CHECKED } else { 0 }, 110 + i, wide(md).as_ptr());
         }
         AppendMenuW(m, MF_STRING | MF_POPUP, fm as usize, wide("Fixer mode").as_ptr());
+        let cmds = &mut *std::ptr::addr_of_mut!(GOV_CMDS);
+        cmds.clear();
+        if let Some(g) = flyout::gov_read(dir()) {
+            let gm = CreatePopupMenu();
+            let hd = if g.held.is_empty() { "Nothing held back".to_string() } else { format!("Holding back {} app{}", g.held.len(), if g.held.len() == 1 { "" } else { "s" }) };
+            AppendMenuW(gm, MF_STRING | MF_GRAYED, 0, wide(&hd).as_ptr());
+            for h in g.held.iter().take(5) {
+                let sub = CreatePopupMenu();
+                let lv = match h.level { 1 => "efficiency mode", 2 => "below normal", _ => "idle" };
+                let why: String = h.reason.chars().take(50).collect();
+                let label = if why.is_empty() { format!("{}: {}", h.name, lv) } else { format!("{}: {} ({})", h.name, lv, why) };
+                AppendMenuW(sub, MF_STRING, 200 + cmds.len(), wide("Give it full speed now").as_ptr());
+                cmds.push(vec!["governor".into(), "undo".into(), h.pid.to_string()]);
+                AppendMenuW(sub, MF_STRING, 200 + cmds.len(), wide("Always run in background").as_ptr());
+                cmds.push(vec!["rule".into(), "add".into(), format!("{} background=yes", h.name)]);
+                AppendMenuW(gm, MF_STRING | MF_POPUP, sub as usize, wide(&esc(&label)).as_ptr());
+            }
+            for (name, count) in g.sugg.iter().take(5) {
+                let label = format!("Make {} always background (held back {} time{} this week)", name, count, if *count == 1 { "" } else { "s" });
+                AppendMenuW(gm, MF_STRING, 200 + cmds.len(), wide(&esc(&label)).as_ptr());
+                cmds.push(vec!["rule".into(), "add".into(), format!("{} background=yes", name)]);
+            }
+            AppendMenuW(m, MF_STRING | MF_POPUP, gm as usize, wide("Governor").as_ptr());
+        }
     }
     AppendMenuW(m, MF_SEPARATOR, 0, null());
     AppendMenuW(m, MF_STRING, 4, wide("Quit tray icon").as_ptr());
@@ -275,6 +306,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 c @ 100..=105 => {
                     let ids = &*std::ptr::addr_of!(MENU_IDS);
                     if let Some(id) = ids.get(((c - 100) / 2) as usize) { run_fix(&[if c % 2 == 0 { "approve" } else { "dismiss" }, id]); }
+                }
+                c @ 200..=299 => {
+                    let cmds = &*std::ptr::addr_of!(GOV_CMDS);
+                    if let Some(a) = cmds.get((c - 200) as usize) { let v: Vec<&str> = a.iter().map(|s| s.as_str()).collect(); run_fix(&v); }
                 }
                 c @ 110..=113 => run_fix(&["mode", MODES[(c - 110) as usize]]),
                 4 => { DestroyWindow(hwnd); }

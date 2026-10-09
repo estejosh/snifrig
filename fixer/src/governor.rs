@@ -18,7 +18,7 @@
 use crate::policy;
 use crate::sys::{self, Proc};
 use crate::{Action, Target};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const TICK_SECS: f64 = 1.0;
 pub const BUSY_PCT: f64 = 75.0;
@@ -125,6 +125,11 @@ pub struct Governor {
     cores: f64,
     extra_deny: Vec<String>,
     pinned: Vec<String>, // image names a user rule manages; the governor leaves them alone
+    rules: Vec<crate::rules::Rule>, // user rules; any process a rule covers (wildcards too) is pinned
+    undone: HashSet<Key>, // processes the user restored by hand; left alone from then on
+    last_procs: Vec<Proc>, // the snapshot of the latest tick, for the rule enforcer
+    /// Total CPU use measured on the latest tick (0-100).
+    pub total_pct: f64,
     /// Whether current demotions were really applied (false = dry run bookkeeping only).
     pub acting: bool,
 }
@@ -136,14 +141,14 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, acting: false }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, acting: false }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
         let key = (p.pid, p.created);
         if let Some(&b) = self.protected_cache.get(&key) { return b; }
         let name = p.name.to_lowercase();
-        let mut b = self.pinned.iter().any(|x| *x == name);
+        let mut b = self.pinned.iter().any(|x| *x == name) || crate::rules::is_pinned(&self.rules, &name);
         if !b {
             // Only read the command line for real candidates; it is the expensive part.
             let t = Target { pid: p.pid, name: p.name.clone(), age_secs: f64::MAX, cmdline: sys::cmdline(p.pid), service: None, private_mb: 0.0 };
@@ -173,11 +178,14 @@ impl Governor {
             let foreground = Some(p.pid) == fg;
             // Cheap filter before the protected check, which may read a command line.
             let protected = if core_pct >= MIN_CORE_PCT || self.demoted.contains_key(&key) { self.protected(p) } else { true };
+            let protected = protected || self.undone.contains(&key);
             seen.push(Seen { key, name: p.name.clone(), core_pct, foreground, protected });
         }
         self.prev = next_prev;
         self.protected_cache.retain(|k, _| self.prev.contains_key(k));
+        self.undone.retain(|k| self.prev.contains_key(k));
         let total_pct = (busy_sum / self.cores).min(100.0);
+        self.total_pct = total_pct;
         self.mood.update(total_pct);
 
         let mut changes = Vec::new();
@@ -202,7 +210,27 @@ impl Governor {
                 }
             }
         }
+        self.last_procs = procs;
         changes
+    }
+
+    /// Replace the user rules (processes they cover become pinned).
+    pub fn set_rules(&mut self, rules: Vec<crate::rules::Rule>) { self.rules = rules; self.protected_cache.clear(); }
+
+    /// The process snapshot taken by the latest tick.
+    pub fn procs(&self) -> &[Proc] { &self.last_procs }
+
+    /// Restore every demotion of this pid fully, and leave it alone from now on.
+    pub fn undo(&mut self, pid: u32, act: bool) -> Vec<Change> {
+        let keys: Vec<Key> = self.demoted.keys().filter(|k| k.0 == pid).cloned().collect();
+        let mut out = Vec::new();
+        for k in keys {
+            let Some(d) = self.demoted.remove(&k) else { continue };
+            self.undone.insert(k);
+            let result = if !act { Ok(()) } else if !sys::image_matches(k.0, k.1, &d.name) { Err("pid reused".into()) } else { apply_level(k.0, d.level, 0, d.orig_priority) };
+            out.push(Change { pid, name: d.name, from: d.level, to: 0, reason: "you asked to undo it".into(), result });
+        }
+        out
     }
 
     /// Put everything back, e.g. on exit or pause.

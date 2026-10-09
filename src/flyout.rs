@@ -17,6 +17,29 @@ static mut REG: bool = false;
 static mut HEAD: String = String::new();
 static mut CAUSES: Vec<String> = Vec::new();
 static mut EXTRA: i32 = 0; // extra height for the verdict block, in 96-dpi px
+static mut GOV: String = String::new(); // "Governor: holding back a, b" line, empty when none
+static mut GOVY: i32 = 40; // 96-dpi y of that line
+
+pub struct Held { pub pid: u64, pub name: String, pub level: u64, pub reason: String }
+pub struct Gov { pub held: Vec<Held>, pub sugg: Vec<(String, u64)> }
+
+/// governor.json from snifrig-fix, None when missing or older than 30 s.
+pub fn gov_read(dir: &Path) -> Option<Gov> {
+    let s = std::fs::read_to_string(dir.join("governor.json")).ok()?;
+    let u = snifrig::json_num(&s, "unix");
+    if u == 0 || now_s().saturating_sub(u) >= 30 { return None; }
+    let (mut held, mut sugg) = (Vec::new(), Vec::new());
+    for c in s.split('{').skip(2) {
+        let name = snifrig::json_str(c, "name").unwrap_or_default();
+        if name.is_empty() { continue; }
+        if c.contains("\"pid\":") {
+            held.push(Held { pid: snifrig::json_num(c, "pid"), name, level: snifrig::json_num(c, "level"), reason: snifrig::json_str(c, "reason").unwrap_or_default() });
+        } else if c.contains("\"count\":") {
+            sugg.push((name, snifrig::json_num(c, "count")));
+        }
+    }
+    Some(Gov { held, sugg })
+}
 
 pub fn now_s() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
@@ -86,7 +109,12 @@ pub unsafe fn show(dir: &Path) {
         let fresh = crate::flyout::now_s().saturating_sub(num(&st, "unix") as u64) < 180;
         let h = if fresh { st.find("\"headline\":\"").map(|i| st[i + 12..].split('"').next().unwrap_or("").to_string()).unwrap_or_default() } else { String::new() };
         let c = if fresh && !h.is_empty() { snifrig::verdict::causes_from_status(&st) } else { Vec::new() };
-        EXTRA = if h.is_empty() { 0 } else { 8 + 36 + 34 * c.len().min(3) as i32 };
+        let hx = if h.is_empty() { 0 } else { 8 + 36 + 34 * c.len().min(3) as i32 };
+        let names: Vec<String> = gov_read(dir).map(|g| g.held.into_iter().take(3).map(|x| x.name).collect()).unwrap_or_default();
+        let gl = if names.is_empty() { String::new() } else { format!("Governor: holding back {}", names.join(", ")) };
+        GOVY = 40 + if h.is_empty() { 0 } else { hx - 8 };
+        EXTRA = hx + if gl.is_empty() { 0 } else { 20 };
+        GOV = gl;
         HEAD = h;
         CAUSES = c;
     }
@@ -154,6 +182,8 @@ unsafe fn paint(hwnd: HWND) {
         wrap(dc, hl, 36, sev_col, &mut y);
         for c in (&*std::ptr::addr_of!(CAUSES)).iter().take(3) { wrap(dc, &format!("- {}", c), 34, rgb(0xE7, 0xDC, 0xC0), &mut y); }
     }
+    let gv = &*std::ptr::addr_of!(GOV);
+    if !gv.is_empty() { text(dc, sc(20), sc(*std::ptr::addr_of!(GOVY)), gv, rgb(0x3F, 0xB8, 0xE8), false); }
     let ex = sc(EXTRA);
     if s.is_empty() {
         text(dc, sc(20), sc(14), "sampling...", rgb(0x9A, 0xA5, 0xAE), true);
