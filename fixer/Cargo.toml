@@ -1,6 +1,6 @@
 [package]
 name = "snifrig-fix"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "LicenseRef-UFL-3.7-U.P-snifrig-fix"
 description = "Snifrig fixer: acts on what the snifrig monitor finds. Licensed separately from the monitor."

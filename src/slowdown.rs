@@ -192,9 +192,12 @@ impl Slow {
         let maint_sum: f64 = maint.iter().map(|x| x.1).sum();
 
         let mut eff: Vec<(&str, f64)> = Vec::new();
+        // Apps snifrig fix put in efficiency mode on purpose are not Windows slowing you down.
+        let (eased_pids, eased_names) = self.dir.as_deref().map(eased_by_fixer).unwrap_or_default();
         let mut by_cpu: Vec<&(u32, String, f64)> = procs.iter().collect();
         by_cpu.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         for (pid, n, p) in by_cpu.into_iter().take(20) {
+            if eased_pids.contains(pid) || eased_names.iter().any(|x| name_match(x, n)) { continue; }
             if *p > 5.0 && eco(*pid) { eff.push((n.as_str(), *p)); }
         }
         let eff_sum: f64 = eff.iter().map(|x| x.1).sum();
@@ -249,6 +252,40 @@ impl Slow {
 }
 
 fn busy_names(v: &[(&str, f64)]) -> String { v.iter().map(|x| x.0).collect::<Vec<_>>().join(",") }
+
+/// Pids the fixer's governor has eased right now (fresh governor.json) and rule names that turn efficiency mode on.
+pub fn eased_by_fixer(dir: &std::path::Path) -> (std::collections::HashSet<u32>, Vec<String>) {
+    let mut pids = std::collections::HashSet::new();
+    let g = std::fs::read_to_string(dir.join("governor.json")).unwrap_or_default();
+    let fresh = g.find("\"unix\":").and_then(|i| g[i + 7..].split(|c: char| c == ',' || c == '}').next()?.parse::<f64>().ok())
+        .map_or(false, |u| (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) - u).abs() < 120.0);
+    if fresh {
+        for part in g.split("{\"pid\":").skip(1) {
+            if let Some(p) = part.split(|c: char| !c.is_ascii_digit()).next().and_then(|x| x.parse().ok()) { pids.insert(p); }
+        }
+    }
+    let names = std::fs::read_to_string(dir.join("fix-rules.txt")).unwrap_or_default().lines()
+        .map(|l| l.split('#').next().unwrap_or("").to_lowercase())
+        .filter(|l| l.contains("background=yes") || l.contains("efficiency=on"))
+        .filter_map(|l| l.split_whitespace().next().map(String::from)).collect();
+    (pids, names)
+}
+
+/// Rule pattern match: case-insensitive, '*' wildcard.
+fn name_match(pat: &str, name: &str) -> bool {
+    let name = name.to_lowercase();
+    let parts: Vec<&str> = pat.split('*').collect();
+    if parts.len() == 1 { return pat == name; }
+    let mut pos = 0;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() { continue; }
+        match name[pos..].find(part) {
+            Some(j) if i > 0 || j == 0 => pos += j + part.len(),
+            _ => return false,
+        }
+    }
+    parts.last().map_or(true, |l| l.is_empty() || name.ends_with(l))
+}
 
 fn eco(pid: u32) -> bool {
     unsafe {

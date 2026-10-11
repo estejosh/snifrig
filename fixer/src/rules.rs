@@ -15,7 +15,11 @@
 //! background=yes (shorthand for efficiency=on io=low priority=below_normal; later keys win).
 //! Priority never goes above normal. max_instances only reports the extra, newest copies and
 //! queues a terminate for your approval; it never kills anything by itself.
-//! A process named by a rule is "pinned": the automatic governor leaves it alone.
+//! A process named by a rule is "pinned": the automatic governor leaves it alone, unless the rule
+//! says governor=on (manage it like anything else) or max_level=<1..3> (manage it, but only that far).
+//! governor=exempt (or max_level=0) pins an app without changing anything else.
+//! game=yes|no: treat the app as a game for performance mode (or never).
+//! Priority and affinity are re-checked every reapply_secs (fix-governor.txt) and put back if the app resets them.
 
 use crate::{policy, sys, Action, Target};
 use std::collections::{HashMap, HashSet};
@@ -34,6 +38,12 @@ pub struct Rule {
     pub affinity: Option<u64>,
     pub cap: Option<u32>,
     pub max_instances: Option<usize>,
+    /// Some(true) = governor may manage it; Some(false) = exempt; None = pinned when the rule sets anything.
+    pub governor: Option<bool>,
+    /// Deepest governor level allowed (0 = exempt).
+    pub max_level: Option<u8>,
+    /// Performance mode override.
+    pub game: Option<bool>,
     /// The rule as written (whitespace normalised, comment removed).
     pub text: String,
 }
@@ -87,6 +97,9 @@ pub fn parse_line(line: &str) -> Result<Option<Rule>, String> {
             "affinity" => r.affinity = Some(parse_affinity(&v)?),
             "cap" => r.cap = Some(match v.parse::<u32>() { Ok(n) if (1..=100).contains(&n) => n, _ => return Err(bad("1 to 100")) }),
             "max_instances" => r.max_instances = Some(match v.parse::<usize>() { Ok(n) if n >= 1 => n, _ => return Err(bad("1 or more")) }),
+            "governor" => r.governor = Some(match v.as_str() { "on" | "yes" => true, "exempt" | "off" | "no" => false, _ => return Err(bad("on or exempt")) }),
+            "max_level" => r.max_level = Some(match v.parse::<u8>() { Ok(n) if n <= 3 => n, _ => return Err(bad("0 to 3")) }),
+            "game" => r.game = Some(match v.as_str() { "yes" | "on" => true, "no" | "off" => false, _ => return Err(bad("yes or no")) }),
             "background" => {
                 if v != "yes" { return Err(bad("yes")); }
                 r.efficiency = Some(true); r.io = Some(1); r.priority = Some(sys::BELOW_NORMAL);
@@ -122,13 +135,39 @@ pub fn load(dir: &Path) -> Vec<Rule> {
     read_rules_text(dir).lines().filter_map(|l| parse_line(l).ok().flatten()).collect()
 }
 
-/// Literal (non-wildcard) lowercase names from the rules.
-pub fn pinned_names(dir: &Path) -> Vec<String> {
-    load(dir).into_iter().map(|r| r.pattern).filter(|p| !p.contains('*') && !p.contains('?')).collect()
+impl Rule {
+    /// Whether this rule keeps the governor away from the app.
+    pub fn pins(&self) -> bool {
+        match (self.governor, self.max_level) {
+            (_, Some(0)) | (Some(false), _) => true,
+            (Some(true), _) | (_, Some(_)) => false,
+            _ => self.priority.is_some() || self.efficiency.is_some() || self.io.is_some() || self.memory.is_some() || self.affinity.is_some() || self.cap.is_some(),
+        }
+    }
+    /// The rule makes the app run slower on purpose (so performance mode should not treat it as a game).
+    pub fn slows(&self) -> bool { self.priority.map_or(false, |p| p != sys::NORMAL) || self.efficiency == Some(true) || self.cap.is_some() || self.affinity.is_some() }
 }
 
-/// True if any rule (wildcard or literal) covers this image name.
-pub fn is_pinned(rules: &[Rule], name: &str) -> bool { rules.iter().any(|r| glob_match(&r.pattern, name)) }
+/// Literal (non-wildcard) lowercase names of rules that pin.
+pub fn pinned_names(dir: &Path) -> Vec<String> {
+    load(dir).into_iter().filter(|r| r.pins()).map(|r| r.pattern).filter(|p| !p.contains('*') && !p.contains('?')).collect()
+}
+
+/// True if any pinning rule (wildcard or literal) covers this image name.
+pub fn is_pinned(rules: &[Rule], name: &str) -> bool { rules.iter().any(|r| r.pins() && glob_match(&r.pattern, name)) }
+
+/// The deepest governor level a rule allows for this name (first matching rule that sets one).
+pub fn rule_max_level(rules: &[Rule], name: &str) -> Option<u8> {
+    rules.iter().filter(|r| glob_match(&r.pattern, name)).find_map(|r| r.max_level.filter(|_| !r.pins()))
+}
+
+/// Some(true/false) if a rule says whether this app is a game; Some(false) also when a rule deliberately slows it.
+pub fn game_override(rules: &[Rule], name: &str) -> Option<bool> {
+    let m: Vec<&Rule> = rules.iter().filter(|r| glob_match(&r.pattern, name)).collect();
+    if let Some(g) = m.iter().find_map(|r| r.game) { return Some(g); }
+    if m.iter().any(|r| r.slows()) { return Some(false); }
+    None
+}
 
 pub fn mtime(dir: &Path) -> Option<std::time::SystemTime> { std::fs::metadata(dir.join(FILE)).and_then(|m| m.modified()).ok() }
 
@@ -200,9 +239,12 @@ pub fn suggestions_from(fixes: &str, now: f64, rules: &[Rule]) -> Vec<(String, u
 /// One thing the enforcer did (or would do), for the ledger.
 pub struct Applied { pub pid: u32, pub name: String, pub kind: &'static str, pub note: String, pub result: Result<(), String> }
 
-/// Applies rules once per process (pid + create time).
+/// Applies rules to each process (pid + create time) once, then re-checks priority and affinity
+/// every `reapply_secs` and puts them back if the app changed them.
 pub struct Enforcer {
     done: HashSet<(u32, u64)>,
+    checked: HashMap<(u32, u64), f64>,
+    pub reapply_secs: u32,
     reported: HashSet<(u32, u64)>,
     extra_deny: Vec<String>,
     /// false = dry run: nothing is changed, results are Ok.
@@ -210,14 +252,33 @@ pub struct Enforcer {
 }
 
 impl Enforcer {
-    pub fn new(extra_deny: Vec<String>) -> Self { Enforcer { done: HashSet::new(), reported: HashSet::new(), extra_deny, acting: false } }
+    pub fn new(extra_deny: Vec<String>) -> Self { Enforcer { done: HashSet::new(), checked: HashMap::new(), reapply_secs: 30, reported: HashSet::new(), extra_deny, acting: false } }
 
     /// Forget what was applied (rules reloaded, or dry run turned into real runs).
-    pub fn reset(&mut self) { self.done.clear(); self.reported.clear(); }
+    pub fn reset(&mut self) { self.done.clear(); self.checked.clear(); self.reported.clear(); }
 
     fn denied(&self, p: &sys::Proc) -> Option<String> {
         let t = Target { pid: p.pid, name: p.name.clone(), age_secs: f64::MAX, cmdline: sys::cmdline(p.pid), service: None, private_mb: 0.0 };
         policy::denied(&t, &Action::LowerPriority, &self.extra_deny)
+    }
+
+    /// Put back priority (pinned rules only, so it never fights the governor) and affinity if the app changed them.
+    fn recheck(&self, p: &sys::Proc, rules: &[Rule], out: &mut Vec<Applied>) {
+        for r in rules.iter().filter(|r| glob_match(&r.pattern, &p.name)) {
+            if let Some(c) = r.priority.filter(|_| r.pins()) {
+                if sys::get_priority(p.pid).map_or(false, |now| now != c) && sys::image_matches(p.pid, p.created, &p.name) {
+                    out.push(Applied { pid: p.pid, name: p.name.clone(), kind: "priority", note: format!("rule {}: app changed its priority, put back {:#x}", r.pattern, c), result: sys::set_priority(p.pid, c) });
+                }
+            }
+            if let Some(m) = r.affinity {
+                if let Some((cur, system)) = sys::get_affinity(p.pid) {
+                    let want = m & system;
+                    if want != 0 && cur != want && sys::image_matches(p.pid, p.created, &p.name) {
+                        out.push(Applied { pid: p.pid, name: p.name.clone(), kind: "affinity", note: format!("rule {}: app changed its cores, put back {:#x}", r.pattern, want), result: sys::set_affinity(p.pid, want) });
+                    }
+                }
+            }
+        }
     }
 
     pub fn tick(&mut self, procs: &[sys::Proc], rules: &[Rule]) -> Vec<Applied> {
@@ -226,11 +287,20 @@ impl Enforcer {
         let live: HashSet<(u32, u64)> = procs.iter().map(|p| (p.pid, p.created)).collect();
         self.done.retain(|k| live.contains(k));
         self.reported.retain(|k| live.contains(k));
+        self.checked.retain(|k, _| live.contains(k));
         let acting = self.acting;
+        let now = crate::now_unix();
         for p in procs {
             if p.pid <= 4 { continue; }
             let key = (p.pid, p.created);
-            if self.done.contains(&key) { continue; }
+            if self.done.contains(&key) {
+                if acting && self.reapply_secs > 0 && now - self.checked.get(&key).copied().unwrap_or(0.0) >= self.reapply_secs as f64 {
+                    self.checked.insert(key, now);
+                    self.recheck(p, rules, &mut out);
+                }
+                continue;
+            }
+            self.checked.insert(key, now);
             let matching: Vec<&Rule> = rules.iter().filter(|r| glob_match(&r.pattern, &p.name)).collect();
             if matching.is_empty() { continue; }
             self.done.insert(key);
@@ -245,6 +315,7 @@ impl Enforcer {
             };
             for r in matching {
                 let who = &r.pattern;
+                if r.priority.is_none() && r.efficiency.is_none() && r.io.is_none() && r.memory.is_none() && r.affinity.is_none() && r.cap.is_none() { continue; }
                 if let Some(c) = r.priority { apply("priority", format!("rule {}: priority class {:#x}", who, c), &|| sys::set_priority(pid, c)); }
                 if let Some(e) = r.efficiency { apply("efficiency", format!("rule {}: efficiency mode {}", who, if e { "on" } else { "off" }), &|| sys::set_efficiency(pid, e)); }
                 if let Some(v) = r.io { apply("io", format!("rule {}: I/O priority {}", who, v), &|| sys::set_io_priority(pid, v)); }
@@ -283,6 +354,19 @@ mod rule_tests {
     use super::*;
 
     fn rule(l: &str) -> Rule { parse_line(l).unwrap().unwrap() }
+
+    #[test]
+    fn governor_keys_control_pinning() {
+        assert!(rule("a.exe priority=idle").pins());
+        assert!(!rule("a.exe priority=idle governor=on").pins());
+        assert!(rule("a.exe governor=exempt").pins());
+        assert!(rule("a.exe max_level=0").pins());
+        let rs = vec![rule("b*.exe max_level=1"), rule("c.exe governor=exempt"), rule("d.exe background=yes"), rule("e.exe game=yes")];
+        assert_eq!(rule_max_level(&rs, "build.exe"), Some(1));
+        assert!(!is_pinned(&rs, "build.exe") && is_pinned(&rs, "c.exe") && is_pinned(&rs, "d.exe"));
+        assert_eq!((game_override(&rs, "d.exe"), game_override(&rs, "e.exe"), game_override(&rs, "z.exe")), (Some(false), Some(true), None));
+        assert!(parse_line("a.exe max_level=4").is_err());
+    }
 
     #[test]
     fn parses_all_keys() {

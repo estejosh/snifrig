@@ -10,6 +10,17 @@ All notable changes to snifrig are listed here.
 - Earlier releases and commits keep the license they were published under (UFL 3.4 Noncommercial).
 - UFL 1C: projects move forward only.
 
+## 0.3.0 - 2026-10-11
+
+- Governor (fixer): eases the biggest background CPU users within seconds when the PC is pegged, in three steps (efficiency mode, below normal, idle), never the app in front, and puts them back stepwise when calm. Every change is explained, logged and undoable from the tray.
+- Governor settings: `fix-governor.txt` (busy and calm thresholds, minimum per-app CPU, steps per second, deepest level), re-read on save.
+- Rules (fixer): `fix-rules.txt` per-app priority, efficiency mode, I/O and memory priority, affinity, hard CPU cap, instance limits, `background=yes`. New keys `governor=exempt|on`, `max_level=0-3`, `game=yes|no`. Priority and affinity are re-applied if an app resets them.
+- Performance mode (fixer): when a game is in front, switch to a fast power plan, ease background apps sooner and never ease the game; restore the plan when it exits (crash-safe).
+- Learning (fixer): fix outcomes scored after 3 minutes, protection for apps you keep undoing, hour-of-week baselines with an "unusual for this hour" note, optional local OpenJev brain for program classification (`snifrig-fix brain NAME`).
+- `snifrig report` (free): what slowed this PC down over N days and what snifrig fix did or would have done.
+- Slowdown evidence no longer blames Windows for efficiency mode that snifrig fix applied on purpose.
+- Tray: shows performance mode in the tooltip and Governor menu.
+
 ## 0.2.0 — 2026-10-07
 
 - Windows slowdown evidence: `snifrig slowdown` summarizes evidence of Windows slowing this PC over the last 24 hours.

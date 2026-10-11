@@ -21,7 +21,7 @@ static mut GOV: String = String::new(); // "Governor: holding back a, b" line, e
 static mut GOVY: i32 = 40; // 96-dpi y of that line
 
 pub struct Held { pub pid: u64, pub name: String, pub level: u64, pub reason: String }
-pub struct Gov { pub held: Vec<Held>, pub sugg: Vec<(String, u64)> }
+pub struct Gov { pub held: Vec<Held>, pub sugg: Vec<(String, u64)>, pub game: Option<String> }
 
 /// governor.json from snifrig-fix, None when missing or older than 30 s.
 pub fn gov_read(dir: &Path) -> Option<Gov> {
@@ -38,7 +38,8 @@ pub fn gov_read(dir: &Path) -> Option<Gov> {
             sugg.push((name, snifrig::json_num(c, "count")));
         }
     }
-    Some(Gov { held, sugg })
+    let game = snifrig::json_str(s.split("\"demoted\"").next().unwrap_or(""), "game");
+    Some(Gov { held, sugg, game })
 }
 
 pub fn now_s() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
