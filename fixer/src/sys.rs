@@ -119,6 +119,15 @@ pub fn local_offset_secs() -> i64 {
     }
 }
 
+#[link(name = "shell32", kind = "raw-dylib")]
+extern "system" { fn SHQueryUserNotificationState(state: *mut i32) -> i32; }
+
+/// True while a Direct3D app runs exclusive full screen (QUNS_RUNNING_D3D_FULL_SCREEN).
+pub fn fullscreen_d3d() -> bool {
+    let mut st = 0i32;
+    unsafe { SHQueryUserNotificationState(&mut st) == 0 && st == 3 }
+}
+
 pub fn foreground_pid() -> Option<u32> {
     unsafe {
         let w = GetForegroundWindow();

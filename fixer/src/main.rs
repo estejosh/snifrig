@@ -192,11 +192,12 @@ fn handle_undo(dir: &Path, gov: &mut snifrig_fix::governor::Governor, act: bool)
 /// The governor.json text for the current state. The second value changes only when the
 /// state does (not with the CPU number), so the loop can write on change.
 fn state_json(gov: &snifrig_fix::governor::Governor, acting: bool, sugg: &[(String, usize)]) -> (String, String) {
+    let game = gov.game.as_ref().map_or("null".to_string(), |g| format!("\"{}\"", snifrig_fix::json::esc(g)));
     let mut d: Vec<_> = gov.demoted.values().collect();
     d.sort_by_key(|x| x.pid);
     let demoted: Vec<String> = d.iter().map(|x| format!("{{\"pid\":{},\"name\":\"{}\",\"level\":{},\"reason\":\"{}\",\"since\":{:.0}}}", x.pid, snifrig_fix::json::esc(&x.name), x.level, snifrig_fix::json::esc(&x.reason), x.since)).collect();
     let sg: Vec<String> = sugg.iter().map(|(n, c)| format!("{{\"name\":\"{}\",\"count\":{}}}", snifrig_fix::json::esc(n), c)).collect();
-    let tail = format!("\"busy\":{},\"demoted\":[{}],\"suggestions\":[{}]}}\n", gov.mood.busy(), demoted.join(","), sg.join(","));
+    let tail = format!("\"busy\":{},\"game\":{},\"busy_pct\":{:.0},\"demoted\":[{}],\"suggestions\":[{}]}}\n", gov.mood.busy_with(&gov.tuning), game, gov.tuning.busy_pct, demoted.join(","), sg.join(","));
     let full = format!("{{\"unix\":{:.0},\"acting\":{},\"cpu\":{:.0},{}", now_unix(), acting, gov.total_pct, tail);
     (full, format!("{}{}", acting, tail))
 }
@@ -216,6 +217,22 @@ fn watch(dir: &Path) {
     let mut learner = Learner::load(dir);
     let mut base = Baseline::load(dir);
     let brain = snifrig_fix::brain::Brain::start(dir);
+    let note = |dir: &Path, key: &str, status: &str, msg: &str| {
+        let alert = snifrig_fix::Alert { t: String::new(), key: key.into(), msg: msg.into() };
+        ledger::record(dir, &alert, &Action::Report, None, status, msg);
+    };
+    use snifrig_fix::governor::Tuning;
+    let tuning_mt = |dir: &Path| std::fs::metadata(dir.join(snifrig_fix::governor::TUNING_FILE)).and_then(|m| m.modified()).ok();
+    let tf = dir.join(snifrig_fix::governor::TUNING_FILE);
+    if !tf.exists() { let _ = std::fs::write(&tf, snifrig_fix::governor::TUNING_TEMPLATE); }
+    let (t0, errs) = Tuning::load(dir);
+    for e in errs { note(dir, "gov:settings", "refused", &format!("{}: {}", snifrig_fix::governor::TUNING_FILE, e)); }
+    gov.tuning = t0.clone();
+    enf.reapply_secs = t0.reapply_secs;
+    let mut tune_mt = tuning_mt(dir);
+    let (mut perf, left) = snifrig_fix::perfmode::PerfMode::new(dir);
+    if let Some(m) = left { note(dir, "perf:mode", "done", &m); }
+    let mut last_unusual = 0.0f64;
     base.set_tz(sys::local_offset_secs());
     let metrics = |gov: &snifrig_fix::governor::Governor| {
         let (commit_pct, avail_mb) = sys::memory_status().unwrap_or((0.0, 0.0));
@@ -229,6 +246,14 @@ fn watch(dir: &Path) {
                 let m = metrics(&gov);
                 for (action, name, trig) in ran { learner.start("fix", &action, &name, trig, now_unix(), m.clone()); }
             }
+        }
+        if n > 0 && n % 30 == 0 && tuning_mt(dir) != tune_mt {
+            tune_mt = tuning_mt(dir);
+            let (t, errs) = Tuning::load(dir);
+            for e in errs { note(dir, "gov:settings", "refused", &format!("{}: {}", snifrig_fix::governor::TUNING_FILE, e)); }
+            note(dir, "gov:settings", "done", &format!("governor settings reloaded: busy at {:.0}% for {} s, demote apps over {:.0}% of a core, up to level {}, performance mode {}", t.busy_pct, t.busy_ticks, t.min_core_pct, t.max_level, if t.game_mode { "on" } else { "off" }));
+            enf.reapply_secs = t.reapply_secs;
+            gov.tuning = t;
         }
         if n > 0 && n % 30 == 0 {
             let mt = rules::mtime(dir);
@@ -246,6 +271,8 @@ fn watch(dir: &Path) {
         let mut act = false;
         if mode == Mode::Off || paused {
             if !gov.demoted.is_empty() { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); }
+            for m in perf.stop(gov.acting) { note(dir, "perf:mode", "done", &m); }
+            gov.game = None;
         } else {
             act = matches!(mode, Mode::Ask | Mode::Auto);
             if act != gov.acting && !gov.demoted.is_empty() { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); }
@@ -253,6 +280,11 @@ fn watch(dir: &Path) {
             gov.acting = act;
             enf.acting = act;
             let changes = gov.tick(now_unix(), act);
+            let brain_game = |name: &str| brain.cache().get(name).map_or(false, |v| v.kind == "game" && v.confidence >= snifrig_fix::brain::MIN_CONF);
+            for m in perf.tick(gov.procs(), sys::foreground_pid(), &rule_set, &gov.tuning, act, &brain_game) {
+                note(dir, "perf:mode", if act { "done" } else { "would" }, &m);
+            }
+            gov.game = perf.game.as_ref().map(|g| g.2.clone());
             if act {
                 let fresh: Vec<&str> = changes.iter().filter(|c| c.result.is_ok() && c.from == 0 && c.to == 1).map(|c| c.name.as_str()).collect();
                 if !fresh.is_empty() {
@@ -293,6 +325,15 @@ fn watch(dir: &Path) {
         if n > 0 && n % 60 == 0 {
             let (now, m) = (now_unix(), metrics(&gov));
             let top: Vec<String> = gov.top.iter().map(|(name, _)| name.clone()).collect();
+            if gov.mood.busy_with(&gov.tuning) && now - last_unusual > 3600.0 {
+                if let Some(z) = base.unusual(snifrig_fix::baseline::Metric::Cpu, m.total_cpu_pct, now).filter(|z| *z >= 2.5) {
+                    last_unusual = now;
+                    let usual = base.expected_names(now);
+                    let new: Vec<&String> = top.iter().filter(|t| !usual.contains(t)).collect();
+                    let who = if new.is_empty() { String::new() } else { format!("; not usually busy at this hour: {}", new.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")) };
+                    note(dir, "learn:unusual", "report", &format!("CPU at {:.0}% is unusual for this hour of the week (z {:.1}){}", m.total_cpu_pct, z, who));
+                }
+            }
             base.update(now, m.total_cpu_pct, m.commit_pct, &top);
             base.maybe_save(dir, now);
         }
@@ -305,7 +346,7 @@ fn watch(dir: &Path) {
         n += 1;
         std::thread::sleep(std::time::Duration::from_millis(1000));
     }
-    { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); }
+    { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); for m in perf.stop(a) { note(dir, "perf:mode", "done", &m); } }
     base.save(dir, now_unix());
     let _ = std::fs::remove_file(dir.join("governor.json"));
 }
@@ -342,7 +383,7 @@ fn gov_status(dir: &Path) -> Result<String, String> {
     Ok(o.trim_end().to_string())
 }
 const DENIED: &str = "snifrig-fix is the paid part of Snifrig and needs a valid key. Prices: https://github.com/estejosh/snifrig/blob/main/PRICING.md";
-const USAGE: &str = "usage: snifrig-fix [once|status|pending|mode M|approve ID|dismiss ID|governor status|governor undo PID|rule add \"PATTERN key=value ...\"|rule list|rule remove N|machine-id|license install PATH|license accept|license status] [--dir D] [--accept-license \"UFL-3.7 snifrig-fix\"]";
+const USAGE: &str = "usage: snifrig-fix [once|status|pending|mode M|approve ID|dismiss ID|governor status|governor undo PID|brain NAME|rule add \"PATTERN key=value ...\"|rule list|rule remove N|machine-id|license install PATH|license accept|license status] [--dir D] [--accept-license \"UFL-3.7 snifrig-fix\"]";
 const ACCEPT_PHRASE: &str = "UFL-3.7 snifrig-fix";
 
 /// The hard gate: a valid key and a recorded acceptance, or Err(reason).

@@ -134,9 +134,11 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         _ => "Snifrig: monitor not running".to_string(),
     };
     let tip = if !st.headline.is_empty() && st.level != 2 { format!("Snifrig: {}", st.headline) } else { tip };
-    let gn = if fixer_exe().is_some() && dir().join("snifrig-fix.key").exists() { flyout::gov_read(dir()).map_or(0, |g| g.held.len()) } else { 0 };
-    let tip = if gn > 0 {
-        let suf = format!(" \u{b7} governor holding {}", gn);
+    let g = if fixer_exe().is_some() && dir().join("snifrig-fix.key").exists() { flyout::gov_read(dir()) } else { None };
+    let gn = g.as_ref().map_or(0, |g| g.held.len());
+    let game = g.and_then(|g| g.game);
+    let tip = if gn > 0 || game.is_some() {
+        let suf = match &game { Some(n) => format!(" \u{b7} performance mode: {} \u{b7} holding {}", n, gn), None => format!(" \u{b7} governor holding {}", gn) };
         let base: String = tip.chars().take(127usize.saturating_sub(suf.encode_utf16().count())).collect();
         format!("{}{}", base, suf)
     } else { tip };
@@ -249,6 +251,7 @@ unsafe fn menu(hwnd: HWND) {
             let gm = CreatePopupMenu();
             let hd = if g.held.is_empty() { "Nothing held back".to_string() } else { format!("Holding back {} app{}", g.held.len(), if g.held.len() == 1 { "" } else { "s" }) };
             AppendMenuW(gm, MF_STRING | MF_GRAYED, 0, wide(&hd).as_ptr());
+            if let Some(n) = &g.game { AppendMenuW(gm, MF_STRING | MF_GRAYED, 0, wide(&format!("Performance mode on for {}", n)).as_ptr()); }
             for h in g.held.iter().take(5) {
                 let sub = CreatePopupMenu();
                 let lv = match h.level { 1 => "efficiency mode", 2 => "below normal", _ => "idle" };

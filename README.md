@@ -49,6 +49,7 @@ Output of `snifrig --help`:
 | `snifrig resume` | resume fixing |
 | `snifrig webhook URL\|off` | POST alerts as JSON to URL (opt-in, e.g. n8n) |
 | `snifrig slowdown [--dir PATH]` | summarize evidence of Windows slowing this PC (last 24 h) |
+| `snifrig report [--days N]` | what slowed this PC down, and what snifrig fix did or would do (default 7 days) |
 | `snifrig uninstall` | remove login startup and stop the monitor |
 | `snifrig license accept` | record acceptance of UFL-3.7 |
 | `snifrig license statement` | print a usage statement from local records |
@@ -84,7 +85,7 @@ Everything else stays on your computer in `%LOCALAPPDATA%\snifrig`.
 
 ## Fixer
 
-`snifrig-fix` is the paid Component of snifrig. It reads the monitor's alerts and, when it is safe, trims, lowers the priority of, terminates or restarts the process behind a leak. It never runs without a valid key. See [fixer/README.md](fixer/README.md) for modes, safety rules, files and commands, and [PRICING.md](PRICING.md) for the price.
+`snifrig-fix` is the paid Component of snifrig. It reads the monitor's alerts and, when it is safe, trims, lowers the priority of, terminates or restarts the process behind a leak. It also runs a governor that eases background CPU hogs within seconds and puts them back when the PC is calm, per-app rules (priority, efficiency mode, I/O and memory priority, cores, hard CPU caps, instance limits), a performance mode that switches power plan while you play, and learning from what worked on your PC, with an optional local AI brain that never leaves your machine. `snifrig report` (free) shows what it did or would have done. It never runs without a valid key. See [fixer/README.md](fixer/README.md) for modes, safety rules, files and commands, and [PRICING.md](PRICING.md) for the price.
 
 The tray right-click menu lists pending fixes (Approve or Dismiss) and shows the fixer mode, which can be changed from its submenu.
 

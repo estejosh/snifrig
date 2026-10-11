@@ -20,6 +20,7 @@ pub mod brain;
 pub mod rules;
 pub mod learn;
 pub mod baseline;
+pub mod perfmode;
 
 /// What the fixer can do, mildest first.
 #[derive(Clone, Debug, PartialEq)]

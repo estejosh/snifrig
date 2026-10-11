@@ -31,6 +31,87 @@ pub const MIN_CORE_PCT: f64 = 25.0;
 pub const MAX_DEMOTIONS_PER_TICK: usize = 2;
 pub const MAX_LEVEL: u8 = 3;
 
+/// Governor settings, from `fix-governor.txt` (key=value per line, '#' comments). Defaults are the consts above.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tuning {
+    pub busy_pct: f64,
+    pub busy_ticks: u32,
+    pub calm_pct: f64,
+    pub calm_ticks: u32,
+    pub restore_every: u32,
+    pub min_core_pct: f64,
+    pub max_per_tick: usize,
+    pub max_level: u8,
+    /// Performance mode: when a game is in front, switch power plan and keep background quieter.
+    pub game_mode: bool,
+    /// Power plan for performance mode: "auto" (Ultimate, else High performance), "none", or a plan GUID.
+    pub game_plan: String,
+    /// Busy threshold while a game runs.
+    pub game_busy_pct: f64,
+    /// How often rules are re-checked and re-applied when an app undoes them (seconds, 0 = never).
+    pub reapply_secs: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning { busy_pct: BUSY_PCT, busy_ticks: BUSY_TICKS, calm_pct: CALM_PCT, calm_ticks: CALM_TICKS, restore_every: RESTORE_EVERY,
+            min_core_pct: MIN_CORE_PCT, max_per_tick: MAX_DEMOTIONS_PER_TICK, max_level: MAX_LEVEL,
+            game_mode: true, game_plan: "auto".into(), game_busy_pct: 50.0, reapply_secs: 30 }
+    }
+}
+
+pub const TUNING_FILE: &str = "fix-governor.txt";
+
+/// Written once if the file is missing, so the settings are easy to find. Every line is a comment.
+pub const TUNING_TEMPLATE: &str = "# snifrig-fix governor settings. Remove the '#' in front of a line to change it.\r\n\
+# The fixer re-reads this file within 30 seconds of a save.\r\n\
+# busy_pct = 75            # total CPU that counts as busy\r\n\
+# busy_secs = 3            # ...for this many seconds before the governor steps in\r\n\
+# calm_pct = 50            # total CPU that counts as calm again\r\n\
+# calm_secs = 10           # ...for this long before anything is put back\r\n\
+# restore_every_secs = 5   # then one step back every this many seconds\r\n\
+# min_core_pct = 25        # only ease apps using at least this much of one core\r\n\
+# max_per_tick = 2         # apps eased per second at most\r\n\
+# max_level = 3            # 1 efficiency mode, 2 below normal, 3 idle\r\n\
+# game_mode = on           # performance mode when a game is in front\r\n\
+# game_plan = auto         # auto (Ultimate, else High performance), none, or a plan name or GUID\r\n\
+# game_busy_pct = 50       # busy threshold while a game runs\r\n\
+# reapply_secs = 30        # re-check rules this often and undo apps that reset them (0 = never)\r\n";
+
+impl Tuning {
+    /// Parse the settings file. Unknown keys and bad values are reported, and the default is kept.
+    pub fn parse(text: &str) -> (Tuning, Vec<String>) {
+        let mut t = Tuning::default();
+        let mut errs = Vec::new();
+        for (i, raw) in text.lines().enumerate() {
+            let l = raw.split('#').next().unwrap_or("").trim();
+            if l.is_empty() { continue; }
+            let Some((k, v)) = l.split_once('=') else { errs.push(format!("line {}: '{}' is not key=value", i + 1, l)); continue };
+            let (k, v) = (k.trim().to_lowercase(), v.trim().to_lowercase());
+            let pct = |v: &str| v.trim_end_matches('%').parse::<f64>().ok().filter(|x| (1.0..=100.0).contains(x));
+            let ok = match k.as_str() {
+                "busy_pct" => pct(&v).map(|x| t.busy_pct = x).is_some(),
+                "calm_pct" => pct(&v).map(|x| t.calm_pct = x).is_some(),
+                "game_busy_pct" => pct(&v).map(|x| t.game_busy_pct = x).is_some(),
+                "busy_secs" => v.parse::<u32>().ok().filter(|x| *x >= 1).map(|x| t.busy_ticks = x).is_some(),
+                "calm_secs" => v.parse::<u32>().ok().filter(|x| *x >= 1).map(|x| t.calm_ticks = x).is_some(),
+                "restore_every_secs" => v.parse::<u32>().ok().filter(|x| *x >= 1).map(|x| t.restore_every = x).is_some(),
+                "min_core_pct" => v.trim_end_matches('%').parse::<f64>().ok().filter(|x| *x >= 1.0).map(|x| t.min_core_pct = x).is_some(),
+                "max_per_tick" => v.parse::<usize>().ok().filter(|x| (1..=16).contains(x)).map(|x| t.max_per_tick = x).is_some(),
+                "max_level" => v.parse::<u8>().ok().filter(|x| *x <= MAX_LEVEL).map(|x| t.max_level = x).is_some(),
+                "game_mode" => match v.as_str() { "on" | "yes" => { t.game_mode = true; true } "off" | "no" => { t.game_mode = false; true } _ => false },
+                "game_plan" => { t.game_plan = v.clone(); true }
+                "reapply_secs" => v.parse::<u32>().ok().map(|x| t.reapply_secs = x).is_some(),
+                _ => { errs.push(format!("line {}: unknown setting '{}'", i + 1, k)); continue; }
+            };
+            if !ok { errs.push(format!("line {}: bad value for {}: '{}'", i + 1, k, v)); }
+        }
+        if t.calm_pct > t.busy_pct { errs.push("calm_pct above busy_pct; using defaults for both".into()); t.calm_pct = CALM_PCT; t.busy_pct = BUSY_PCT; }
+        (t, errs)
+    }
+    pub fn load(dir: &std::path::Path) -> (Tuning, Vec<String>) { Tuning::parse(&std::fs::read_to_string(dir.join(TUNING_FILE)).unwrap_or_default()) }
+}
+
 type Key = (u32, u64); // pid, create time: survives pid reuse
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,12 +142,14 @@ pub struct Seen { pub key: Key, pub name: String, pub core_pct: f64, pub foregro
 pub struct Mood { pub busy_ticks: u32, pub calm_ticks: u32 }
 
 impl Mood {
-    pub fn update(&mut self, total_pct: f64) {
-        if total_pct >= BUSY_PCT { self.busy_ticks += 1; } else { self.busy_ticks = 0; }
-        if total_pct < CALM_PCT { self.calm_ticks += 1; } else { self.calm_ticks = 0; }
+    pub fn update(&mut self, total_pct: f64, t: &Tuning, game: bool) {
+        let busy_at = if game { t.game_busy_pct.min(t.busy_pct) } else { t.busy_pct };
+        if total_pct >= busy_at { self.busy_ticks += 1; } else { self.busy_ticks = 0; }
+        if total_pct < t.calm_pct.min(busy_at) { self.calm_ticks += 1; } else { self.calm_ticks = 0; }
     }
-    pub fn busy(&self) -> bool { self.busy_ticks >= BUSY_TICKS }
-    pub fn calm(&self) -> bool { self.calm_ticks >= CALM_TICKS }
+    pub fn busy_with(&self, t: &Tuning) -> bool { self.busy_ticks >= t.busy_ticks }
+    pub fn calm_with(&self, t: &Tuning) -> bool { self.calm_ticks >= t.calm_ticks }
+    pub fn busy(&self) -> bool { self.busy_with(&Tuning::default()) }
 }
 
 /// What the learner knows, as plain data so `decide_with` stays pure. Names are lowercase.
@@ -83,10 +166,12 @@ pub struct Hints {
     pub boost: HashMap<String, f64>,
     /// Deepest level the brain allows for this name (default MAX_LEVEL).
     pub max_level: HashMap<String, u8>,
+    /// Thresholds in force (the Governor copies its settings in before deciding).
+    pub tuning: Tuning,
 }
 
 impl Default for Hints {
-    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new() } }
+    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new(), tuning: Tuning::default() } }
 }
 
 /// Pure policy without learning hints.
@@ -99,6 +184,7 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
     let mut out = Vec::new();
     let live: HashMap<Key, &Seen> = seen.iter().map(|s| (s.key, s)).collect();
     let fg_names: Vec<&str> = seen.iter().filter(|s| s.foreground).map(|s| s.name.as_str()).collect();
+    let t = &hints.tuning;
 
     // Restores first: gone, foreground, or calm.
     for (k, d) in demoted {
@@ -106,25 +192,25 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
             None => out.push(Step::Forget { key: *k }),
             Some(s) if s.foreground || fg_names.contains(&s.name.as_str()) =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 0, reason: format!("{} is now the app you are using", d.name) }),
-            Some(_) if mood.calm() && mood.calm_ticks % RESTORE_EVERY == 0 =>
+            Some(_) if mood.calm_with(t) && mood.calm_ticks % t.restore_every.max(1) == 0 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: d.level - 1, reason: format!("CPU is calm again ({:.0}%)", total_pct) }),
             _ => {}
         }
     }
-    if !mood.busy() { return out; }
+    if !mood.busy_with(t) { return out; }
 
     // Demote the biggest background users, one step each, a couple per tick.
     let mut cands: Vec<&Seen> = seen.iter()
         .filter(|s| !s.protected && !s.foreground && !fg_names.contains(&s.name.as_str()))
-        .filter(|s| s.core_pct >= MIN_CORE_PCT)
+        .filter(|s| s.core_pct >= t.min_core_pct)
         .filter(|s| { let n = s.name.to_lowercase(); !hints.protect.contains(&n) && !hints.blocked.contains(&n) })
-        .filter(|s| { let cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(MAX_LEVEL).min(MAX_LEVEL); demoted.get(&s.key).map_or(0, |d| d.level) < cap })
+        .filter(|s| { let cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level); demoted.get(&s.key).map_or(0, |d| d.level) < cap })
         .collect();
     // Biggest user first, weighted by how often demoting that name has helped.
     let weight = |s: &Seen| { let n = s.name.to_lowercase();
         s.core_pct * hints.prob.get(&n).copied().unwrap_or(hints.default_prob) * hints.boost.get(&n).copied().unwrap_or(1.0) };
     cands.sort_by(|a, b| weight(b).partial_cmp(&weight(a)).unwrap_or(std::cmp::Ordering::Equal));
-    for s in cands.into_iter().take(MAX_DEMOTIONS_PER_TICK) {
+    for s in cands.into_iter().take(t.max_per_tick) {
         let lvl = demoted.get(&s.key).map_or(0, |d| d.level) + 1;
         out.push(Step::Demote { key: s.key, name: s.name.clone(), to_level: lvl,
             reason: format!("CPU at {:.0}% and {} was using {:.0}% of a core in the background", total_pct, s.name, s.core_pct) });
@@ -167,6 +253,10 @@ pub struct Governor {
     pub hints: Hints,
     /// Whether current demotions were really applied (false = dry run bookkeeping only).
     pub acting: bool,
+    /// Settings from fix-governor.txt.
+    pub tuning: Tuning,
+    /// Lowercase image name of the game performance mode is running for, if any.
+    pub game: Option<String>,
 }
 
 /// One change made, for the ledger and the tray.
@@ -176,7 +266,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -212,7 +302,7 @@ impl Governor {
             busy_sum += core_pct;
             let foreground = Some(p.pid) == fg;
             // Cheap filter before the protected check, which may read a command line.
-            let protected = if core_pct >= MIN_CORE_PCT || self.demoted.contains_key(&key) { self.protected(p) } else { true };
+            let protected = if core_pct >= self.tuning.min_core_pct || self.demoted.contains_key(&key) { self.protected(p) } else { true };
             let protected = protected || self.undone.contains(&key);
             seen.push(Seen { key, name: p.name.clone(), core_pct, foreground, protected });
         }
@@ -221,7 +311,7 @@ impl Governor {
         self.undone.retain(|k| self.prev.contains_key(k));
         let total_pct = (busy_sum / self.cores).min(100.0);
         self.total_pct = total_pct;
-        self.mood.update(total_pct);
+        self.mood.update(total_pct, &self.tuning, self.game.is_some());
         self.fg_cpu_pct = seen.iter().find(|s| s.foreground).map(|s| s.core_pct);
         let mut top: Vec<(String, f64)> = seen.iter().filter(|s| s.core_pct >= 5.0).map(|s| (s.name.to_lowercase(), s.core_pct)).collect();
         top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -229,6 +319,13 @@ impl Governor {
         self.top = top;
 
         let mut changes = Vec::new();
+        self.hints.tuning = self.tuning.clone();
+        // Rules with governor=on / max_level=n let the governor manage that app, but only so far.
+        for s in &seen {
+            let n = s.name.to_lowercase();
+            if let Some(m) = crate::rules::rule_max_level(&self.rules, &n) { self.hints.max_level.insert(n.clone(), m); }
+        }
+        if let Some(g) = &self.game { self.hints.protect.insert(g.clone()); }
         for step in decide_with(total_pct, &self.mood, &seen, &self.demoted, &self.hints) {
             match step {
                 Step::Forget { key } => { self.demoted.remove(&key); }
@@ -287,6 +384,35 @@ impl Governor {
 mod gov_tests {
     use super::*;
     fn s(pid: u32, name: &str, pct: f64) -> Seen { Seen { key: (pid, 1), name: name.into(), core_pct: pct, foreground: false, protected: false } }
+
+    #[test]
+    fn tuning_file_parses_and_reports_errors() {
+        let (t, e) = Tuning::parse("busy_pct = 60 # comment\nbusy_secs=2\nmin_core_pct=40%\nmax_level=2\ngame_mode=off\nnonsense=1\nmax_per_tick=99\n");
+        assert_eq!((t.busy_pct, t.busy_ticks, t.min_core_pct, t.max_level, t.game_mode, t.max_per_tick), (60.0, 2, 40.0, 2, false, MAX_DEMOTIONS_PER_TICK));
+        assert_eq!(e.len(), 2, "{:?}", e);
+        let (t, e) = Tuning::parse("busy_pct=40\ncalm_pct=60");
+        assert_eq!((t.busy_pct, t.calm_pct), (BUSY_PCT, CALM_PCT));
+        assert_eq!(e.len(), 1);
+    }
+
+    #[test]
+    fn tuned_thresholds_and_game_mode_change_decisions() {
+        let mut h = Hints::default();
+        h.tuning.min_core_pct = 100.0;
+        h.tuning.max_level = 1;
+        let m = Mood { busy_ticks: BUSY_TICKS, calm_ticks: 0 };
+        let mut d = HashMap::new();
+        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "b.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        let steps = decide_with(95.0, &m, &[s(1, "a.exe", 80.0), s(2, "b.exe", 300.0), s(3, "c.exe", 200.0)], &d, &h);
+        assert_eq!(steps.len(), 1, "a under min_core_pct, b already at max_level 1: {:?}", steps);
+        assert!(matches!(&steps[0], Step::Demote { key: (3, 1), to_level: 1, .. }));
+        let t = Tuning::default();
+        let mut mood = Mood::default();
+        mood.update(60.0, &t, false);
+        assert_eq!(mood.busy_ticks, 0);
+        mood.update(60.0, &t, true);
+        assert_eq!(mood.busy_ticks, 1, "60% counts as busy while a game runs (game_busy_pct 50)");
+    }
 
     #[test]
     fn quiet_machine_does_nothing() {

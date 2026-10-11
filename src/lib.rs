@@ -30,6 +30,7 @@ mod gpu_throttle;
 mod dupes;
 mod cpuhog;
 mod slowdown;
+mod report;
 const SLOW_CAP: u64 = 512 << 10;
 
 // ---------- raw readers ----------
@@ -620,6 +621,7 @@ fn usage() {
     println!("  snifrig --once [--sample SECS]     print a report now (2 samples, default 10 s apart)");
     println!("  snifrig [--interval SECS]          watch loop (default 60), alerts to alerts.jsonl");
     println!("  snifrig slowdown [--dir PATH]      summarize evidence of Windows slowing this PC (last 24 h)");
+    println!("  snifrig report [--days N]          what slowed this PC down, and what snifrig fix did or would do (default 7 days)");
     println!("  snifrig install                    start at login (hidden monitor + tray icon), start now");
     println!("  snifrig pause [MIN]                pause fixing (default 60 min); monitoring continues");
     println!("  snifrig resume                     resume fixing");
@@ -656,6 +658,7 @@ pub fn run() {
         Some("pause") => { let m: f64 = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(60.0); let u = now_unix() + m * 60.0; let _ = fs::write(dir.join("mode.json"), format!("{{\"paused_until\":{:.0}}}", u)); println!("fixing paused for {:.0} min. monitoring continues.", m); return; }
         Some("resume") => { let _ = fs::remove_file(dir.join("mode.json")); println!("fixing resumed."); return; }
         Some("webhook") => { match a.get(1) { Some(u) if u.starts_with("http") => { let _ = fs::write(dir.join("webhook.txt"), u); println!("webhook saved. test post: {}", if post_json(u, "{\"source\":\"snifrig\",\"msg\":\"test\"}") { "ok" } else { "failed" }); } Some(x) if x == "off" => { let _ = fs::remove_file(dir.join("webhook.txt")); println!("webhook removed."); } _ => println!("usage: snifrig webhook URL|off") } return; }
+        Some("report") => { let days = flag("--days").and_then(|d| d.parse::<f64>().ok()).filter(|d| *d > 0.0).unwrap_or(7.0); print!("{}", report::run(&dir, days)); println!("\nNotice: {}", notice::NOTICE_TEXT); return; }
         Some("slowdown") => { let l = slowdown::summarize(&dir); if l.is_empty() { println!("No Windows slowdowns recorded in the last 24 hours."); } else { for x in l { println!("{}", x); } } return; }
         Some("install") => { install(&dir, given); return; }
         Some("uninstall") => { uninstall(&dir); return; }
