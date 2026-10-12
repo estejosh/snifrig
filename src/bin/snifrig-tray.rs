@@ -45,6 +45,13 @@ fn fixer_exe() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrig-fix.exe"))).filter(|p| p.exists())
 }
 
+/// The small "needs your OK" card, if the window app is installed.
+fn open_ask() -> bool {
+    use std::os::windows::process::CommandExt;
+    let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrig-app.exe"))).filter(|p| p.exists()) else { return false };
+    std::process::Command::new(exe).arg("--ask").arg("--dir").arg(dir()).creation_flags(0x0000_0008).spawn().is_ok()
+}
+
 /// The snifrig window, if it was installed next to the tray.
 fn open_app() -> bool {
     use std::os::windows::process::CommandExt;
@@ -220,14 +227,21 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         n.dwInfoFlags = NIIF_WARNING;
     }
     if st.last_alert_unix > LAST_ALERT { LAST_ALERT = st.last_alert_unix; }
+    // Something new needs the user's OK (a fix, or a suggestion from their AI assistant):
+    // show the snifrig card with real buttons; the balloon is only a fallback.
     let seen = &mut *std::ptr::addr_of_mut!(SEEN);
-    if let Some(p) = read_pending().into_iter().find(|p| !seen.contains(&p.id)) {
-        n.uFlags |= NIF_INFO;
-        put(&mut n.szInfoTitle, "Snifrig fixer");
-        put(&mut n.szInfo, &format!("Snifrig wants to {} {}. Right-click to approve.", p.action, p.name));
-        n.dwInfoFlags = NIIF_WARNING;
+    let mut ids: Vec<(String, String)> = read_pending().into_iter().map(|p| (p.id, format!("Snifrig wants to {} {}.", p.action, p.name))).collect();
+    let sug = std::fs::read_to_string(dir().join("ai-suggestions.json")).unwrap_or_default();
+    for part in sug.split("\"id\":\"").skip(1) { if let Some(id) = part.split('"').next() { ids.push((id.to_string(), "Your AI assistant has a suggestion for snifrig.".into())); } }
+    if let Some((_, text)) = ids.iter().find(|(id, _)| !seen.contains(id)) {
+        if FIRST || !open_ask() {
+            n.uFlags |= NIF_INFO;
+            put(&mut n.szInfoTitle, "Snifrig needs your OK");
+            put(&mut n.szInfo, &format!("{} Double-click the snifrig icon to decide.", text));
+            n.dwInfoFlags = NIIF_WARNING;
+        }
     }
-    for p in read_pending() { if !seen.contains(&p.id) { seen.push(p.id); } }
+    for (id, _) in ids { if !seen.contains(&id) { seen.push(id); } }
     FIRST = false;
     Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &n);
     if add { promote_icon(); }

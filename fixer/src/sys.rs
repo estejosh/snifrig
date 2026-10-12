@@ -128,6 +128,24 @@ pub fn fullscreen_d3d() -> bool {
     unsafe { SHQueryUserNotificationState(&mut st) == 0 && st == 3 }
 }
 
+/// Pids that own a visible top-level window with a title (what a person would call an open app).
+pub fn window_pids() -> std::collections::HashSet<u32> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, IsWindowVisible};
+    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> i32 {
+        let set = &mut *(lp as *mut std::collections::HashSet<u32>);
+        if IsWindowVisible(h) != 0 && GetWindowTextLengthW(h) > 0 {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid != 0 { set.insert(pid); }
+        }
+        1
+    }
+    let mut set = std::collections::HashSet::new();
+    unsafe { EnumWindows(Some(cb), &mut set as *mut _ as LPARAM); }
+    set
+}
+
 pub fn foreground_pid() -> Option<u32> {
     unsafe {
         let w = GetForegroundWindow();

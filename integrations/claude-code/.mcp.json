@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "snifrig": {
+      "command": "${LOCALAPPDATA}\\snifrig\\bin\\snifrig-mcp.exe",
+      "args": []
+    }
+  }
+}

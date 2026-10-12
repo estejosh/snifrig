@@ -1,0 +1,14 @@
+{
+  "name": "snifrig",
+  "displayName": "snifrig",
+  "version": "0.3.0",
+  "description": "Diagnose a slow Windows PC with snifrig: status, live processes, alerts, and suggested fixes that the user approves in snifrig.",
+  "author": {
+    "name": "estejosh",
+    "url": "https://github.com/estejosh/snifrig"
+  },
+  "homepage": "https://github.com/estejosh/snifrig",
+  "repository": "https://github.com/estejosh/snifrig",
+  "license": "LicenseRef-UFL-3.7",
+  "keywords": ["windows", "performance", "diagnostics"]
+}

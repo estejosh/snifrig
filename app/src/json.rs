@@ -14,6 +14,7 @@ impl J {
 }
 
 pub fn parse(s: &str) -> Option<J> {
+    let s = s.trim_start_matches('\u{feff}');
     let b = s.as_bytes();
     let mut i = 0;
     let v = val(b, &mut i)?;

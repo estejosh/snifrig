@@ -1,3 +1,7 @@
 target/
 data/
 .env
+
+target-mcp/
+integrations/claude-desktop/server/*.exe
+integrations/claude-desktop/*.mcpb

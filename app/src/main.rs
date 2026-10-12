@@ -57,27 +57,39 @@ struct App {
     brain_up: Option<bool>,
     logo: Option<egui::TextureHandle>,
     confirm_delete: Option<usize>,
+    /// Compact "needs your OK" popup instead of the full window.
+    ask: bool,
+    snoozed: Vec<String>,
+    sugg: Vec<data::Suggestion>,
 }
 
 fn main() -> eframe::Result<()> {
-    if already_running() { return Ok(()); }
+    let ask = std::env::args().any(|a| a == "--ask");
+    if already_running(if ask { "Local\\snifrig-ask" } else { "Local\\snifrig-app" }, if ask { "snifrig needs your OK" } else { "snifrig" }) { return Ok(()); }
     let dir = std::env::args().skip_while(|a| a != "--dir").nth(1).map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("snifrig"));
-    let mut vp = egui::ViewportBuilder::default().with_title("snifrig").with_inner_size([1280.0, 840.0]).with_min_inner_size([900.0, 560.0]);
+    let mut vp = if ask {
+        let (_, _, r, b) = sys::work_area();
+        let (w, h) = (460.0, 440.0);
+        egui::ViewportBuilder::default().with_title("snifrig needs your OK").with_inner_size([w, h]).with_position([r - w - 16.0, b - h - 16.0])
+            .with_decorations(false).with_always_on_top().with_resizable(false).with_taskbar(false)
+    } else {
+        egui::ViewportBuilder::default().with_title("snifrig").with_inner_size([1280.0, 840.0]).with_min_inner_size([900.0, 560.0])
+    };
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-64.png")) { vp = vp.with_icon(Arc::new(icon)); }
     let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
-    eframe::run_native("snifrig", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, dir)))))
+    eframe::run_native("snifrig", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, ask)))))
 }
 
-fn already_running() -> bool {
+fn already_running(mutex: &str, title: &str) -> bool {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
-    let name: Vec<u16> = "Local\\snifrig-app".encode_utf16().chain(Some(0)).collect();
+    let name: Vec<u16> = mutex.encode_utf16().chain(Some(0)).collect();
     unsafe {
         let _m = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         if GetLastError() != 183 { return false; }
-        let title: Vec<u16> = "snifrig".encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
         let h = FindWindowW(std::ptr::null(), title.as_ptr());
         if !h.is_null() { ShowWindow(h, SW_RESTORE); SetForegroundWindow(h); }
         true
@@ -212,7 +224,7 @@ fn action_label(a: &str) -> &'static str {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext, dir: PathBuf) -> App {
+    fn new(cc: &eframe::CreationContext, dir: PathBuf, ask: bool) -> App {
         setup_style(&cc.egui_ctx);
         let logo = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-128.png")).ok().map(|i| {
             let img = egui::ColorImage::from_rgba_unmultiplied([i.width as usize, i.height as usize], &i.rgba);
@@ -224,6 +236,7 @@ impl App {
             rules: data::load_rules(&dir), edit: None, pick: String::new(), tuning_saved: tuning.clone(), tuning,
             plans: Vec::new(), toast: Arc::new(Mutex::new(None)), report_days: 7, report: Arc::new(Mutex::new(None)),
             filter: Filter::All, search: String::new(), license: Arc::new(Mutex::new(String::new())), brain_up: None,
+            ask, snoozed: Vec::new(), sugg: data::load_suggestions(&dir),
             live: sys::start(), state, loaded: Instant::now(), hist_loaded: Instant::now(), page: Page::Overview, logo, confirm_delete: None, dir,
         };
         app.refresh_license();
@@ -260,6 +273,7 @@ impl App {
         if hist { self.hist_loaded = Instant::now(); }
         self.state = data::load_state(&self.dir, hist, &self.state);
         if self.edit.is_none() { self.rules = data::load_rules(&self.dir); }
+        self.sugg = data::load_suggestions(&self.dir);
         if self.tuning == self.tuning_saved { self.tuning = data::load_tuning(&self.dir); self.tuning_saved = self.tuning.clone(); }
         self.loaded = Instant::now();
     }
@@ -278,6 +292,93 @@ impl App {
     fn add_rule(&mut self, r: Rule, msg: &str) {
         if let Some(i) = self.rules.rules.iter().position(|x| x.pattern == r.pattern) { self.rules.rules[i] = r; } else { self.rules.rules.push(r); }
         self.save_rules(msg);
+    }
+
+    fn accept_suggestion(&mut self, s: &data::Suggestion) {
+        let r = match s.kind.as_str() {
+            "rule" => match Rule::parse(&s.rule) { Some(r) => { let p = r.pattern.clone(); self.add_rule(r, &format!("Rule for {} saved.", p)); Ok(()) } None => Err("the suggested rule could not be read".to_string()) },
+            "ease" => { self.add_rule(Rule { pattern: s.app.to_lowercase(), priority: "below_normal".into(), efficiency: "on".into(), io: "low".into(), ..Default::default() }, &format!("{} will always run in the background.", s.app)); Ok(()) }
+            "setting" => data::apply_setting(&self.dir, &s.setting).map(|_| { self.tuning = data::load_tuning(&self.dir); self.tuning_saved = self.tuning.clone(); self.say("Setting saved.", true); }),
+            _ => Ok(()),
+        };
+        if let Err(e) = r { self.say(format!("Could not apply it: {}", e), false); }
+        let _ = data::drop_suggestion(&self.dir, &s.id);
+        self.sugg.retain(|x| x.id != s.id);
+    }
+
+    fn dismiss_suggestion(&mut self, s: &data::Suggestion) {
+        let _ = data::drop_suggestion(&self.dir, &s.id);
+        self.sugg.retain(|x| x.id != s.id);
+    }
+
+    /// One pending fix as a card with real buttons. Returns true if it was handled here.
+    fn pending_card(&mut self, ui: &mut egui::Ui, p: &data::Pending, snooze: bool) {
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(bold(&p.name, 15.0).color(TEXT));
+                chip(ui, action_label(&p.action), if p.action == "terminate" { BAD } else { BLUE });
+            });
+            ui.label(RichText::new(if p.why.is_empty() { &p.msg } else { &p.why }).size(12.5).color(MUTED));
+            ui.horizontal(|ui| {
+                let ends = p.action == "terminate" || p.action.starts_with("restart");
+                if ends {
+                    if ui.add(egui::Button::new(RichText::new("Rein it in").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("Keep it running, but slower and with less memory").clicked() {
+                        self.run("snifrig-fix.exe", vec!["ease".into(), p.id.clone()], &format!("{} is reined in: efficiency mode, lower priority, memory trimmed.", p.name));
+                        self.snoozed.push(p.id.clone());
+                    }
+                    if ui.button(action_label(&p.action)).clicked() {
+                        self.run("snifrig-fix.exe", vec!["approve".into(), p.id.clone()], &format!("Done: {} {}.", action_label(&p.action).to_lowercase(), p.name));
+                        self.snoozed.push(p.id.clone());
+                    }
+                } else if ui.add(egui::Button::new(RichText::new("Approve").color(Color32::BLACK)).fill(ACCENT)).clicked() {
+                    self.run("snifrig-fix.exe", vec!["approve".into(), p.id.clone()], &format!("Done: {} {}.", action_label(&p.action).to_lowercase(), p.name));
+                    self.snoozed.push(p.id.clone());
+                }
+                if ui.button("Dismiss").clicked() { self.run("snifrig-fix.exe", vec!["dismiss".into(), p.id.clone()], "Dismissed."); self.snoozed.push(p.id.clone()); }
+                if snooze && ui.button("Not now").clicked() { self.snoozed.push(p.id.clone()); }
+            });
+        });
+    }
+
+    fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
+        card(ui, |ui| {
+            ui.horizontal(|ui| { chip(ui, "suggested by your AI assistant", BLUE); });
+            ui.label(bold(s.summary(), 15.0).color(TEXT));
+            ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
+            ui.horizontal(|ui| {
+                if s.kind != "note" && ui.add(egui::Button::new(RichText::new("Accept").color(Color32::BLACK)).fill(ACCENT)).clicked() { self.accept_suggestion(s); }
+                if ui.button(if s.kind == "note" { "Got it" } else { "Dismiss" }).clicked() { self.dismiss_suggestion(s); }
+                if snooze && ui.button("Not now").clicked() { self.snoozed.push(s.id.clone()); }
+            });
+        });
+    }
+
+    fn ask_view(&mut self, ctx: &egui::Context) {
+        let pending: Vec<data::Pending> = self.state.pending.iter().filter(|p| !self.snoozed.contains(&p.id)).cloned().collect();
+        let sugg: Vec<data::Suggestion> = self.sugg.iter().filter(|s| !self.snoozed.contains(&s.id)).cloned().collect();
+        let busy = self.toast.lock().unwrap().as_ref().map_or(false, |t| t.2.elapsed() < Duration::from_secs(3));
+        if pending.is_empty() && sugg.is_empty() && !busy { ctx.send_viewport_cmd(egui::ViewportCommand::Close); return; }
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).stroke(Stroke::new(1.0, ACCENT)).inner_margin(Margin::same(14))).show(ctx, |ui| {
+            let head = ui.horizontal(|ui| {
+                if let Some(t) = &self.logo { ui.add(egui::Image::new(t).fit_to_exact_size(Vec2::splat(26.0))); }
+                ui.label(bold("snifrig needs your OK", 16.0).color(TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("\u{d7}").on_hover_text("Close; ask again later").clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                    if ui.small_button("Open snifrig").clicked() {
+                        let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).arg("--dir").arg(&self.dir).spawn();
+                    }
+                });
+            }).response;
+            if ui.interact(head.rect, egui::Id::new("drag"), egui::Sense::drag()).drag_started() { ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); }
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 34.0).show(ui, |ui| {
+                for p in pending.iter().take(10) { self.pending_card(ui, p, true); ui.add_space(4.0); }
+                for s in sugg.iter().take(10) { self.suggestion_card(ui, s, true); ui.add_space(4.0); }
+            });
+            let toast = self.toast.lock().unwrap().clone();
+            if let Some((msg, ok, at)) = toast { if at.elapsed() < Duration::from_secs(6) { ui.label(RichText::new(msg).size(12.5).color(if ok { GOOD } else { BAD })); } }
+        });
+        ctx.request_repaint_after(Duration::from_millis(500));
     }
 
     fn fixer_note(&self, ui: &mut egui::Ui) {
@@ -416,6 +517,7 @@ impl App {
         }
         let held = self.state.held.clone();
         let pending = self.state.pending.clone();
+        let sugg = self.sugg.clone();
         ui.columns(2, |c| {
             card(&mut c[0], |ui| {
                 section(ui, "Eased in the background", "Busy apps the governor slowed down so the app you are using stays fast.");
@@ -435,23 +537,11 @@ impl App {
                 }
             });
             card(&mut c[1], |ui| {
-                section(ui, "Waiting for your OK", "Fixes that need you to decide.");
-                if pending.is_empty() { ui.label(RichText::new("Nothing to decide.").color(MUTED)); }
-                egui::ScrollArea::vertical().id_salt("pend").max_height(300.0).show(ui, |ui| {
-                    for p in pending.iter().rev().take(20) {
-                        ui.horizontal(|ui| {
-                            ui.label(bold(&p.name, 14.5).color(TEXT));
-                            chip(ui, action_label(&p.action), if p.action == "terminate" { BAD } else { BLUE });
-                        });
-                        ui.label(RichText::new(if p.why.is_empty() { &p.msg } else { &p.why }).size(12.5).color(MUTED));
-                        ui.horizontal(|ui| {
-                            if ui.add(egui::Button::new(RichText::new("Approve").color(Color32::BLACK)).fill(ACCENT)).clicked() {
-                                self.run("snifrig-fix.exe", vec!["approve".into(), p.id.clone()], &format!("Done: {} {}.", action_label(&p.action).to_lowercase(), p.name));
-                            }
-                            if ui.button("Dismiss").clicked() { self.run("snifrig-fix.exe", vec!["dismiss".into(), p.id.clone()], "Dismissed."); }
-                        });
-                        ui.separator();
-                    }
+                section(ui, "Waiting for your OK", "Fixes and suggestions that need you to decide.");
+                if pending.is_empty() && sugg.is_empty() { ui.label(RichText::new("Nothing to decide.").color(MUTED)); }
+                egui::ScrollArea::vertical().id_salt("pend").max_height(320.0).show(ui, |ui| {
+                    for p in pending.iter().rev().take(20) { self.pending_card(ui, p, false); ui.add_space(4.0); }
+                    for g in sugg.iter() { self.suggestion_card(ui, g, false); ui.add_space(4.0); }
                 });
             });
         });
@@ -933,6 +1023,7 @@ fn glob(p: &str, name: &str) -> bool {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.loaded.elapsed() > Duration::from_millis(1500) { self.reload(); }
+        if self.ask { self.ask_view(ctx); return; }
         let live = self.live.lock().map(|g| g.clone()).unwrap_or_default();
         egui::SidePanel::left("nav").exact_width(220.0).resizable(false).frame(egui::Frame::new().fill(SIDE).inner_margin(Margin::symmetric(12, 0))).show(ctx, |ui| self.nav(ui));
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(20, 6)).stroke(Stroke::new(1.0, BORDER))).show(ctx, |ui| self.top_bar(ui));

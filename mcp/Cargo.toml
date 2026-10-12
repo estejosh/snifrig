@@ -1,0 +1,10 @@
+[package]
+name = "snifrig-mcp"
+version = "0.3.0"
+edition = "2021"
+description = "MCP server for snifrig: lets an AI client explain why this PC is slow and suggest changes. Read-only plus suggestions; the user approves everything in snifrig."
+license = "LicenseRef-UFL-3.7"
+
+[[bin]]
+name = "snifrig-mcp"
+path = "src/main.rs"

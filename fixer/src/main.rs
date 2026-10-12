@@ -67,13 +67,21 @@ fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
             continue;
         }
         for t in &targets {
-            let action = refine(&it.action, t);
+            let mut action = refine(&it.action, t);
+            let mut why = it.why.clone();
+            // Never end or restart something the user is using: rein it in instead.
+            if matches!(action, Action::Terminate | Action::RestartService(_)) {
+                if let Some(r) = snifrig_fix::inuse::why_in_use(&t.name, now_unix()) {
+                    action = if a.key.starts_with("pm:") || a.key.starts_with("x:") { Action::Trim } else { Action::LowerPriority };
+                    why = format!("you are using it ({}), so snifrig reins it in instead of closing it; {}", r, it.why);
+                }
+            }
             // Fresh policy per target so the auto rate limit sees actions taken earlier in this pass.
             let p = policy(dir);
             match p.decide(&action, Some(t)) {
                 Verdict::Execute => {
                     let (status, note) = match actions::run(&action, t) {
-                        Ok(m) => ("done", format!("auto: {}; {}", m, it.why)),
+                        Ok(m) => ("done", format!("auto: {}; {}", m, why)),
                         Err(e) => ("failed", format!("auto: {}", e)),
                     };
                     ledger::record(dir, a, &action, Some(t), status, &note);
@@ -81,11 +89,11 @@ fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
                     acted += 1;
                 }
                 Verdict::Queue => {
-                    if let Some(id) = ledger::queue(dir, a, &action, t, &it.why) {
-                        ledger::record(dir, a, &action, Some(t), "queued", &format!("pending id {}; {}", id, it.why));
+                    if let Some(id) = ledger::queue(dir, a, &action, t, &why) {
+                        ledger::record(dir, a, &action, Some(t), "queued", &format!("pending id {}; {}", id, why));
                     }
                 }
-                Verdict::LogOnly(r) => ledger::record(dir, a, &action, Some(t), "would", &format!("{}; {}", r, it.why)),
+                Verdict::LogOnly(r) => ledger::record(dir, a, &action, Some(t), "would", &format!("{}; {}", r, why)),
                 Verdict::Refuse(r) => ledger::record(dir, a, &action, Some(t), "refused", &r),
             }
         }
@@ -129,6 +137,28 @@ fn approve(dir: &Path, id: &str) -> Result<String, String> {
         learn::append_feedback(dir, &f);
     }
     r
+}
+
+/// "Rein it in" instead of ending or restarting: efficiency mode, below-normal priority, memory trimmed.
+fn ease(dir: &Path, id: &str) -> Result<String, String> {
+    if now_unix() < ledger::paused_until(dir) { return Err("fixing is paused".into()); }
+    let mut items = ledger::load_pending(dir);
+    let i = items.iter().position(|x| x.id == id).ok_or("no pending fix with that id")?;
+    let item = items.remove(i);
+    ledger::save_pending(dir, &items);
+    let alert = snifrig_fix::Alert { t: String::new(), key: item.key.clone(), msg: item.msg.clone() };
+    let t = proc::target(item.pid).filter(|t| t.name.eq_ignore_ascii_case(&item.name))
+        .ok_or_else(|| format!("{} (pid {}) is no longer running", item.name, item.pid))?;
+    if let Some(why) = snifrig_fix::policy::denied(&t, &Action::LowerPriority, &ledger::read_list(dir, "fix-deny.txt")) { return Err(why); }
+    let mut done = Vec::new();
+    if sys::set_efficiency(t.pid, true).is_ok() { done.push("efficiency mode"); }
+    if sys::set_priority(t.pid, sys::BELOW_NORMAL).is_ok() { done.push("below-normal priority"); }
+    if actions::run(&Action::Trim, &t).is_ok() { done.push("memory trimmed"); }
+    if done.is_empty() { return Err(format!("could not change {}", t.name)); }
+    let note = format!("reined in at your request instead of {}: {}", item.action, done.join(", "));
+    ledger::record(dir, &alert, &Action::LowerPriority, Some(&t), "done", &note);
+    learn::append_feedback(dir, &Feedback::new("dismiss", "fix", &item.action, &item.name));
+    Ok(format!("{}: {}", t.name, done.join(", ")))
 }
 
 fn dismiss(dir: &Path, id: &str) -> Result<String, String> {
@@ -316,7 +346,23 @@ fn watch(dir: &Path) {
                     brain.want(name, &sys::cmdline(p.pid), &parent);
                 }
             }
-            snifrig_fix::brain::apply(&mut gov.hints, &brain.cache());
+            let cache = brain.cache();
+            snifrig_fix::brain::apply(&mut gov.hints, &cache);
+            snifrig_fix::inuse::set_kinds(cache.iter().filter(|(_, v)| v.confidence >= snifrig_fix::brain::MIN_CONF).map(|(k, v)| (k.clone(), v.kind.clone())).collect());
+            // Drop queued end/restart proposals for apps the user is using now.
+            if n % 30 == 0 {
+                let mut items = ledger::load_pending(dir);
+                let before = items.len();
+                let mut dropped = Vec::new();
+                items.retain(|x| {
+                    if !(x.action == "terminate" || x.action.starts_with("restart")) { return true; }
+                    match snifrig_fix::inuse::why_in_use(&x.name, now) { Some(r) => { dropped.push((x.name.clone(), r)); false } None => true }
+                });
+                if items.len() != before {
+                    ledger::save_pending(dir, &items);
+                    for (name, r) in dropped { note(dir, "fix:in-use", "dismissed", &format!("withdrew the proposal to end {}: you are using it ({}); snifrig reins it in instead", name, r)); }
+                }
+            }
             for note in learner.take_notes() {
                 let alert = snifrig_fix::Alert { t: String::new(), key: "learn:blocked".into(), msg: note.clone() };
                 ledger::record(dir, &alert, &Action::Report, None, "refused", &note);
@@ -383,7 +429,7 @@ fn gov_status(dir: &Path) -> Result<String, String> {
     Ok(o.trim_end().to_string())
 }
 const DENIED: &str = "snifrig-fix is the paid part of Snifrig and needs a valid key. Prices: https://github.com/estejosh/snifrig/blob/main/PRICING.md";
-const USAGE: &str = "usage: snifrig-fix [once|status|pending|mode M|approve ID|dismiss ID|governor status|governor undo PID|brain NAME|rule add \"PATTERN key=value ...\"|rule list|rule remove N|machine-id|license install PATH|license accept|license status] [--dir D] [--accept-license \"UFL-3.7 snifrig-fix\"]";
+const USAGE: &str = "usage: snifrig-fix [once|status|pending|mode M|approve ID|ease ID|dismiss ID|governor status|governor undo PID|brain NAME|rule add \"PATTERN key=value ...\"|rule list|rule remove N|machine-id|license install PATH|license accept|license status] [--dir D] [--accept-license \"UFL-3.7 snifrig-fix\"]";
 const ACCEPT_PHRASE: &str = "UFL-3.7 snifrig-fix";
 
 /// The hard gate: a valid key and a recorded acceptance, or Err(reason).
@@ -442,6 +488,7 @@ fn main() {
                 format!("{}: kind {} (confidence {:.2}), importance {:.2} -> weight {:.1}, deepest level {}", name, v.kind, v.confidence, v.importance, w, max)
             }))
         }
+        ["ease", id] => out(ease(&dir, id)),
         ["mode", m] => match Mode::parse(m) {
             Some(m) => { ledger::write_mode(&dir, m); println!("fixer mode: {}", m.as_str()); }
             None => out(Err("mode must be off, dry-run, ask or auto".into())),

@@ -120,6 +120,21 @@ pub fn start() -> Arc<Mutex<Live>> {
     live
 }
 
+#[link(name = "user32", kind = "raw-dylib")]
+extern "system" { fn GetDpiForSystem() -> u32; }
+
+/// The desktop area not covered by the taskbar, in logical points: (left, top, right, bottom).
+pub fn work_area() -> (f32, f32, f32, f32) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
+    unsafe {
+        let mut r: RECT = std::mem::zeroed();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut _ as *mut _, 0);
+        let s = (GetDpiForSystem().max(96) as f32) / 96.0;
+        (r.left as f32 / s, r.top as f32 / s, r.right as f32 / s, r.bottom as f32 / s)
+    }
+}
+
 /// Seconds to add to unix time to get local time (daylight saving included).
 pub fn local_offset_secs() -> i64 {
     use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};

@@ -29,6 +29,56 @@ pub struct Event { pub unix: f64, pub key: String, pub name: String, pub action:
 pub struct Gpu { pub ok: bool, pub temp_c: f64, pub power_w: f64, pub limit_w: f64, pub mhz: f64, pub max_mhz: f64, pub used_mb: f64, pub total_mb: f64, pub reasons: String }
 
 #[derive(Clone, Default)]
+pub struct Suggestion { pub id: String, pub kind: String, pub app: String, pub rule: String, pub setting: String, pub reason: String }
+
+impl Suggestion {
+    /// What accepting it would do, in plain words.
+    pub fn summary(&self) -> String {
+        match self.kind.as_str() {
+            "rule" => match Rule::parse(&self.rule) { Some(r) => format!("{}: {}", r.pattern, r.chips().join(", ")), None => self.rule.clone() },
+            "ease" => format!("Always run {} in the background", self.app),
+            "setting" => format!("Governor setting {}", self.setting),
+            _ => "A note, nothing to change".into(),
+        }
+    }
+}
+
+pub fn load_suggestions(dir: &Path) -> Vec<Suggestion> {
+    read_json(dir, "ai-suggestions.json").get("items").arr().iter().map(|j| Suggestion {
+        id: j.get("id").str().into(), kind: j.get("kind").str().into(), app: j.get("app").str().into(),
+        rule: j.get("rule").str().into(), setting: j.get("setting").str().into(), reason: j.get("reason").str().into(),
+    }).collect()
+}
+
+fn esc(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() { match c { '"' => o.push_str("\\\""), '\\' => o.push_str("\\\\"), c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)), c => o.push(c) } }
+    o
+}
+
+/// Remove one suggestion (after Accept or Dismiss), keeping the others as written.
+pub fn drop_suggestion(dir: &Path, id: &str) -> Result<(), String> {
+    let j = read_json(dir, "ai-suggestions.json");
+    let keep: Vec<String> = j.get("items").arr().iter().filter(|x| x.get("id").str() != id).map(|x| {
+        let f = |k: &str| format!("\"{}\":\"{}\"", k, esc(x.get(k).str()));
+        format!("{{{},\"unix\":{},{},{},{},{},{},\"source\":\"ai\"}}", f("id"), x.get("unix").num() as u64, f("kind"), f("app"), f("rule"), f("setting"), f("reason"))
+    }).collect();
+    write_atomic(&dir.join("ai-suggestions.json"), &format!("{{\"items\":[{}]}}\n", keep.join(",")))
+}
+
+/// Apply one "key=value" governor setting through the same parser the file uses.
+pub fn apply_setting(dir: &Path, kv: &str) -> Result<(), String> {
+    let mut text = read(dir, "fix-governor.txt");
+    text.push_str("\n");
+    text.push_str(kv);
+    let tmp = dir.join("fix-governor.check");
+    std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+    let t = { let mut t = load_tuning_text(&text); if t == Tuning::default() && !kv.contains('=') { return Err("not a setting".into()); } t.calm_pct = t.calm_pct.min(t.busy_pct); t };
+    let _ = std::fs::remove_file(tmp);
+    save_tuning(dir, &t)
+}
+
+#[derive(Clone, Default)]
 pub struct Brain { pub name: String, pub kind: String, pub confidence: f64 }
 
 #[derive(Clone, Default)]
@@ -267,9 +317,11 @@ impl Default for Tuning {
     }
 }
 
-pub fn load_tuning(dir: &Path) -> Tuning {
+pub fn load_tuning(dir: &Path) -> Tuning { load_tuning_text(&read(dir, "fix-governor.txt")) }
+
+pub fn load_tuning_text(text: &str) -> Tuning {
     let mut t = Tuning::default();
-    for raw in read(dir, "fix-governor.txt").lines() {
+    for raw in text.lines() {
         let l = raw.split('#').next().unwrap_or("").trim();
         let Some((k, v)) = l.split_once('=') else { continue };
         let (k, v) = (k.trim(), v.trim().trim_end_matches('%'));

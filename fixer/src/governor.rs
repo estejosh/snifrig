@@ -135,7 +135,7 @@ pub enum Step {
 
 /// One process as seen this tick.
 #[derive(Clone, Debug)]
-pub struct Seen { pub key: Key, pub name: String, pub core_pct: f64, pub foreground: bool, pub protected: bool }
+pub struct Seen { pub key: Key, pub name: String, pub core_pct: f64, pub foreground: bool, pub protected: bool, pub windowed: bool }
 
 /// Counters that carry between ticks.
 #[derive(Clone, Debug, Default)]
@@ -190,8 +190,11 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
     for (k, d) in demoted {
         match live.get(k) {
             None => out.push(Step::Forget { key: *k }),
-            Some(s) if s.foreground || fg_names.contains(&s.name.as_str()) =>
+            Some(s) if s.foreground || (fg_names.contains(&s.name.as_str()) && s.windowed) =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 0, reason: format!("{} is now the app you are using", d.name) }),
+            // A windowless helper (a browser tab, a renderer) of the app in front may stay reined in, but only lightly.
+            Some(s) if fg_names.contains(&s.name.as_str()) && d.level > 1 =>
+                out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is in front, so its busy background part is only kept in efficiency mode", d.name) }),
             Some(_) if mood.calm_with(t) && mood.calm_ticks % t.restore_every.max(1) == 0 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: d.level - 1, reason: format!("CPU is calm again ({:.0}%)", total_pct) }),
             _ => {}
@@ -201,10 +204,15 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
 
     // Demote the biggest background users, one step each, a couple per tick.
     let mut cands: Vec<&Seen> = seen.iter()
-        .filter(|s| !s.protected && !s.foreground && !fg_names.contains(&s.name.as_str()))
+        // The app in front is never touched; its windowless helpers (busy tabs, renderers) may be reined in lightly.
+        .filter(|s| !s.protected && !s.foreground && (!fg_names.contains(&s.name.as_str()) || !s.windowed))
         .filter(|s| s.core_pct >= t.min_core_pct)
         .filter(|s| { let n = s.name.to_lowercase(); !hints.protect.contains(&n) && !hints.blocked.contains(&n) })
-        .filter(|s| { let cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level); demoted.get(&s.key).map_or(0, |d| d.level) < cap })
+        .filter(|s| {
+            let mut cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level);
+            if fg_names.contains(&s.name.as_str()) { cap = cap.min(1); }
+            demoted.get(&s.key).map_or(0, |d| d.level) < cap
+        })
         .collect();
     // Biggest user first, weighted by how often demoting that name has helped.
     let weight = |s: &Seen| { let n = s.name.to_lowercase();
@@ -212,8 +220,12 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
     cands.sort_by(|a, b| weight(b).partial_cmp(&weight(a)).unwrap_or(std::cmp::Ordering::Equal));
     for s in cands.into_iter().take(t.max_per_tick) {
         let lvl = demoted.get(&s.key).map_or(0, |d| d.level) + 1;
-        out.push(Step::Demote { key: s.key, name: s.name.clone(), to_level: lvl,
-            reason: format!("CPU at {:.0}% and {} was using {:.0}% of a core in the background", total_pct, s.name, s.core_pct) });
+        let reason = if fg_names.contains(&s.name.as_str()) {
+            format!("CPU at {:.0}% and a background part of {} (a tab or helper, pid {}) was using {:.0}% of a core; the window you are using is untouched", total_pct, s.name, s.key.0, s.core_pct)
+        } else {
+            format!("CPU at {:.0}% and {} was using {:.0}% of a core in the background", total_pct, s.name, s.core_pct)
+        };
+        out.push(Step::Demote { key: s.key, name: s.name.clone(), to_level: lvl, reason });
     }
     out
 }
@@ -257,6 +269,8 @@ pub struct Governor {
     pub tuning: Tuning,
     /// Lowercase image name of the game performance mode is running for, if any.
     pub game: Option<String>,
+    windowed: HashSet<u32>,
+    win_at: f64,
 }
 
 /// One change made, for the ledger and the tray.
@@ -266,7 +280,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), win_at: 0.0 }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -288,6 +302,7 @@ impl Governor {
     pub fn tick(&mut self, now: f64, act: bool) -> Vec<Change> {
         let procs = sys::snapshot(&mut self.buf);
         let fg = sys::foreground_pid();
+        if now - self.win_at >= 5.0 { self.windowed = sys::window_pids(); self.win_at = now; }
         let mut seen = Vec::with_capacity(procs.len());
         let mut busy_sum = 0.0;
         let mut next_prev = HashMap::with_capacity(procs.len());
@@ -301,10 +316,11 @@ impl Governor {
             if p.pid == 0 { continue; } // idle
             busy_sum += core_pct;
             let foreground = Some(p.pid) == fg;
+            if foreground { crate::inuse::note_foreground(&p.name, now); }
             // Cheap filter before the protected check, which may read a command line.
             let protected = if core_pct >= self.tuning.min_core_pct || self.demoted.contains_key(&key) { self.protected(p) } else { true };
             let protected = protected || self.undone.contains(&key);
-            seen.push(Seen { key, name: p.name.clone(), core_pct, foreground, protected });
+            seen.push(Seen { key, name: p.name.clone(), core_pct, foreground, protected, windowed: self.windowed.contains(&p.pid) });
         }
         self.prev = next_prev;
         self.protected_cache.retain(|k, _| self.prev.contains_key(k));
@@ -383,7 +399,23 @@ impl Governor {
 #[cfg(test)]
 mod gov_tests {
     use super::*;
-    fn s(pid: u32, name: &str, pct: f64) -> Seen { Seen { key: (pid, 1), name: name.into(), core_pct: pct, foreground: false, protected: false } }
+    fn s(pid: u32, name: &str, pct: f64) -> Seen { Seen { key: (pid, 1), name: name.into(), core_pct: pct, foreground: false, protected: false, windowed: false } }
+
+    #[test]
+    fn busy_tab_of_front_app_is_reined_in_lightly() {
+        let m = Mood { busy_ticks: BUSY_TICKS, calm_ticks: 0 };
+        let mut fg = s(1, "comet.exe", 30.0); fg.foreground = true; fg.windowed = true;
+        let mut other_window = s(3, "comet.exe", 90.0); other_window.windowed = true;
+        let tab = s(2, "comet.exe", 120.0);
+        let steps = decide(95.0, &m, &[fg.clone(), tab.clone(), other_window], &HashMap::new());
+        assert_eq!(steps.len(), 1, "{:?}", steps);
+        assert!(matches!(&steps[0], Step::Demote { key: (2, 1), to_level: 1, .. }));
+        let mut d = HashMap::new();
+        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "comet.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        assert!(decide(95.0, &m, &[fg.clone(), tab.clone()], &d).is_empty(), "already at the cap for a front app's helper, no flapping");
+        d.get_mut(&(2, 1)).unwrap().level = 3;
+        assert!(matches!(&decide(95.0, &m, &[fg, tab], &d)[0], Step::Restore { to_level: 1, .. }));
+    }
 
     #[test]
     fn tuning_file_parses_and_reports_errors() {
@@ -434,7 +466,7 @@ mod gov_tests {
     fn never_touches_foreground_name_or_protected() {
         let m = Mood { busy_ticks: BUSY_TICKS, calm_ticks: 0 };
         let mut fg = s(1, "comet.exe", 80.0); fg.foreground = true;
-        let other_tab = s(2, "comet.exe", 90.0);
+        let mut other_tab = s(2, "comet.exe", 90.0); other_tab.windowed = true;
         let mut prot = s(3, "dwm.exe", 90.0); prot.protected = true;
         let steps = decide(95.0, &m, &[fg, other_tab, prot], &HashMap::new());
         assert!(steps.is_empty(), "{:?}", steps);

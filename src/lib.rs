@@ -798,6 +798,10 @@ fn install(dir: &PathBuf, given: Option<String>) {
         match fs::copy(&fsrc, bin.join("snifrig-fix.exe")) { Ok(_) => fix = true, Err(e) => eprintln!("could not copy snifrig-fix.exe: {}", e) }
     }
     // The window is optional too: copy it if it was built here, and add a Start menu entry.
+    let msrc = sd.join("snifrig-mcp.exe");
+    if msrc.exists() && msrc != bin.join("snifrig-mcp.exe") {
+        if let Err(e) = fs::copy(&msrc, bin.join("snifrig-mcp.exe")) { eprintln!("could not copy snifrig-mcp.exe (close AI apps using it and run install again): {}", e); }
+    }
     let asrc = sd.join("snifrig-app.exe");
     if asrc.exists() && asrc != bin.join("snifrig-app.exe") {
         if let Err(e) = fs::copy(&asrc, bin.join("snifrig-app.exe")) { eprintln!("could not copy snifrig-app.exe (close the snifrig window and run install again): {}", e); }

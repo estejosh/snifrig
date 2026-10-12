@@ -1,0 +1,43 @@
+{
+  "manifest_version": "0.3",
+  "name": "snifrig",
+  "display_name": "snifrig",
+  "version": "0.3.0",
+  "description": "Ask Claude why your Windows PC is slow. snifrig reads its own measurements, explains the cause, and suggests fixes that you approve in snifrig.",
+  "long_description": "snifrig watches your PC for memory leaks, runaway apps and Windows slowdowns. This extension lets Claude read what snifrig sees (status, live processes, alerts, recent fixes) and explain why the PC is slow. Claude can suggest a gentle change, such as putting a background app in efficiency mode, but it can never apply one: every suggestion waits for your OK in the snifrig window. Reading is free; suggestions need snifrig fix.",
+  "author": {
+    "name": "estejosh",
+    "url": "https://github.com/estejosh/snifrig"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/estejosh/snifrig"
+  },
+  "homepage": "https://github.com/estejosh/snifrig",
+  "icon": "icon.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/snifrig-mcp.exe",
+    "mcp_config": {
+      "command": "${__dirname}/server/snifrig-mcp.exe",
+      "args": [],
+      "env": {}
+    }
+  },
+  "tools": [
+    { "name": "snifrig_status", "description": "Headline, causes, live CPU and RAM, GPU, what the governor is easing" },
+    { "name": "snifrig_why_slow", "description": "snifrig's own explanation of why the PC is slow right now" },
+    { "name": "snifrig_report", "description": "Slowdown, alert and leak summary for the last N days" },
+    { "name": "snifrig_top_processes", "description": "Live per-process CPU, memory and handles" },
+    { "name": "snifrig_recent_activity", "description": "What the fixer and governor recently did" },
+    { "name": "snifrig_alerts", "description": "Recent snifrig alerts" },
+    { "name": "snifrig_rules", "description": "Current fix rules and governor settings" },
+    { "name": "snifrig_pending", "description": "Fixes waiting for your OK (read-only)" },
+    { "name": "snifrig_suggest", "description": "Propose a rule or setting for you to accept in snifrig (needs snifrig fix; never changes anything itself)" }
+  ],
+  "keywords": ["windows", "performance", "diagnostics", "memory", "cpu"],
+  "compatibility": {
+    "platforms": ["win32"]
+  },
+  "license": "LicenseRef-UFL-3.7"
+}
