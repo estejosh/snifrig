@@ -20,4 +20,4 @@ panic = "abort"
 strip = true
 
 [workspace]
-members = ["fixer"]
+members = ["fixer", "app"]
