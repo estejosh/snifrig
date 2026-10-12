@@ -52,6 +52,19 @@ fn open_app() -> bool {
     std::process::Command::new(exe).arg("--dir").arg(dir()).creation_flags(0x0000_0008).spawn().is_ok()
 }
 
+/// Windows 11 hides new tray icons in the overflow. Show ours on the taskbar once, a few
+/// seconds after it appears; if the user hid it again (IsPromoted = 0), leave it hidden.
+fn promote_icon() {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = exe.display().to_string().replace('\'', "''");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let ps = format!("Get-ChildItem 'HKCU:\\Control Panel\\NotifyIconSettings' | Where-Object {{ $p = Get-ItemProperty $_.PSPath; $p.ExecutablePath -eq '{}' -and $null -eq $p.IsPromoted }} | ForEach-Object {{ Set-ItemProperty $_.PSPath -Name IsPromoted -Value 1 -Type DWord }}", exe);
+        let _ = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &ps]).creation_flags(0x0800_0000).status();
+    });
+}
+
 fn fix_mode() -> String {
     std::fs::read_to_string(dir().join("fix-mode.txt")).map(|s| s.trim().to_string()).unwrap_or_else(|_| "dry-run".into())
 }
@@ -185,6 +198,7 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
     for p in read_pending() { if !seen.contains(&p.id) { seen.push(p.id); } }
     FIRST = false;
     Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &n);
+    if add { promote_icon(); }
 }
 
 unsafe fn open(file: &str, params: Option<&str>) {
