@@ -29,6 +29,7 @@ pub mod verdict;
 mod gpu_throttle;
 mod dupes;
 mod cpuhog;
+mod wslwatch;
 mod slowdown;
 mod report;
 const SLOW_CAP: u64 = 512 << 10;
@@ -247,6 +248,7 @@ struct Mon {
     cpu_prev: HashMap<u32, u64>,
     cpu_t: f64,
     cpuhog: cpuhog::CpuHogs,
+    wsl: wslwatch::WslWatch,
     busy_streak: u32,
     total_cpu_pct: Option<f64>,
     t0: Instant,
@@ -265,7 +267,7 @@ impl Mon {
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
             last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9, rebase: false,
-            slow: slowdown::Slow::open(), recent_slow: VecDeque::new(), dupes: Vec::new(), dup_det: dupes::Dupes::new(), verdict: None, cpu_prev: HashMap::new(), cpu_t: 0.0, cpuhog: cpuhog::CpuHogs::new(), busy_streak: 0, total_cpu_pct: None, t0: Instant::now(),
+            slow: slowdown::Slow::open(), recent_slow: VecDeque::new(), dupes: Vec::new(), dup_det: dupes::Dupes::new(), verdict: None, cpu_prev: HashMap::new(), cpu_t: 0.0, cpuhog: cpuhog::CpuHogs::new(), wsl: wslwatch::WslWatch::new(), busy_streak: 0, total_cpu_pct: None, t0: Instant::now(),
         }
     }
 
@@ -376,6 +378,8 @@ impl Mon {
         for (k, m) in alerts { self.alert(t, &k, &m); }
         let dir = self.dir.clone();
         for (k, m) in self.dup_det.check(t, &dir, &procs) { self.alert(t, &k, &m); }
+        let vm_gb = procs.iter().filter(|p| p.name.eq_ignore_ascii_case("vmmemWSL")).map(|p| p.private as f64 / 1073741824.0).sum::<f64>();
+        if let Some((k, m)) = self.wsl.tick(t, vm_gb, &dir, &iso) { self.alert(t, &k, &m); }
         self.log_cycle(t, &g);
         self.write_status(t, &g);
         if self.cycle % 30 == 0 {

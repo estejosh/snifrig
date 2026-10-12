@@ -33,10 +33,10 @@ fn friendly(name: &str) -> String {
 
 fn action(name: &str, pid: u32) -> String {
     match name.to_ascii_lowercase().trim_end_matches(".exe") {
-        "vmmemwsl" | "vmmem" => "Run wsl --shutdown to give the memory back.".into(),
+        "vmmemwsl" | "vmmem" => "wsl --shutdown gives it back, but stops everything running in WSL.".into(),
         "msmpeng" => "Let the scan finish, or schedule scans for later.".into(),
         "dwm" => "Sign out and back in to reset it.".into(),
-        _ => format!("Close or restart it (pid {}).", pid),
+        _ => format!("snifrig fix can rein it in now; restart it when it suits you (pid {}).", pid),
     }
 }
 
@@ -49,7 +49,7 @@ fn cpu_causes(i: &VerdictInput) -> Vec<String> {
     let mut h: Vec<&CpuHog> = i.cpu_hogs.iter().collect();
     h.sort_by(|a, b| b.pct.partial_cmp(&a.pct).unwrap_or(std::cmp::Ordering::Equal));
     let mut out: Vec<String> = h.iter().take(3).map(|x| {
-        let act = if crate::cpuhog::auto_restarts(&x.name) { "End it; Windows restarts it." } else { "Close or restart it." };
+        let act = if crate::cpuhog::auto_restarts(&x.name) { "End it; Windows restarts it." } else { "snifrig fix can rein it in; restart it when it suits you." };
         format!("{} is using about {:.0}% of a CPU core ({:.0} min, pid {}). {}", cap(&crate::cpuhog::friendly(&x.name)), x.pct, x.minutes, x.pid, act)
     }).collect();
     if out.is_empty() { out.push("Open Task Manager, sort by CPU, and close what you are not using.".into()); }
@@ -144,8 +144,8 @@ mod tests {
         assert_eq!(v.severity, 2);
         assert!(v.headline.starts_with("Your PC is short on memory"));
         assert_eq!(v.causes.len(), 3);
-        assert_eq!(v.causes[0], "WSL (vmmemWSL) 24.5 GB, growing 1.5 GB/h. Run wsl --shutdown to give the memory back.");
-        assert!(v.causes[1].starts_with("comet.exe 9.3 GB. Close or restart it (pid 7)"));
+        assert_eq!(v.causes[0], "WSL (vmmemWSL) 24.5 GB, growing 1.5 GB/h. wsl --shutdown gives it back, but stops everything running in WSL.");
+        assert!(v.causes[1].starts_with("comet.exe 9.3 GB. snifrig fix can rein it in now; restart it when it suits you (pid 7)"));
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(v.headline, "Your CPU is busy, mostly with the Windows Start menu.");
         assert_eq!(v.causes.len(), 2);
         assert_eq!(v.causes[0], "The Windows Start menu is using about 98% of a CPU core (10 min, pid 5). End it; Windows restarts it.");
-        assert_eq!(v.causes[1], "Comet browser is using about 90% of a CPU core (10 min, pid 7). Close or restart it.");
+        assert_eq!(v.causes[1], "Comet browser is using about 90% of a CPU core (10 min, pid 7). snifrig fix can rein it in; restart it when it suits you.");
     }
 
     #[test]
