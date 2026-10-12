@@ -756,6 +756,17 @@ fn monitor_running(dir: &PathBuf) -> bool {
     u > 0.0 && now() - u < 180.0
 }
 
+/// Create or remove the Start menu entry for the window (per user, no admin).
+fn start_menu_shortcut(target: &PathBuf, create: bool) {
+    use std::os::windows::process::CommandExt;
+    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let lnk = PathBuf::from(appdata).join("Microsoft\\Windows\\Start Menu\\Programs\\snifrig.lnk");
+    if !create { let _ = fs::remove_file(&lnk); return; }
+    let ps = format!("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath='{}'; $s.Description='snifrig: keeps your PC fast'; $s.Save()",
+        lnk.display().to_string().replace('\'', "''"), target.display().to_string().replace('\'', "''"));
+    let _ = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &ps]).creation_flags(0x0800_0000).status();
+}
+
 fn install(dir: &PathBuf, given: Option<String>) {
     if !ensure_accepted(dir, given) { std::process::exit(1); }
     let here = match std::env::current_exe() { Ok(p) => p, Err(_) => { eprintln!("cannot find own location"); std::process::exit(1) } };
@@ -786,6 +797,12 @@ fn install(dir: &PathBuf, given: Option<String>) {
         let _ = fs::remove_file(dir.join("stop-fix"));
         match fs::copy(&fsrc, bin.join("snifrig-fix.exe")) { Ok(_) => fix = true, Err(e) => eprintln!("could not copy snifrig-fix.exe: {}", e) }
     }
+    // The window is optional too: copy it if it was built here, and add a Start menu entry.
+    let asrc = sd.join("snifrig-app.exe");
+    if asrc.exists() && asrc != bin.join("snifrig-app.exe") {
+        if let Err(e) = fs::copy(&asrc, bin.join("snifrig-app.exe")) { eprintln!("could not copy snifrig-app.exe (close the snifrig window and run install again): {}", e); }
+    }
+    if bin.join("snifrig-app.exe").exists() { start_menu_shortcut(&bin.join("snifrig-app.exe"), true); }
     if failed { eprintln!("Install stopped. Build all three programs first (cargo build --release) and run install from that folder."); std::process::exit(1); }
     let q = |n: &str| format!("\"{}\" --dir \"{}\"", bin.join(n).display(), dir.display());
     if !(set_run("Snifrig", &q("snifrigd.exe")) && set_run("SnifrigTray", &q("snifrig-tray.exe"))) {
@@ -801,6 +818,7 @@ fn install(dir: &PathBuf, given: Option<String>) {
 }
 
 fn uninstall(dir: &PathBuf) {
+    start_menu_shortcut(&dir.join("bin").join("snifrig-app.exe"), false);
     del_run("Snifrig");
     del_run("SnifrigTray");
     del_run("SnifrigFix");

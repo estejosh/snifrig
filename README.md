@@ -56,6 +56,10 @@ Output of `snifrig --help`:
 
 Options: `--dir PATH`, `--cycles N`, `--accept-license UFL-3.7` (or env `SNIFRIG_ACCEPT_LICENSE`).
 
+## The snifrig window
+
+Double-click the tray icon, pick Open snifrig, or find snifrig in the Start menu. The window shows what is slowing the PC, what snifrig fix eased or wants your OK for, and every fixer setting (governor, app rules, performance mode, mode and pause) with no text files to edit. It only runs while it is open.
+
 ## Tray flyout
 
 Left-click the tray icon to see CPU, RAM, GPU and VRAM with the top three consumers of each (for example which process holds your VRAM). Data is collected only while the flyout opens (snifrig --snapshot), using Windows per-process GPU counters, so it adds nothing to the background monitor.

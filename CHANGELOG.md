@@ -10,6 +10,10 @@ All notable changes to snifrig are listed here.
 - Earlier releases and commits keep the license they were published under (UFL 3.4 Noncommercial).
 - UFL 1C: projects move forward only.
 
+## Unreleased
+
+- snifrig app: a real window for everything. Overview (live CPU, memory, GPU and graphics memory, what slows the PC, apps eased in the background with Put back, fixes waiting for your OK with Approve and Dismiss, busiest apps with Make a rule), Governor settings with sliders and a live CPU chart, App rules editor (pick a running app, priority, efficiency, disk and memory priority, core picker, CPU limit, copies, governor and game options, suggestions), Performance mode (power plan, games snifrig knows), Activity log with filters and a 24 h memory chart, Report, Settings (fixer mode, license, local brain, data folder). Opens from the tray (double-click or Open snifrig) and the Start menu. Runs only while open.
+
 ## 0.3.0 - 2026-10-11
 
 - Governor (fixer): eases the biggest background CPU users within seconds when the PC is pegged, in three steps (efficiency mode, below normal, idle), never the app in front, and puts them back stepwise when calm. Every change is explained, logged and undoable from the tray.

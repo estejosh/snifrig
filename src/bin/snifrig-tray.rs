@@ -45,6 +45,13 @@ fn fixer_exe() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrig-fix.exe"))).filter(|p| p.exists())
 }
 
+/// The snifrig window, if it was installed next to the tray.
+fn open_app() -> bool {
+    use std::os::windows::process::CommandExt;
+    let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrig-app.exe"))).filter(|p| p.exists()) else { return false };
+    std::process::Command::new(exe).arg("--dir").arg(dir()).creation_flags(0x0000_0008).spawn().is_ok()
+}
+
 fn fix_mode() -> String {
     std::fs::read_to_string(dir().join("fix-mode.txt")).map(|s| s.trim().to_string()).unwrap_or_else(|_| "dry-run".into())
 }
@@ -214,6 +221,8 @@ unsafe fn menu(hwnd: HWND) {
     let head = if st.headline.is_empty() { format!("Snifrig: {}", ["OK", "ALERT", "monitor not running"][st.level]) } else { esc(&st.headline) };
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, wide(&head).as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, null());
+    AppendMenuW(m, MF_STRING, 9, wide("Open snifrig").as_ptr());
+    SetMenuDefaultItem(m, 9, 0);
     AppendMenuW(m, MF_STRING, 1, wide("Show report").as_ptr());
     AppendMenuW(m, MF_STRING, 2, wide("Open alerts").as_ptr());
     AppendMenuW(m, MF_STRING, 3, wide("Open data folder").as_ptr());
@@ -286,7 +295,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_TRAY => {
             let ev = (lp as u32) & 0xFFFF;
-            if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU { menu(hwnd); } else if ev == WM_LBUTTONUP { flyout::show(dir()); }
+            if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU { menu(hwnd); } else if ev == WM_LBUTTONDBLCLK { if !open_app() { flyout::show(dir()); } } else if ev == WM_LBUTTONUP { flyout::show(dir()); }
             0
         }
         WM_TIMER => {
@@ -296,6 +305,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_COMMAND => {
             match (wp & 0xFFFF) as u32 {
+                9 => { if !open_app() { open_report(); } }
                 1 => open_report(),
                 2 => {
                     let p = dir().join("alerts.jsonl");
