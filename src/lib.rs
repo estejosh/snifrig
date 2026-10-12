@@ -762,8 +762,8 @@ fn start_menu_shortcut(target: &PathBuf, create: bool) {
     let Some(appdata) = std::env::var_os("APPDATA") else { return };
     let lnk = PathBuf::from(appdata).join("Microsoft\\Windows\\Start Menu\\Programs\\snifrig.lnk");
     if !create { let _ = fs::remove_file(&lnk); return; }
-    let ps = format!("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath='{}'; $s.Description='snifrig: keeps your PC fast'; $s.Save()",
-        lnk.display().to_string().replace('\'', "''"), target.display().to_string().replace('\'', "''"));
+    let ps = format!("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath='{}'; $s.IconLocation='{}' + ',0'; $s.Description='snifrig: keeps your PC fast'; $s.Save()",
+        lnk.display().to_string().replace('\'', "''"), target.display().to_string().replace('\'', "''"), target.display().to_string().replace('\'', "''"));
     let _ = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &ps]).creation_flags(0x0800_0000).status();
 }
 
