@@ -104,28 +104,60 @@ fn read_status() -> Status {
     }
 }
 
-/// The hound head on its charcoal tile, with a status dot: green ok, red alert, gray monitor not running.
+/// The real snifrig icon (embedded resource 1) at the tray's size, as BGRA pixels, top row first.
+unsafe fn resource_pixels(size: i32) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Graphics::Gdi::{GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS};
+    let h = LoadImageW(GetModuleHandleW(null()), 1 as _, IMAGE_ICON, size, size, LR_DEFAULTCOLOR);
+    if h.is_null() { return None; }
+    let mut ii: ICONINFO = std::mem::zeroed();
+    let ok = GetIconInfo(h as HICON, &mut ii) != 0;
+    DestroyIcon(h as HICON);
+    if !ok { return None; }
+    let mut bmi: BITMAPINFO = std::mem::zeroed();
+    bmi.bmiHeader = BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: size, biHeight: -size, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB as u32, ..std::mem::zeroed() };
+    let mut px = vec![0u8; (size * size * 4) as usize];
+    let dc = GetDC(null_mut());
+    let lines = GetDIBits(dc, ii.hbmColor, 0, size as u32, px.as_mut_ptr() as *mut _, &mut bmi, DIB_RGB_COLORS);
+    ReleaseDC(null_mut(), dc);
+    DeleteObject(ii.hbmColor as _);
+    DeleteObject(ii.hbmMask as _);
+    if lines == 0 || px.chunks(4).all(|p| p[3] == 0) { return None; }
+    Some(px)
+}
+
+/// The hound with a status dot in the corner: green ok, red alert, gray monitor not running.
 fn make_icon(level: usize) -> HICON {
-    let pal = |c: u8| match c { b'g' => (217u8, 164u8, 65u8), b'c' => (63, 184, 232), _ => (20, 24, 28) };
-    let mut px = vec![0u8; 32 * 32 * 4];
-    for (i, c) in icon::ICON.bytes().enumerate().take(1024) {
-        let (r, g, b) = pal(c);
-        px[i * 4] = b; px[i * 4 + 1] = g; px[i * 4 + 2] = r; px[i * 4 + 3] = 255;
-    }
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 64);
+    let px = unsafe { resource_pixels(size) };
+    let (size, mut px) = match px {
+        Some(p) => (size, p),
+        None => {
+            // Fallback: the old drawn hound at 32 px.
+            let pal = |c: u8| match c { b'g' => (217u8, 164u8, 65u8), b'c' => (63, 184, 232), _ => (20, 24, 28) };
+            let mut p = vec![0u8; 32 * 32 * 4];
+            for (i, c) in icon::ICON.bytes().enumerate().take(1024) {
+                let (r, g, b) = pal(c);
+                p[i * 4] = b; p[i * 4 + 1] = g; p[i * 4 + 2] = r; p[i * 4 + 3] = 255;
+            }
+            (32, p)
+        }
+    };
     let dot = match level { 0 => (61u8, 220u8, 132u8), 1 => (229, 72, 77), _ => (138, 143, 152) };
-    for y in 0..32i32 {
-        for x in 0..32i32 {
-            let d2 = (x - 25) * (x - 25) + (y - 25) * (y - 25);
-            if d2 <= 36 {
-                let (r, g, b) = if d2 > 25 { (255u8, 255u8, 255u8) } else { dot };
-                let i = ((y * 32 + x) * 4) as usize;
-                px[i] = b; px[i + 1] = g; px[i + 2] = r;
+    let s = size as f32;
+    let (cx, cy, r) = (s * 0.77, s * 0.77, s * 0.2);
+    for y in 0..size {
+        for x in 0..size {
+            let d = (((x as f32 + 0.5) - cx).powi(2) + ((y as f32 + 0.5) - cy).powi(2)).sqrt();
+            if d <= r + 1.0 {
+                let (rr, gg, bb) = if d > r - s / 16.0 { (255u8, 255u8, 255u8) } else { dot };
+                let i = ((y * size + x) * 4) as usize;
+                px[i] = bb; px[i + 1] = gg; px[i + 2] = rr; px[i + 3] = 255;
             }
         }
     }
     unsafe {
-        let color = CreateBitmap(32, 32, 1, 32, px.as_ptr() as *const _);
-        let mask = CreateBitmap(32, 32, 1, 1, null());
+        let color = CreateBitmap(size, size, 1, 32, px.as_ptr() as *const _);
+        let mask = CreateBitmap(size, size, 1, 1, null());
         let ii = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
         let h = CreateIconIndirect(&ii);
         DeleteObject(color as _);

@@ -9,6 +9,9 @@ license = "LicenseRef-UFL-3.7"
 name = "snifrig-app"
 path = "src/main.rs"
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 eframe = "0.32"
 windows-sys = { version = "0.59", features = [
