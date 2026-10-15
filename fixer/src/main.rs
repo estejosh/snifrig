@@ -49,11 +49,17 @@ fn refine(action: &Action, t: &Target) -> Action {
     }
 }
 
+fn ago(secs: f64) -> String {
+    let s = secs.max(0.0);
+    if s < 7200.0 { format!("{:.0} minutes", (s / 60.0).max(1.0)) } else if s < 172800.0 { format!("{:.0} hours", s / 3600.0) } else { format!("{:.0} days", s / 86400.0) }
+}
+
 fn process_once(dir: &Path) -> usize { process_once_ex(dir).0 }
 
 /// Like process_once, and also returns what ran: (action kind, lowercase name, metric it was meant to help).
 fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
     let (alerts, off) = ledger::new_alerts(dir, ledger::read_offset(dir));
+    let (listen, mem, now) = if alerts.is_empty() { (Default::default(), snifrig_fix::judge::Memory::load(Path::new("")), now_unix()) } else { (snifrig_fix::judge::listening_pids(), snifrig_fix::judge::Memory::load(dir), now_unix()) };
     let mut acted = 0;
     let mut ran = Vec::new();
     for a in &alerts {
@@ -69,13 +75,40 @@ fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
         for t in &targets {
             let mut action = refine(&it.action, t);
             let mut why = it.why.clone();
+            let ident = snifrig_fix::judge::identity(&t.name, &t.cmdline);
+            let server = listen.get(&t.pid).copied();
+            let in_use = match server { Some(port) => Some(format!("it is a server other programs use, port {}", port)), None => snifrig_fix::inuse::why_in_use(&t.name, now) };
+            let memory_alert = a.key.starts_with("pm:") || a.key.starts_with("ph:") || a.key.starts_with("x:");
+            // A server's memory grows as it caches (models, pages): watch it, never ask to end it.
+            if let (Some(port), true) = (server, memory_alert) {
+                ledger::record(dir, a, &Action::Report, Some(t), "would", &format!("left alone: {} is a server other programs use (port {}); its memory grows as it caches, snifrig keeps watching", ident, port));
+                continue;
+            }
             // Never end or restart something the user is using: rein it in instead.
             if matches!(action, Action::Terminate | Action::RestartService(_)) {
-                if let Some(r) = snifrig_fix::inuse::why_in_use(&t.name, now_unix()) {
-                    action = if a.key.starts_with("pm:") || a.key.starts_with("x:") { Action::Trim } else { Action::LowerPriority };
+                if let Some(r) = &in_use {
+                    action = if memory_alert { Action::Trim } else { Action::LowerPriority };
                     why = format!("you are using it ({}), so snifrig reins it in instead of closing it; {}", r, it.why);
                 }
             }
+            let label = action.label();
+            if let Some(when) = mem.declined(&t.name, &label, now) {
+                ledger::record(dir, a, &action, Some(t), "refused", &format!("not asking again: you said no to this {} ago", ago(now - when)));
+                continue;
+            }
+            if !ident.eq_ignore_ascii_case(&t.name) { why = format!("{}: {}", ident, why); }
+            // Freeing memory of an app in use is harmless: do it (at most every 6 h) instead of asking.
+            if action == Action::Trim && in_use.is_some() {
+                let p = policy(dir);
+                if matches!(p.mode, Mode::Ask | Mode::Auto) && now >= p.paused_until && snifrig_fix::policy::denied(t, &action, &p.extra_deny).is_none() {
+                    if !mem.done_within(&t.name, &label, now, 6.0 * 3600.0) {
+                        let (status, note) = match actions::run(&action, t) { Ok(m) => ("done", format!("freed memory without asking (harmless, you are using it): {}; {}", m, why)), Err(e) => ("failed", e) };
+                        ledger::record(dir, a, &action, Some(t), status, &note);
+                    }
+                    continue;
+                }
+            }
+            if mem.asked_recently(&t.name, &label, now) { continue; }
             // Fresh policy per target so the auto rate limit sees actions taken earlier in this pass.
             let p = policy(dir);
             match p.decide(&action, Some(t)) {
@@ -354,13 +387,19 @@ fn watch(dir: &Path) {
                 let mut items = ledger::load_pending(dir);
                 let before = items.len();
                 let mut dropped = Vec::new();
+                let listen = snifrig_fix::judge::listening_pids();
                 items.retain(|x| {
-                    if !(x.action == "terminate" || x.action.starts_with("restart")) { return true; }
-                    match snifrig_fix::inuse::why_in_use(&x.name, now) { Some(r) => { dropped.push((x.name.clone(), r)); false } None => true }
+                    let ends = x.action == "terminate" || x.action.starts_with("restart");
+                    if !(ends || x.action == "trim") { return true; }
+                    let why = match listen.get(&x.pid) { Some(p) => Some(format!("it is a server other programs use, port {}", p)), None => snifrig_fix::inuse::why_in_use(&x.name, now) };
+                    match why { Some(r) => { dropped.push((x.name.clone(), x.action.clone(), r)); false } None => true }
                 });
                 if items.len() != before {
                     ledger::save_pending(dir, &items);
-                    for (name, r) in dropped { note(dir, "fix:in-use", "dismissed", &format!("withdrew the proposal to end {}: you are using it ({}); snifrig reins it in instead", name, r)); }
+                    for (name, action, r) in dropped {
+                        let what = if action == "trim" { "snifrig frees its memory by itself when needed" } else { "snifrig reins it in instead" };
+                        note(dir, "fix:in-use", "withdrawn", &format!("withdrew the question to {} {}: you are using it ({}); {}", action, name, r, what));
+                    }
                 }
             }
             for note in learner.take_notes() {
