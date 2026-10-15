@@ -308,6 +308,16 @@ fn status(cx: &Ctx) -> String {
         o += "\n";
     }
     if let Some(g) = &gv {
+        if let Some(f) = g.get("feel") {
+            o += &format!("How it feels (feel meter): {} (front app answers in {:.0} ms, scheduling lag {:.0} ms{})\n",
+                gs(f, "word"), gn(f, "ping_ms").unwrap_or(0.0), gn(f, "lag_ms").unwrap_or(0.0), if matches!(f.get("hung"), Some(J::Bool(true))) { ", front window not responding" } else { "" });
+        }
+    }
+    if let Some(i) = read_json(cx, "incident-now.json") {
+        let t = gs(&i, "text");
+        if !t.is_empty() { o += &format!("Seen before (incident memory): {t}\n"); }
+    }
+    if let Some(g) = &gv {
         let dem = g.get("demoted").and_then(|d| d.arr()).unwrap_or(&[]);
         if dem.is_empty() {
             o += "Governor: not easing any app right now\n";

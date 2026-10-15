@@ -46,12 +46,15 @@ pub struct Metrics {
     pub avail_mb: f64,
     /// CPU (share of one core) of the foreground app, if known.
     pub fg_cpu_pct: Option<f64>,
+    /// Feel meter: how slow the PC feels, ms (front app answer time + scheduling lag).
+    pub feel_ms: Option<f64>,
 }
 
 impl Metrics {
     fn json(&self) -> String {
         let fg = self.fg_cpu_pct.map_or(String::new(), |f| format!(",\"fg_cpu_pct\":{:.1}", f));
-        format!("{{\"total_cpu_pct\":{:.1},\"commit_pct\":{:.1},\"avail_mb\":{:.0}{}}}", self.total_cpu_pct, self.commit_pct, self.avail_mb, fg)
+        let fe = self.feel_ms.map_or(String::new(), |f| format!(",\"feel_ms\":{:.1}", f));
+        format!("{{\"total_cpu_pct\":{:.1},\"commit_pct\":{:.1},\"avail_mb\":{:.0}{}{}}}", self.total_cpu_pct, self.commit_pct, self.avail_mb, fg, fe)
     }
 }
 
@@ -74,7 +77,22 @@ pub fn trigger_for(action_label: &str, msg: &str) -> Trigger {
 pub fn action_kind(label: &str) -> String { label.split(':').next().unwrap_or(label).to_string() }
 
 /// Pure scoring: (improvement clamped to -1..1, success).
+/// When the feel meter has readings, it has the last word: a fix that made the PC *feel*
+/// faster counts even if CPU did not drop, and one that made it feel slower never counts.
 pub fn score(t: Trigger, b: &Metrics, a: &Metrics) -> (f64, bool) {
+    let (imp, ok) = score_numbers(t, b, a);
+    match (b.feel_ms, a.feel_ms) {
+        (Some(fb), Some(fa)) => {
+            let feel_imp = ((fb - fa) / fb.max(20.0)).clamp(-1.0, 1.0);
+            if fa >= crate::feel::SLUGGISH_PING_MS && fa > fb * 1.5 { return (feel_imp.min(imp), false); }
+            let felt_better = fb >= crate::feel::SLUGGISH_PING_MS && feel_imp >= 0.3;
+            (imp.max(feel_imp), ok || felt_better)
+        }
+        _ => (imp, ok),
+    }
+}
+
+fn score_numbers(t: Trigger, b: &Metrics, a: &Metrics) -> (f64, bool) {
     match t {
         Trigger::Cpu => {
             let imp = ((b.total_cpu_pct - a.total_cpu_pct) / b.total_cpu_pct.max(1.0)).clamp(-1.0, 1.0);
@@ -391,7 +409,15 @@ fn append_episode(dir: &Path, e: &Episode) {
 mod learn_tests {
     use super::*;
 
-    fn m(cpu: f64, commit: f64, avail: f64) -> Metrics { Metrics { total_cpu_pct: cpu, commit_pct: commit, avail_mb: avail, fg_cpu_pct: None } }
+    fn m(cpu: f64, commit: f64, avail: f64) -> Metrics { Metrics { total_cpu_pct: cpu, commit_pct: commit, avail_mb: avail, fg_cpu_pct: None, feel_ms: None } }
+
+    #[test]
+    fn feel_has_the_last_word() {
+        let f = |cpu: f64, feel: f64| Metrics { total_cpu_pct: cpu, commit_pct: 50.0, avail_mb: 8000.0, fg_cpu_pct: None, feel_ms: Some(feel) };
+        assert!(score(Trigger::Cpu, &f(90.0, 200.0), &f(88.0, 40.0)).1, "CPU barely moved but it feels fast again");
+        assert!(!score(Trigger::Cpu, &f(90.0, 60.0), &f(40.0, 300.0)).1, "CPU dropped but it feels worse");
+        assert!(score(Trigger::Cpu, &f(90.0, 10.0), &f(40.0, 12.0)).1, "felt fine before and after: CPU result stands");
+    }
 
     #[test]
     fn cpu_scoring() {

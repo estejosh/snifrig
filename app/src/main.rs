@@ -31,7 +31,7 @@ const BLUE: Color32 = Color32::from_rgb(96, 165, 250);
 enum Page { Overview, Governor, Rules, Performance, Activity, Report, Settings }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Filter { All, Governor, Rules, Fixes, Performance, Learning }
+enum Filter { All, Governor, Rules, Fixes, Performance, Learning, Incidents }
 
 type Toast = Arc<Mutex<Option<(String, bool, Instant)>>>;
 
@@ -402,6 +402,12 @@ impl App {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
             ui.painter().circle_filled(r.center(), 5.0, color);
             ui.label(bold(text, 16.0).color(TEXT));
+            let (w, ping, lag) = self.state.feel.clone();
+            if !w.is_empty() && w != "unknown" && self.state.fixer_live {
+                let c = match w.as_str() { "snappy" => GOOD, "ok" => BLUE, "sluggish" => WARN, _ => BAD };
+                chip(ui, &format!("feels {}", w), c);
+                ui.label(RichText::new(format!("{:.0} ms", ping + lag)).size(12.0).color(MUTED)).on_hover_text("Feel meter: how long the app in front takes to answer, plus how late Windows wakes programs up. Under 30 ms feels instant; over 80 ms you notice.");
+            }
             if let Some(g) = &self.state.game { chip(ui, &format!("Performance mode: {}", g), ACCENT); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let paused = self.state.paused_until > data::now();
@@ -508,6 +514,13 @@ impl App {
             });
         });
         ui.add_space(8.0);
+        if !self.state.seen_before.is_empty() {
+            card(ui, |ui| {
+                ui.horizontal(|ui| { chip(ui, "seen before", BLUE); ui.label(bold("snifrig remembers this one", 15.0).color(TEXT)); });
+                ui.label(RichText::new(&self.state.seen_before).color(TEXT));
+            });
+            ui.add_space(8.0);
+        }
         if !self.state.causes.is_empty() {
             card(ui, |ui| {
                 section(ui, "What is slowing your PC", "");
@@ -883,8 +896,23 @@ impl App {
             });
             ui.add_space(8.0);
         }
+        if !self.state.incidents.is_empty() {
+            card(ui, |ui| {
+                section(ui, "Past slowdowns", "Every slowdown snifrig saw, how long it lasted, and what most likely ended it. New ones are matched against these.");
+                egui::Grid::new("inc").num_columns(4).striped(true).spacing([18.0, 6.0]).show(ui, |ui| {
+                    for (start, mins, head, fixed) in self.state.incidents.iter().take(10) {
+                        ui.label(RichText::new(local_time(*start, true)).size(12.5).color(MUTED));
+                        ui.label(format!("{:.0} min", mins));
+                        ui.label(if head.is_empty() { "slowdown" } else { head.as_str() });
+                        ui.label(RichText::new(if fixed.is_empty() { "ended on its own".to_string() } else { format!("ended by {}", fixed) }).color(if fixed.is_empty() { MUTED } else { GOOD }));
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
         ui.horizontal(|ui| {
-            for (f, l) in [(Filter::All, "All"), (Filter::Governor, "Governor"), (Filter::Rules, "Rules"), (Filter::Fixes, "Fixes"), (Filter::Performance, "Performance"), (Filter::Learning, "Learning")] {
+            for (f, l) in [(Filter::All, "All"), (Filter::Governor, "Governor"), (Filter::Rules, "Rules"), (Filter::Fixes, "Fixes"), (Filter::Performance, "Performance"), (Filter::Learning, "Learning"), (Filter::Incidents, "Incidents")] {
                 ui.selectable_value(&mut self.filter, f, l);
             }
             ui.add_space(16.0);
@@ -894,7 +922,7 @@ impl App {
         let q = self.search.to_lowercase();
         let filter = self.filter;
         let evs: Vec<&data::Event> = self.state.events.iter().filter(|e| {
-            let cat = if e.key.starts_with("gov:") { Filter::Governor } else if e.key.starts_with("rule:") { Filter::Rules } else if e.key.starts_with("perf:") { Filter::Performance } else if e.key.starts_with("learn:") { Filter::Learning } else { Filter::Fixes };
+            let cat = if e.key.starts_with("gov:") { Filter::Governor } else if e.key.starts_with("rule:") { Filter::Rules } else if e.key.starts_with("perf:") { Filter::Performance } else if e.key.starts_with("learn:") { Filter::Learning } else if e.key.starts_with("incident") { Filter::Incidents } else { Filter::Fixes };
             (filter == Filter::All || filter == cat) && (q.is_empty() || e.name.to_lowercase().contains(&q) || e.note.to_lowercase().contains(&q))
         }).collect();
         card(ui, |ui| {

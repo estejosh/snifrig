@@ -23,6 +23,8 @@ pub mod baseline;
 pub mod perfmode;
 pub mod inuse;
 pub mod judge;
+pub mod feel;
+pub mod incident;
 
 /// What the fixer can do, mildest first.
 #[derive(Clone, Debug, PartialEq)]

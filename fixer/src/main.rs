@@ -49,6 +49,22 @@ fn refine(action: &Action, t: &Target) -> Action {
     }
 }
 
+/// "Oct 12 14:05" in local time.
+fn local_date(unix: f64) -> String {
+    let t = unix as i64 + sys::local_offset_secs();
+    let (days, secs) = (t.div_euclid(86400), t.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    const M: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!("{} {} {:02}:{:02}", M[(mo - 1) as usize], d, secs / 3600, secs % 3600 / 60)
+}
+
 fn ago(secs: f64) -> String {
     let s = secs.max(0.0);
     if s < 7200.0 { format!("{:.0} minutes", (s / 60.0).max(1.0)) } else if s < 172800.0 { format!("{:.0} hours", s / 3600.0) } else { format!("{:.0} days", s / 86400.0) }
@@ -260,8 +276,10 @@ fn state_json(gov: &snifrig_fix::governor::Governor, acting: bool, sugg: &[(Stri
     d.sort_by_key(|x| x.pid);
     let demoted: Vec<String> = d.iter().map(|x| format!("{{\"pid\":{},\"name\":\"{}\",\"level\":{},\"reason\":\"{}\",\"since\":{:.0}}}", x.pid, snifrig_fix::json::esc(&x.name), x.level, snifrig_fix::json::esc(&x.reason), x.since)).collect();
     let sg: Vec<String> = sugg.iter().map(|(n, c)| format!("{{\"name\":\"{}\",\"count\":{}}}", snifrig_fix::json::esc(n), c)).collect();
+    let f = snifrig_fix::feel::recent(10);
+    let feel = format!("{{\"word\":\"{}\",\"ping_ms\":{:.0},\"lag_ms\":{:.0},\"hung\":{}}}", f.word(), f.ping_ms, f.lag_ms, f.hung);
     let tail = format!("\"busy\":{},\"game\":{},\"busy_pct\":{:.0},\"demoted\":[{}],\"suggestions\":[{}]}}\n", gov.mood.busy_with(&gov.tuning), game, gov.tuning.busy_pct, demoted.join(","), sg.join(","));
-    let full = format!("{{\"unix\":{:.0},\"acting\":{},\"cpu\":{:.0},{}", now_unix(), acting, gov.total_pct, tail);
+    let full = format!("{{\"unix\":{:.0},\"acting\":{},\"cpu\":{:.0},\"feel\":{},{}", now_unix(), acting, gov.total_pct, feel, tail);
     (full, format!("{}{}", acting, tail))
 }
 
@@ -280,6 +298,8 @@ fn watch(dir: &Path) {
     let mut learner = Learner::load(dir);
     let mut base = Baseline::load(dir);
     let brain = snifrig_fix::brain::Brain::start(dir);
+    snifrig_fix::feel::start();
+    let mut incidents = snifrig_fix::incident::Tracker::new();
     let note = |dir: &Path, key: &str, status: &str, msg: &str| {
         let alert = snifrig_fix::Alert { t: String::new(), key: key.into(), msg: msg.into() };
         ledger::record(dir, &alert, &Action::Report, None, status, msg);
@@ -299,7 +319,8 @@ fn watch(dir: &Path) {
     base.set_tz(sys::local_offset_secs());
     let metrics = |gov: &snifrig_fix::governor::Governor| {
         let (commit_pct, avail_mb) = sys::memory_status().unwrap_or((0.0, 0.0));
-        Metrics { total_cpu_pct: gov.total_pct, commit_pct, avail_mb, fg_cpu_pct: gov.fg_cpu_pct }
+        let f = snifrig_fix::feel::recent(30);
+        Metrics { total_cpu_pct: gov.total_pct, commit_pct, avail_mb, fg_cpu_pct: gov.fg_cpu_pct, feel_ms: (f.samples >= 10).then(|| f.ms()) }
     };
     loop {
         if stop.exists() { let _ = std::fs::remove_file(&stop); break; }
@@ -342,6 +363,7 @@ fn watch(dir: &Path) {
             if act != enf.acting { enf.reset(); }
             gov.acting = act;
             enf.acting = act;
+            gov.feels_slow = snifrig_fix::feel::recent(5).sluggish();
             let changes = gov.tick(now_unix(), act);
             let brain_game = |name: &str| brain.cache().get(name).map_or(false, |v| v.kind == "game" && v.confidence >= snifrig_fix::brain::MIN_CONF);
             for m in perf.tick(gov.procs(), sys::foreground_pid(), &rule_set, &gov.tuning, act, &brain_game) {
@@ -406,6 +428,20 @@ fn watch(dir: &Path) {
                 let alert = snifrig_fix::Alert { t: String::new(), key: "learn:blocked".into(), msg: note.clone() };
                 ledger::record(dir, &alert, &Action::Report, None, "refused", &note);
             }
+        }
+        if n % 10 == 5 {
+            // Incident memory: open, extend, match against the past, close with what ended it.
+            let now = now_unix();
+            let st = std::fs::read_to_string(dir.join("status.json")).unwrap_or_default();
+            let fresh = now - snifrig_fix::json::num_field(&st, "unix").unwrap_or(0.0) < 180.0;
+            let severity = if fresh { snifrig_fix::json::num_field(&st, "severity").unwrap_or(0.0) } else { 0.0 };
+            let headline = if fresh { snifrig_fix::json::str_field(&st, "headline").unwrap_or_default() } else { String::new() };
+            let f = snifrig_fix::feel::recent(10);
+            let mut toks = snifrig_fix::incident::recent_alert_tokens(dir, now, 900.0);
+            if f.sluggish() { toks.insert("feel:sluggish".into()); }
+            for d in gov.demoted.values() { toks.insert(format!("busy:{}", d.name.to_lowercase())); }
+            let date = |u: f64| local_date(u);
+            if let Some(msg) = incidents.tick(dir, now, severity >= 1.0 || f.sluggish(), &headline, toks, &date) { note(dir, "incident", "report", &msg); }
         }
         if n > 0 && n % 60 == 0 {
             let (now, m) = (now_unix(), metrics(&gov));

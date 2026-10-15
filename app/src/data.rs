@@ -102,6 +102,12 @@ pub struct State {
     pub brain: Vec<Brain>,
     /// (unix, commit GB, available GB), one per monitor cycle, last 24 h.
     pub mem_hist: Vec<(f64, f32, f32)>,
+    /// Feel meter (from the fixer): word, front-app answer time, scheduling lag.
+    pub feel: (String, f64, f64),
+    /// Incident memory: "this looks like ..." for the slowdown happening now.
+    pub seen_before: String,
+    /// Past slowdowns, newest first: (start, minutes, headline, fixed_by).
+    pub incidents: Vec<(f64, f64, String, String)>,
 }
 
 pub fn load_state(dir: &Path, with_history: bool, old: &State) -> State {
@@ -128,6 +134,10 @@ pub fn load_state(dir: &Path, with_history: bool, old: &State) -> State {
         gpu: Gpu { ok: t - gpu.get("unix").num() < 900.0, temp_c: gpu.get("temp_c").num(), power_w: gpu.get("power_w").num(), limit_w: gpu.get("limit_w").num(), mhz: gpu.get("sm_mhz").num(), max_mhz: gpu.get("sm_max_mhz").num(), used_mb: gpu.get("used_mb").num(), total_mb: gpu.get("total_mb").num(), reasons: gpu.get("reasons").str().into() },
         brain: read(dir, "brain-cache.json").lines().filter_map(json::parse).map(|j| Brain { name: j.get("name").str().into(), kind: j.get("kind").str().into(), confidence: j.get("confidence").num() }).collect(),
         mem_hist: Vec::new(),
+        feel: (gov.get("feel").get("word").str().to_string(), gov.get("feel").get("ping_ms").num(), gov.get("feel").get("lag_ms").num()),
+        seen_before: read_json(dir, "incident-now.json").get("text").str().to_string(),
+        incidents: read(dir, "incidents.jsonl").lines().rev().take(20).filter_map(json::parse)
+            .map(|j| (j.get("start").num(), j.get("minutes").num(), j.get("headline").str().to_string(), j.get("fixed_by").str().to_string())).collect(),
     };
     if s.mode.is_empty() { s.mode = "dry-run".into(); }
     let fixes = read(dir, "fixes.jsonl");

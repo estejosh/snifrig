@@ -30,6 +30,8 @@ pub const RESTORE_EVERY: u32 = 5;
 pub const MIN_CORE_PCT: f64 = 25.0;
 pub const MAX_DEMOTIONS_PER_TICK: usize = 2;
 pub const MAX_LEVEL: u8 = 3;
+/// CPU this high counts as busy even when the feel meter says the PC still feels fast.
+pub const NEAR_MAX_PCT: f64 = 92.0;
 
 /// Governor settings, from `fix-governor.txt` (key=value per line, '#' comments). Defaults are the consts above.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,13 +52,15 @@ pub struct Tuning {
     pub game_busy_pct: f64,
     /// How often rules are re-checked and re-applied when an app undoes them (seconds, 0 = never).
     pub reapply_secs: u32,
+    /// Only step in when the PC also *feels* slow (feel meter), unless CPU is nearly maxed.
+    pub feel_gate: bool,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
         Tuning { busy_pct: BUSY_PCT, busy_ticks: BUSY_TICKS, calm_pct: CALM_PCT, calm_ticks: CALM_TICKS, restore_every: RESTORE_EVERY,
             min_core_pct: MIN_CORE_PCT, max_per_tick: MAX_DEMOTIONS_PER_TICK, max_level: MAX_LEVEL,
-            game_mode: true, game_plan: "auto".into(), game_busy_pct: 50.0, reapply_secs: 30 }
+            game_mode: true, game_plan: "auto".into(), game_busy_pct: 50.0, reapply_secs: 30, feel_gate: true }
     }
 }
 
@@ -76,7 +80,8 @@ pub const TUNING_TEMPLATE: &str = "# snifrig-fix governor settings. Remove the '
 # game_mode = on           # performance mode when a game is in front\r\n\
 # game_plan = auto         # auto (Ultimate, else High performance), none, or a plan name or GUID\r\n\
 # game_busy_pct = 50       # busy threshold while a game runs\r\n\
-# reapply_secs = 30        # re-check rules this often and undo apps that reset them (0 = never)\r\n";
+# reapply_secs = 30        # re-check rules this often and undo apps that reset them (0 = never)\r\n\
+# feel_gate = on           # only step in when the PC also feels slow (or CPU is nearly maxed)\r\n";
 
 impl Tuning {
     /// Parse the settings file. Unknown keys and bad values are reported, and the default is kept.
@@ -102,6 +107,7 @@ impl Tuning {
                 "game_mode" => match v.as_str() { "on" | "yes" => { t.game_mode = true; true } "off" | "no" => { t.game_mode = false; true } _ => false },
                 "game_plan" => { t.game_plan = v.clone(); true }
                 "reapply_secs" => v.parse::<u32>().ok().map(|x| t.reapply_secs = x).is_some(),
+                "feel_gate" => match v.as_str() { "on" | "yes" => { t.feel_gate = true; true } "off" | "no" => { t.feel_gate = false; true } _ => false },
                 _ => { errs.push(format!("line {}: unknown setting '{}'", i + 1, k)); continue; }
             };
             if !ok { errs.push(format!("line {}: bad value for {}: '{}'", i + 1, k, v)); }
@@ -142,9 +148,12 @@ pub struct Seen { pub key: Key, pub name: String, pub core_pct: f64, pub foregro
 pub struct Mood { pub busy_ticks: u32, pub calm_ticks: u32 }
 
 impl Mood {
-    pub fn update(&mut self, total_pct: f64, t: &Tuning, game: bool) {
+    /// `feels_slow`: the feel meter says the PC is sluggish right now.
+    pub fn update(&mut self, total_pct: f64, t: &Tuning, game: bool, feels_slow: bool) {
         let busy_at = if game { t.game_busy_pct.min(t.busy_pct) } else { t.busy_pct };
-        if total_pct >= busy_at { self.busy_ticks += 1; } else { self.busy_ticks = 0; }
+        // High CPU alone is not a problem if the PC still feels fast: leave apps alone then.
+        let hurts = !t.feel_gate || feels_slow || total_pct >= NEAR_MAX_PCT;
+        if total_pct >= busy_at && hurts { self.busy_ticks += 1; } else { self.busy_ticks = 0; }
         if total_pct < t.calm_pct.min(busy_at) { self.calm_ticks += 1; } else { self.calm_ticks = 0; }
     }
     pub fn busy_with(&self, t: &Tuning) -> bool { self.busy_ticks >= t.busy_ticks }
@@ -271,6 +280,8 @@ pub struct Governor {
     pub game: Option<String>,
     windowed: HashSet<u32>,
     win_at: f64,
+    /// Set by the watch loop from the feel meter before each tick.
+    pub feels_slow: bool,
 }
 
 /// One change made, for the ledger and the tray.
@@ -280,7 +291,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), win_at: 0.0 }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), win_at: 0.0, feels_slow: false }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -327,7 +338,7 @@ impl Governor {
         self.undone.retain(|k| self.prev.contains_key(k));
         let total_pct = (busy_sum / self.cores).min(100.0);
         self.total_pct = total_pct;
-        self.mood.update(total_pct, &self.tuning, self.game.is_some());
+        self.mood.update(total_pct, &self.tuning, self.game.is_some(), self.feels_slow);
         self.fg_cpu_pct = seen.iter().find(|s| s.foreground).map(|s| s.core_pct);
         let mut top: Vec<(String, f64)> = seen.iter().filter(|s| s.core_pct >= 5.0).map(|s| (s.name.to_lowercase(), s.core_pct)).collect();
         top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -440,10 +451,17 @@ mod gov_tests {
         assert!(matches!(&steps[0], Step::Demote { key: (3, 1), to_level: 1, .. }));
         let t = Tuning::default();
         let mut mood = Mood::default();
-        mood.update(60.0, &t, false);
+        mood.update(60.0, &t, false, true);
         assert_eq!(mood.busy_ticks, 0);
-        mood.update(60.0, &t, true);
+        mood.update(60.0, &t, true, true);
         assert_eq!(mood.busy_ticks, 1, "60% counts as busy while a game runs (game_busy_pct 50)");
+        let mut m2 = Mood::default();
+        m2.update(85.0, &t, false, false);
+        assert_eq!(m2.busy_ticks, 0, "85% CPU while it still feels fast: leave apps alone");
+        m2.update(95.0, &t, false, false);
+        assert_eq!(m2.busy_ticks, 1, "nearly maxed counts even if it feels fine");
+        m2.update(85.0, &t, false, true);
+        assert_eq!(m2.busy_ticks, 2, "85% and it feels slow: step in");
     }
 
     #[test]
