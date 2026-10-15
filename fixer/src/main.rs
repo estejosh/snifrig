@@ -95,9 +95,10 @@ fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
             let server = listen.get(&t.pid).copied();
             let in_use = match server { Some(port) => Some(format!("it is a server other programs use, port {}", port)), None => snifrig_fix::inuse::why_in_use(&t.name, now) };
             let memory_alert = a.key.starts_with("pm:") || a.key.starts_with("ph:") || a.key.starts_with("x:");
-            // A server's memory grows as it caches (models, pages): watch it, never ask to end it.
-            if let (Some(port), true) = (server, memory_alert) {
-                ledger::record(dir, a, &Action::Report, Some(t), "would", &format!("left alone: {} is a server other programs use (port {}); its memory grows as it caches, snifrig keeps watching", ident, port));
+            // A server other programs use (ComfyUI, a model server): its memory grows as it caches and
+            // its CPU use is its work. Never ask about it; the governor eases it only if the PC feels slow.
+            if let Some(port) = server {
+                ledger::record(dir, a, &Action::Report, Some(t), "would", &format!("left alone: {} is a server other programs use (port {}); snifrig keeps watching and the governor eases it only if the PC feels slow", ident, port));
                 continue;
             }
             // Never end or restart something the user is using: rein it in instead.
@@ -412,6 +413,7 @@ fn watch(dir: &Path) {
                 let listen = snifrig_fix::judge::listening_pids();
                 items.retain(|x| {
                     let ends = x.action == "terminate" || x.action.starts_with("restart");
+                    if listen.contains_key(&x.pid) { dropped.push((x.name.clone(), x.action.clone(), "it is a server other programs use".into())); return false; }
                     if !(ends || x.action == "trim") { return true; }
                     let why = match listen.get(&x.pid) { Some(p) => Some(format!("it is a server other programs use, port {}", p)), None => snifrig_fix::inuse::why_in_use(&x.name, now) };
                     match why { Some(r) => { dropped.push((x.name.clone(), x.action.clone(), r)); false } None => true }

@@ -364,6 +364,9 @@ impl Governor {
                         let e = self.demoted.entry(key).or_insert(Demotion { pid: key.0, created: key.1, name: name.clone(), level: 0, orig_priority: orig, since: now, reason: reason.clone() });
                         e.level = to_level; e.reason = reason.clone();
                     }
+                    // A process we cannot open or verify (Windows Update, protected services) is left
+                    // alone from now on instead of being retried and logged as a failure every second.
+                    if act && from == 0 && result.is_err() { self.undone.insert(key); self.demoted.remove(&key); continue; }
                     changes.push(Change { pid: key.0, name, from, to: to_level, reason, result });
                 }
                 Step::Restore { key, name, to_level, reason } => {
