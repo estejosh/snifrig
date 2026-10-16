@@ -38,6 +38,7 @@ impl Suggestion {
             "rule" => match Rule::parse(&self.rule) { Some(r) => format!("{}: {}", r.pattern, r.chips().join(", ")), None => self.rule.clone() },
             "ease" => format!("Always run {} in the background", self.app),
             "setting" => format!("Governor setting {}", self.setting),
+            "restart_desktop" => "Restart the desktop (dwm is stuck)".into(),
             _ => "A note, nothing to change".into(),
         }
     }

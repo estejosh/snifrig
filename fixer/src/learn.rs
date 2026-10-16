@@ -351,6 +351,32 @@ impl Learner {
             .then(|| format!("you said yes {} times and it helped {} of {} times", yes, st.successes, st.tries))
     }
 
+    /// What the user just told snifrig from the tray: Some(true) "feels slow" (for 3 minutes),
+    /// Some(false) "feels fine" (for 10 minutes). The latest one wins.
+    pub fn user_feel(&self, now: f64) -> Option<bool> {
+        let f = self.feedback.iter().filter(|f| f.signal == "feel_slow" || f.signal == "feel_fine").max_by(|a, b| a.unix.partial_cmp(&b.unix).unwrap_or(std::cmp::Ordering::Equal))?;
+        let slow = f.signal == "feel_slow";
+        (now - f.unix <= if slow { 180.0 } else { 600.0 }).then_some(slow)
+    }
+
+    /// Fixes snifrig now does without asking: (action, name, why).
+    pub fn learned_fixes(&self) -> Vec<(String, String, String)> {
+        let mut v: Vec<(String, String, String)> = self.stats.keys().filter(|k| k.0 == "fix")
+            .filter_map(|k| self.earned(&k.1, &k.2).map(|w| (k.1.clone(), k.2.clone(), w))).collect();
+        v.sort();
+        v
+    }
+
+    /// Names snifrig made a background rule for by itself (and that were not undone since).
+    pub fn learned_rules(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.feedback.iter().filter(|f| f.signal == "rule_added" && f.kind == "learned")
+            .filter(|f| !self.feedback.iter().any(|u| u.signal == "undo" && u.name == f.name && u.unix >= f.unix))
+            .map(|f| f.name.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// The user undid this name at least twice in 14 days and has not answered with a rule.
     pub fn user_protects(&self, name: &str) -> bool { self.user_protects_at(name, self.now) }
 

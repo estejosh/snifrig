@@ -291,6 +291,9 @@ pub struct Governor {
     /// CPU (share of one core) of the desktop compositor on the latest tick. When dwm is pegged,
     /// the mouse and every window stutter even though each app still answers instantly.
     pub dwm_pct: f64,
+    /// What you told snifrig from the tray: Some(true) the PC feels slow (ease background apps
+    /// now, even below the CPU threshold), Some(false) it feels fine (hold off).
+    pub user_says: Option<bool>,
 }
 
 /// One change made, for the ledger and the tray.
@@ -300,7 +303,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), onscreen: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0 }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), onscreen: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0, user_says: None }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -348,6 +351,11 @@ impl Governor {
         let total_pct = (busy_sum / self.cores).min(100.0);
         self.total_pct = total_pct;
         self.mood.update(total_pct, &self.tuning, self.game.is_some(), self.feels_slow);
+        match self.user_says {
+            Some(true) => self.mood.busy_ticks = self.mood.busy_ticks.max(self.tuning.busy_ticks),
+            Some(false) => self.mood.busy_ticks = 0,
+            None => {}
+        }
         self.fg_cpu_pct = seen.iter().find(|s| s.foreground).map(|s| s.core_pct);
         let dwm_now: f64 = seen.iter().filter(|s| s.name.eq_ignore_ascii_case("dwm.exe")).map(|s| s.core_pct).sum();
         // Smoothed over ~10 s: a one-second redraw burst is normal, a pegged compositor is not.

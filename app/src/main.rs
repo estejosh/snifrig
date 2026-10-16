@@ -342,12 +342,20 @@ impl App {
 
     fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
         card(ui, |ui| {
-            ui.horizontal(|ui| { chip(ui, "suggested by your AI assistant", BLUE); });
+            ui.horizontal(|ui| { chip(ui, if s.kind == "restart_desktop" { "snifrig noticed" } else { "suggested by your AI assistant" }, BLUE); });
             ui.label(bold(s.summary(), 15.0).color(TEXT));
             ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
             ui.horizontal(|ui| {
-                if s.kind != "note" && ui.add(egui::Button::new(RichText::new("Accept").color(Color32::BLACK)).fill(ACCENT)).clicked() { self.accept_suggestion(s); }
-                if ui.button(if s.kind == "note" { "Got it" } else { "Dismiss" }).clicked() { self.dismiss_suggestion(s); }
+                if s.kind == "restart_desktop" {
+                    if ui.add(egui::Button::new(RichText::new("Restart desktop").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("The screen flashes for a second; your apps stay open. Windows asks you to confirm.").clicked() {
+                        self.run("snifrig-fix.exe", vec!["desktop".into(), "restart".into()], "Restarting the desktop. Confirm in the Windows prompt.");
+                        self.dismiss_suggestion(s);
+                    }
+                    if ui.button("No").clicked() { self.run("snifrig-fix.exe", vec!["desktop".into(), "no".into()], "Ok, snifrig will not ask about this for a week."); self.dismiss_suggestion(s); }
+                } else {
+                    if s.kind != "note" && ui.add(egui::Button::new(RichText::new("Accept").color(Color32::BLACK)).fill(ACCENT)).clicked() { self.accept_suggestion(s); }
+                    if ui.button(if s.kind == "note" { "Got it" } else { "Dismiss" }).clicked() { self.dismiss_suggestion(s); }
+                }
                 if snooze && ui.button("Not now").clicked() { self.snoozed.push(s.id.clone()); }
             });
         });

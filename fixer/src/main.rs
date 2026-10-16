@@ -65,6 +65,11 @@ fn local_date(unix: f64) -> String {
     format!("{} {} {:02}:{:02}", M[(mo - 1) as usize], d, secs / 3600, secs % 3600 / 60)
 }
 
+/// The name learning is keyed by: what a script host runs ("python script build.py"), else the image name.
+fn learn_name(t: &Target) -> String {
+    if snifrig_fix::inuse::is_host(&t.name) { snifrig_fix::judge::identity(&t.name, &t.cmdline).to_lowercase() } else { t.name.to_lowercase() }
+}
+
 fn ago(secs: f64) -> String {
     let s = secs.max(0.0);
     if s < 7200.0 { format!("{:.0} minutes", (s / 60.0).max(1.0)) } else if s < 172800.0 { format!("{:.0} hours", s / 3600.0) } else { format!("{:.0} days", s / 86400.0) }
@@ -96,7 +101,10 @@ fn process_once_ex(dir: &Path, mut ctx: Option<(&Learner, &mut snifrig_fix::gove
             let mut why = it.why.clone();
             let ident = snifrig_fix::judge::identity(&t.name, &t.cmdline);
             let server = listen.get(&t.pid).copied();
-            let in_use = match server { Some(port) => Some(format!("it is a server other programs use, port {}", port)), None => snifrig_fix::inuse::why_in_use(&t.name, now) };
+            let in_use = match server { Some(port) => Some(format!("it is a server other programs use, port {}", port)), None => snifrig_fix::inuse::why_in_use(&t.name, now).or_else(|| {
+                // A script host is as important as the app that started it (your terminal, Claude, an IDE).
+                if snifrig_fix::inuse::is_host(&t.name) { snifrig_fix::inuse::started_by(t.pid, now).map(|p| format!("{} started it and you are using {}", p, p)) } else { None }
+            }) };
             let memory_alert = a.key.starts_with("pm:") || a.key.starts_with("ph:") || a.key.starts_with("x:");
             // A server other programs use (ComfyUI, a model server): its memory grows as it caches and
             // its CPU use is its work. Never ask about it; the governor eases it only if the PC feels slow.
@@ -138,11 +146,11 @@ fn process_once_ex(dir: &Path, mut ctx: Option<(&Learner, &mut snifrig_fix::gove
                         Err(e) => ("failed", format!("auto: {}", e)),
                     };
                     ledger::record(dir, a, &action, Some(t), status, &note);
-                    if status == "done" { ran.push((learn::action_kind(&action.label()), t.name.to_lowercase(), learn::trigger_for(&action.label(), &a.msg))); }
+                    if status == "done" { ran.push((learn::action_kind(&action.label()), learn_name(t), learn::trigger_for(&action.label(), &a.msg))); }
                     acted += 1;
                 }
                 Verdict::Queue => {
-                    let learned = ctx.as_ref().and_then(|(l, _, _)| l.earned(&label, &t.name));
+                    let learned = ctx.as_ref().and_then(|(l, _, _)| l.earned(&label, &learn_name(t)));
                     if let (Some(trust), Some((_, gov, act))) = (learned, ctx.as_mut()) {
                         let r = if action == Action::LowerPriority {
                             match gov.adopt(t.pid, 2, &format!("learned from you: {}", trust), *act) {
@@ -152,7 +160,7 @@ fn process_once_ex(dir: &Path, mut ctx: Option<(&Learner, &mut snifrig_fix::gove
                         } else { actions::run(&action, t) };
                         let (status, note) = match &r { Ok(m) => ("done", format!("did it without asking because {}: {}; undo it in the app if that was wrong; {}", trust, m, why)), Err(e) => ("failed", format!("learned fix: {}", e)) };
                         ledger::record(dir, a, &action, Some(t), status, &note);
-                        if r.is_ok() { ran.push((learn::action_kind(&label), t.name.to_lowercase(), learn::trigger_for(&label, &a.msg))); acted += 1; }
+                        if r.is_ok() { ran.push((learn::action_kind(&label), learn_name(t), learn::trigger_for(&label, &a.msg))); acted += 1; }
                         continue;
                     }
                     if let Some(id) = ledger::queue(dir, a, &action, t, &why) {
@@ -197,7 +205,7 @@ fn approve(dir: &Path, id: &str) -> Result<String, String> {
     let (status, note) = match &r { Ok(m) => ("done", format!("approved: {}", m)), Err(e) => ("failed", format!("approved: {}", e)) };
     ledger::record(dir, &alert, &action, Some(&t), status, &note);
     if r.is_ok() {
-        let mut f = Feedback::new("approve", "fix", &learn::action_kind(&action.label()), &t.name);
+        let mut f = Feedback::new("approve", "fix", &learn::action_kind(&action.label()), &learn_name(&t));
         f.trigger = learn::trigger_for(&action.label(), &item.msg).as_str().into();
         f.start = true;
         learn::append_feedback(dir, &f);
@@ -236,7 +244,8 @@ fn dismiss(dir: &Path, id: &str) -> Result<String, String> {
     let action = Action::parse(&item.action).unwrap_or(Action::Report);
     let t = Target { pid: item.pid, name: item.name.clone(), ..Default::default() };
     ledger::record(dir, &alert, &action, Some(&t), "dismissed", "dismissed by user");
-    learn::append_feedback(dir, &Feedback::new("dismiss", "fix", &learn::action_kind(&action.label()), &item.name));
+    let key = proc::target(item.pid).filter(|x| x.name.eq_ignore_ascii_case(&item.name)).map(|x| learn_name(&x)).unwrap_or_else(|| item.name.to_lowercase());
+    learn::append_feedback(dir, &Feedback::new("dismiss", "fix", &learn::action_kind(&action.label()), &key));
     Ok(format!("dismissed {} on {}", item.action, item.name))
 }
 
@@ -301,6 +310,99 @@ fn state_json(gov: &snifrig_fix::governor::Governor, acting: bool, sugg: &[(Stri
 }
 
 /// The watch loop: alerts every 30 ticks, governor + rules every tick (1 s).
+/// The desktop compositor (smoothed share of a core) this busy for this long is stuck, not busy.
+const DWM_STUCK_PCT: f64 = 70.0;
+const DWM_STUCK_SECS: f64 = 180.0;
+
+/// Known fix: a stuck dwm. Ask once (a card with a Restart button), at most daily; a "no" is
+/// remembered for a week, two for good. Restarting the desktop never becomes automatic.
+fn offer_desktop_restart(dir: &Path, pct: f64, now: f64) {
+    let mem = snifrig_fix::judge::Memory::load(dir);
+    let label = Action::RestartService("dwm".into()).label();
+    if mem.declined("dwm.exe", &label, now).is_some() || mem.asked_recently("dwm.exe", &label, now) { return; }
+    let path = dir.join("ai-suggestions.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.contains("\"restart_desktop\"") { return; }
+    let reason = format!("The desktop compositor (dwm) has used {:.0}% of a core for over 3 minutes. That is what makes the mouse and every window stutter. Restarting it takes a second: the screen flashes, your apps stay open. Windows asks you to confirm.", pct);
+    let item = format!("{{\"id\":\"desktop-{:.0}\",\"unix\":{:.0},\"kind\":\"restart_desktop\",\"app\":\"dwm.exe\",\"rule\":\"\",\"setting\":\"\",\"reason\":\"{}\",\"source\":\"snifrig\"}}", now, now, snifrig_fix::json::esc(&reason));
+    let body = match text.find("\"items\":[") {
+        Some(i) => { let at = i + 9; let rest = &text[at..]; format!("{}{}{}{}", &text[..at], item, if rest.trim_start().starts_with(']') { "" } else { "," }, rest) }
+        None => format!("{{\"items\":[{}]}}\n", item),
+    };
+    rules::write_atomic(&path, &body);
+    let alert = snifrig_fix::Alert { t: String::new(), key: "desktop:stuck".into(), msg: reason.clone() };
+    let t = Target { pid: 0, name: "dwm.exe".into(), ..Default::default() };
+    ledger::record(dir, &alert, &Action::RestartService("dwm".into()), Some(&t), "queued", &reason);
+}
+
+/// `desktop restart` (after your OK) or `desktop no`.
+fn desktop(dir: &Path, yes: bool) -> Result<String, String> {
+    let alert = snifrig_fix::Alert { t: String::new(), key: "desktop:stuck".into(), msg: String::new() };
+    let t = Target { pid: 0, name: "dwm.exe".into(), ..Default::default() };
+    let action = Action::RestartService("dwm".into());
+    if !yes {
+        ledger::record(dir, &alert, &action, Some(&t), "dismissed", "you said not to restart the desktop");
+        learn::append_feedback(dir, &Feedback::new("dismiss", "fix", "restart-service", "dwm.exe"));
+        return Ok("ok, leaving the desktop alone".into());
+    }
+    // dwm belongs to the system: ending it needs admin, so Windows shows its own confirmation.
+    use std::os::windows::process::CommandExt;
+    let st = std::process::Command::new("powershell.exe").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", "Start-Process taskkill.exe -ArgumentList '/f','/im','dwm.exe' -Verb RunAs -WindowStyle Hidden -Wait"])
+        .creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
+    if !st.success() { ledger::record(dir, &alert, &action, Some(&t), "refused", "the Windows confirmation was cancelled"); return Err("cancelled".into()); }
+    ledger::record(dir, &alert, &action, Some(&t), "done", "restarted the desktop compositor with your OK; Windows started it again");
+    let mut f = Feedback::new("approve", "fix", "restart-service", "dwm.exe");
+    f.start = true;
+    learn::append_feedback(dir, &f);
+    Ok("desktop restarted".into())
+}
+
+/// learned.json for the tray and the app: what snifrig now does by itself, one item per line.
+fn write_learned(dir: &Path, l: &Learner, h: &snifrig_fix::governor::Hints) {
+    use snifrig_fix::json::esc;
+    let mut lines = vec![format!("{{\"unix\":{:.0}}}", now_unix())];
+    for (a, n, why) in l.learned_fixes() {
+        let what = if a == "trim" { format!("Frees memory of {} by itself", n) } else { format!("Eases {} by itself", n) };
+        lines.push(format!("{{\"text\":\"{}\",\"why\":\"{}\",\"name\":\"{}\",\"action\":\"{}\"}}", esc(&what), esc(&why), esc(&n), esc(&a)));
+    }
+    let present = rules::rule_lines(dir);
+    for n in l.learned_rules() {
+        if !present.iter().any(|r| r.trim().eq_ignore_ascii_case(&format!("{} background=yes", n))) { continue; }
+        lines.push(format!("{{\"text\":\"Always runs {} in the background\",\"why\":\"eased 20+ times a week and you never undid it\",\"name\":\"{}\",\"action\":\"rule\"}}", esc(&n), esc(&n)));
+    }
+    let mut p: Vec<&String> = h.protect.iter().collect(); p.sort();
+    for n in p { lines.push(format!("{{\"text\":\"Leaves {} alone\",\"why\":\"you undid it twice\",\"name\":\"{}\",\"action\":\"\"}}", esc(n), esc(n))); }
+    let mut b: Vec<&String> = h.blocked.iter().collect(); b.sort();
+    for n in b { lines.push(format!("{{\"text\":\"Stopped easing {}\",\"why\":\"it did not help\",\"name\":\"{}\",\"action\":\"\"}}", esc(n), esc(n))); }
+    let body = lines.join("\n") + "\n";
+    if std::fs::read_to_string(dir.join("learned.json")).map_or(true, |old| old.lines().skip(1).ne(body.lines().skip(1))) { rules::write_atomic(&dir.join("learned.json"), &body); }
+}
+
+/// `feel slow|fine`: you tell snifrig how the PC feels right now (tray buttons).
+fn feel_cmd(dir: &Path, slow: bool) -> Result<String, String> {
+    let g = std::fs::read_to_string(dir.join("governor.json")).unwrap_or_default();
+    let meter = snifrig_fix::json::str_field(&g, "word").unwrap_or_else(|| "unknown".into());
+    learn::append_feedback(dir, &Feedback::new(if slow { "feel_slow" } else { "feel_fine" }, "feel", "", ""));
+    let msg = if slow { format!("you said the PC feels slow (the meter said {}): easing background apps now", meter) } else { format!("you said the PC feels fine (the meter said {}): holding off for 10 minutes", meter) };
+    let alert = snifrig_fix::Alert { t: String::new(), key: "feel:you".into(), msg: msg.clone() };
+    ledger::record(dir, &alert, &Action::Report, None, "report", &msg);
+    Ok(msg)
+}
+
+/// `unlearn NAME ACTION`: stop doing a learned fix, or remove a learned rule. Counts as an undo.
+fn unlearn(dir: &Path, name: &str, action: &str) -> Result<String, String> {
+    let n = name.to_lowercase();
+    if action == "rule" {
+        let lines = rules::rule_lines(dir);
+        if let Some(i) = lines.iter().position(|r| r.trim().eq_ignore_ascii_case(&format!("{} background=yes", n))) { rules::remove(dir, i + 1)?; }
+    }
+    learn::append_feedback(dir, &Feedback::new("undo", "fix", if action == "rule" { "demote" } else { action }, &n));
+    let msg = format!("stopped: snifrig will ask again before doing that to {}", n);
+    let alert = snifrig_fix::Alert { t: String::new(), key: "learn:unlearn".into(), msg: msg.clone() };
+    ledger::record(dir, &alert, &Action::Report, None, "report", &msg);
+    Ok(msg)
+}
+
 /// Times a background program is eased in a week before snifrig makes it a rule by itself.
 const AUTO_RULE_AFTER: usize = 20;
 
@@ -333,6 +435,12 @@ fn watch(dir: &Path) {
     gov.tuning = t0.clone();
     enf.reapply_secs = t0.reapply_secs;
     let mut tune_mt = tuning_mt(dir);
+    let mut dwm_hot = 0.0f64;
+    // The feel gate was turned off while the meter was checked; it comes back on by itself after a day.
+    if !t0.feel_gate && !dir.join("feel-gate-on-at").exists() && !dir.join("feel-gate-stays-off").exists() {
+        let _ = std::fs::write(dir.join("feel-gate-on-at"), format!("{:.0}", now_unix() + 86400.0));
+        let _ = std::fs::write(dir.join("feel-gate-stays-off"), "delete feel-gate-on-at to keep the feel gate off\n");
+    }
     let (mut perf, left) = snifrig_fix::perfmode::PerfMode::new(dir);
     if let Some(m) = left { note(dir, "perf:mode", "done", &m); }
     let mut last_unusual = 0.0f64;
@@ -370,14 +478,34 @@ fn watch(dir: &Path) {
                 sugg = rules::suggestions(dir);
             }
         }
+        if n % 10 == 7 {
+            let now = now_unix();
+            if gov.dwm_pct >= DWM_STUCK_PCT { if dwm_hot == 0.0 { dwm_hot = now; } } else { dwm_hot = 0.0; }
+            if dwm_hot > 0.0 && now - dwm_hot >= DWM_STUCK_SECS { offer_desktop_restart(dir, gov.dwm_pct, now); dwm_hot = now; }
+        }
+        if n % 60 == 30 {
+            write_learned(dir, &learner, &gov.hints);
+            let at = dir.join("feel-gate-on-at");
+            if let Some(t) = std::fs::read_to_string(&at).ok().and_then(|s| s.trim().parse::<f64>().ok()) {
+                if now_unix() >= t {
+                    let _ = std::fs::remove_file(&at);
+                    let text = std::fs::read_to_string(&tf).unwrap_or_default();
+                    if text.lines().any(|l| l.split('#').next().unwrap_or("").replace(' ', "").eq_ignore_ascii_case("feel_gate=off")) {
+                        let new: Vec<String> = text.lines().map(|l| if l.split('#').next().unwrap_or("").replace(' ', "").eq_ignore_ascii_case("feel_gate=off") { "feel_gate = on".to_string() } else { l.to_string() }).collect();
+                        rules::write_atomic(&tf, &(new.join("\n") + "\n"));
+                        note(dir, "gov:settings", "done", "the feel meter has been watching for a day, so the feel gate is back on: snifrig only reins apps in when the PC actually feels slow");
+                    }
+                }
+            }
+        }
         if n > 0 && n % 60 == 0 {
             sugg = rules::suggestions(dir);
             // Learned rules: a background program (no window, not in use) eased again and again all
             // week, never undone, just always runs in the background from now on.
             for (name, count) in sugg.clone() {
-                if count < AUTO_RULE_AFTER || learner.undos(&name) > 0 || snifrig_fix::inuse::why_in_use(&name, now_unix()).is_some() { continue; }
+                if count < AUTO_RULE_AFTER || snifrig_fix::inuse::is_host(&name) || learner.undos(&name) > 0 || snifrig_fix::inuse::why_in_use(&name, now_unix()).is_some() { continue; }
                 if rules::add(dir, &format!("{} background=yes", name)).is_ok() {
-                    learn::append_feedback(dir, &Feedback::new("rule_added", "rule", "add", &name));
+                    learn::append_feedback(dir, &Feedback::new("rule_added", "learned", "add", &name));
                     note(dir, "learn:rule", "done", &format!("{} was eased {} times this week and you never undid it, so it now always runs in the background (a rule was added; remove it on the App rules page)", name, count));
                 }
             }
@@ -396,6 +524,8 @@ fn watch(dir: &Path) {
             gov.acting = act;
             enf.acting = act;
             gov.feels_slow = snifrig_fix::feel::sluggish_with(&snifrig_fix::feel::recent(5), gov.dwm_pct);
+            gov.user_says = learner.user_feel(now_unix());
+            if let Some(s) = gov.user_says { gov.feels_slow = s; }
             let changes = gov.tick(now_unix(), act);
             let brain_game = |name: &str| brain.cache().get(name).map_or(false, |v| v.kind == "game" && v.confidence >= snifrig_fix::brain::MIN_CONF);
             for m in perf.tick(gov.procs(), sys::foreground_pid(), &rule_set, &gov.tuning, act, &brain_game) {
@@ -473,9 +603,11 @@ fn watch(dir: &Path) {
             let mut toks = snifrig_fix::incident::recent_alert_tokens(dir, now, 900.0);
             if snifrig_fix::feel::sluggish_with(&f, gov.dwm_pct) { toks.insert("feel:sluggish".into()); }
             if gov.dwm_pct >= snifrig_fix::feel::DWM_BUSY_PCT { toks.insert("desktop:busy".into()); }
+            let you_slow = gov.user_says == Some(true);
+            if you_slow { toks.insert("you:slow".into()); }
             for d in gov.demoted.values() { toks.insert(format!("busy:{}", d.name.to_lowercase())); }
             let date = |u: f64| local_date(u);
-            if let Some(msg) = incidents.tick(dir, now, severity >= 1.0 || snifrig_fix::feel::sluggish_with(&f, gov.dwm_pct), &headline, toks, &date) { note(dir, "incident", "report", &msg); }
+            if let Some(msg) = incidents.tick(dir, now, you_slow || severity >= 1.0 || snifrig_fix::feel::sluggish_with(&f, gov.dwm_pct), &headline, toks, &date) { note(dir, "incident", "report", &msg); }
         }
         if n > 0 && n % 60 == 0 {
             let (now, m) = (now_unix(), metrics(&gov));
@@ -598,6 +730,9 @@ fn main() {
             }))
         }
         ["ease", id] => out(ease(&dir, id)),
+        ["feel", w @ ("slow" | "fine")] => out(feel_cmd(&dir, *w == "slow")),
+        ["desktop", w @ ("restart" | "no")] => out(desktop(&dir, *w == "restart")),
+        ["unlearn", name, action] => out(unlearn(&dir, name, action)),
         ["mode", m] => match Mode::parse(m) {
             Some(m) => { ledger::write_mode(&dir, m); println!("fixer mode: {}", m.as_str()); }
             None => out(Err("mode must be off, dry-run, ask or auto".into())),

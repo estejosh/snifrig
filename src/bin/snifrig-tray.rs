@@ -316,6 +316,26 @@ unsafe fn menu(hwnd: HWND) {
         AppendMenuW(m, MF_STRING | MF_POPUP, fm as usize, wide("Fixer mode").as_ptr());
         let cmds = &mut *std::ptr::addr_of_mut!(GOV_CMDS);
         cmds.clear();
+        // Teach it: your word beats the meter, and every answer is kept for learning.
+        AppendMenuW(m, MF_SEPARATOR, 0, null());
+        AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("PC feels slow right now").as_ptr());
+        cmds.push(vec!["feel".into(), "slow".into()]);
+        AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("PC feels fine").as_ptr());
+        cmds.push(vec!["feel".into(), "fine".into()]);
+        let lm = CreatePopupMenu();
+        let learned: Vec<String> = std::fs::read_to_string(dir().join("learned.json")).unwrap_or_default().lines().filter(|l| l.contains("\"text\"")).map(String::from).collect();
+        if learned.is_empty() { AppendMenuW(lm, MF_STRING | MF_GRAYED, 0, wide("Nothing yet: answer its questions and it learns").as_ptr()); }
+        for l in learned.iter().take(12) {
+            let (text, why) = (snifrig::json_str(l, "text").unwrap_or_default(), snifrig::json_str(l, "why").unwrap_or_default());
+            let (name, action) = (snifrig::json_str(l, "name").unwrap_or_default(), snifrig::json_str(l, "action").unwrap_or_default());
+            if action.is_empty() { AppendMenuW(lm, MF_STRING | MF_GRAYED, 0, wide(&esc(&format!("{} ({})", text, why))).as_ptr()); continue; }
+            let sub = CreatePopupMenu();
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, wide(&esc(&why)).as_ptr());
+            AppendMenuW(sub, MF_STRING, 200 + cmds.len(), wide("Stop doing this, ask me again").as_ptr());
+            cmds.push(vec!["unlearn".into(), name, action]);
+            AppendMenuW(lm, MF_STRING | MF_POPUP, sub as usize, wide(&esc(&text)).as_ptr());
+        }
+        AppendMenuW(m, MF_STRING | MF_POPUP, lm as usize, wide("What snifrig learned").as_ptr());
         if let Some(g) = flyout::gov_read(dir()) {
             let gm = CreatePopupMenu();
             let hd = if g.held.is_empty() { "Nothing held back".to_string() } else { format!("Holding back {} app{}", g.held.len(), if g.held.len() == 1 { "" } else { "s" }) };

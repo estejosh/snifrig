@@ -42,6 +42,35 @@ pub fn why_in_use(name: &str, now: f64) -> Option<String> {
     reason(name, now, &windowed, fg, kind.as_deref())
 }
 
+/// Programs that only run what someone else gives them: python.exe could be ComfyUI, a build
+/// script or an agent's tool call. They are judged by what they run and who started them, and
+/// snifrig never makes a rule for the host name itself.
+pub const HOSTS: [&str; 16] = ["python.exe", "pythonw.exe", "py.exe", "powershell.exe", "pwsh.exe", "cmd.exe", "node.exe", "bun.exe",
+    "deno.exe", "java.exe", "javaw.exe", "bash.exe", "wsl.exe", "ruby.exe", "perl.exe", "php.exe"];
+
+pub fn is_host(name: &str) -> bool { HOSTS.iter().any(|h| h.eq_ignore_ascii_case(name)) }
+
+/// The app with a window (or used in the last 30 minutes) that started this process, up to
+/// five parents up. Explorer does not count: everything you open starts from it.
+pub fn started_by(pid: u32, now: f64) -> Option<String> {
+    let mut buf = Vec::new();
+    let procs = crate::sys::snapshot(&mut buf);
+    let pids = crate::sys::window_pids();
+    let by_pid: HashMap<u32, &crate::sys::Proc> = procs.iter().map(|p| (p.pid, p)).collect();
+    let mut cur = *by_pid.get(&pid)?;
+    for _ in 0..5 {
+        let Some(parent) = by_pid.get(&cur.ppid).copied() else { break };
+        if parent.created > cur.created || parent.pid == cur.pid { break; } // pid reused: the chain ends here
+        let n = parent.name.to_lowercase();
+        if n != "explorer.exe" && !is_host(&n) {
+            let recent = with(|s| s.last_fg.get(&n).map_or(false, |t| now - t < RECENT_SECS));
+            if pids.contains(&parent.pid) || recent { return Some(parent.name.clone()); }
+        }
+        cur = parent;
+    }
+    None
+}
+
 /// Lowercase image names that own a visible, titled top-level window.
 pub fn windowed_names() -> HashSet<String> {
     let pids = crate::sys::window_pids();
