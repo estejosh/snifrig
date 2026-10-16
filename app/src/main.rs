@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 mod data;
+mod demo;
 mod json;
 mod sys;
 
@@ -67,28 +68,53 @@ struct App {
     lic_accept: String,
     /// `--shot DIR`: walk every page, save a PNG of each, then close (store screenshots).
     shot: Option<(PathBuf, usize, Instant, bool)>,
+    /// `--demo`: a made-up PC (sample data, fake live numbers).
+    demo: bool,
+    /// `--record DIR`: play the scripted tour with captions and write every frame for a video.
+    rec: Option<Rec>,
 }
+
+struct Rec { dir: PathBuf, out: std::fs::File, start: Instant, last: Instant, frames: u64, size: (usize, usize) }
+
+/// The video tour: what is on screen, for how long, and the caption under it.
+/// None = a full-screen title card (caption = headline, second line under it).
+const TOUR: [(Option<Page>, f32, &str, &str); 9] = [
+    (None, 3.5, "snifrig", "Keeps your PC fast without closing what you use."),
+    (Some(Page::Overview), 5.0, "Watches CPU, memory, graphics card and how your PC feels.", ""),
+    (Some(Page::Overview), 4.5, "Busy background apps get eased. The app in front is never touched.", ""),
+    (Some(Page::Governor), 4.5, "Hidden apps step down. Apps on your other screen stay smooth.", ""),
+    (Some(Page::Activity), 5.0, "It learns: say yes twice and it does it by itself, with an undo.", ""),
+    (Some(Page::Rules), 4.5, "Any app can always run in the background. Even from launch.", ""),
+    (Some(Page::Performance), 4.5, "Game in front? Fastest power plan, background eased sooner.", ""),
+    (Some(Page::Report), 4.0, "Plain words: what slowed your PC down, and what fixed it.", ""),
+    (None, 4.0, "snifrig", "Free monitor. Lifetime deal on snifrig fix at launch."),
+];
 
 const SHOTS: [(&str, Option<Page>); 8] = [("welcome", None), ("overview", Some(Page::Overview)), ("governor", Some(Page::Governor)), ("rules", Some(Page::Rules)),
     ("performance", Some(Page::Performance)), ("activity", Some(Page::Activity)), ("report", Some(Page::Report)), ("settings", Some(Page::Settings))];
 
 fn main() -> eframe::Result<()> {
     let ask = std::env::args().any(|a| a == "--ask");
+    let demo = std::env::args().any(|a| a == "--demo");
+    let rec = std::env::args().skip_while(|a| a != "--record").nth(1).map(PathBuf::from);
     let shot = std::env::args().skip_while(|a| a != "--shot").nth(1).map(PathBuf::from);
-    if shot.is_none() && already_running(if ask { "Local\\snifrig-ask" } else { "Local\\snifrig-app" }, if ask { "snifrig needs your OK" } else { "snifrig" }) { return Ok(()); }
-    let dir = std::env::args().skip_while(|a| a != "--dir").nth(1).map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("snifrig"));
+    if shot.is_none() && rec.is_none() && already_running(if ask { "Local\\snifrig-ask" } else { "Local\\snifrig-app" }, if ask { "snifrig needs your OK" } else { "snifrig" }) { return Ok(()); }
+    let dir = if demo { let d = demo::dir(); demo::prepare(&d); d } else { std::env::args().skip_while(|a| a != "--dir").nth(1).map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("snifrig")) };
     let mut vp = if ask {
         let (_, _, r, b) = sys::work_area();
         let (w, h) = (460.0, 440.0);
         egui::ViewportBuilder::default().with_title("snifrig needs your OK").with_inner_size([w, h]).with_position([r - w - 16.0, b - h - 16.0])
             .with_decorations(false).with_always_on_top().with_resizable(false).with_taskbar(false)
     } else {
-        egui::ViewportBuilder::default().with_title("snifrig").with_inner_size([1280.0, 840.0]).with_min_inner_size([900.0, 560.0])
+        egui::ViewportBuilder::default().with_title("snifrig").with_inner_size(if rec.is_some() { [1280.0, 720.0] } else { [1280.0, 840.0] }).with_min_inner_size([900.0, 560.0])
     };
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-64.png")) { vp = vp.with_icon(Arc::new(icon)); }
     let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
-    eframe::run_native("snifrig", opts, Box::new(move |cc| { let mut a = App::new(cc, dir, ask); if let Some(s) = shot { let _ = std::fs::create_dir_all(&s); a.shot = Some((s, 0, Instant::now(), false)); } Ok(Box::new(a)) }))
+    eframe::run_native("snifrig", opts, Box::new(move |cc| { let mut a = App::new(cc, dir, ask);
+        if demo { a.demo = true; a.live = demo::live(); *a.license.lock().unwrap() = "mode: ask\npaused: no\nlicense: Demo PC (1 seat, lifetime)\npending: 1".into(); }
+        if let Some(r) = rec { let _ = std::fs::create_dir_all(&r); if let Ok(out) = std::fs::File::create(r.join("frames.rgba")) { a.rec = Some(Rec { dir: r, out, start: Instant::now(), last: Instant::now(), frames: 0, size: (0, 0) }); } }
+        if let Some(s) = shot { let _ = std::fs::create_dir_all(&s); a.shot = Some((s, 0, Instant::now(), false)); } Ok(Box::new(a)) }))
 }
 
 fn already_running(mutex: &str, title: &str) -> bool {
@@ -247,7 +273,7 @@ impl App {
             plans: Vec::new(), toast: Arc::new(Mutex::new(None)), report_days: 7, report: Arc::new(Mutex::new(None)),
             filter: Filter::All, search: String::new(), license: Arc::new(Mutex::new(String::new())), brain_up: None,
             ask, snoozed: Vec::new(), sugg: data::load_suggestions(&dir),
-            welcome: !ask && !dir.join("welcomed").exists(), lic_code: String::new(), lic_accept: String::new(), shot: None,
+            welcome: !ask && !dir.join("welcomed").exists(), lic_code: String::new(), lic_accept: String::new(), shot: None, demo: false, rec: None,
             live: sys::start(), state, loaded: Instant::now(), hist_loaded: Instant::now(), page: Page::Overview, logo, confirm_delete: None, dir,
         };
         app.refresh_license();
@@ -272,6 +298,7 @@ impl App {
     }
 
     fn refresh_license(&self) {
+        if self.demo { return; }
         let (path, out, dir) = (data::tool("snifrig-fix.exe", &self.dir), self.license.clone(), self.dir.clone());
         std::thread::spawn(move || {
             let r = if path.exists() { data::cmd(&path.to_string_lossy(), &["status", "--dir", &dir.to_string_lossy()]).unwrap_or_else(|e| e) } else { "snifrig fix is not installed.".into() };
@@ -319,7 +346,16 @@ impl App {
                 if ui.link("Read the license").clicked() { let _ = std::process::Command::new("explorer").arg("https://github.com/estejosh/snifrig/blob/main/LICENSE").spawn(); }
             });
         }
-        if !self.state.has_key {
+        if let Some(id) = l.lines().find_map(|x| x.strip_prefix("this PC: ")).map(|s| s.trim().to_string()) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("This PC's ID: {}...", &id[..id.len().min(16)])).color(MUTED));
+                if ui.small_button("Copy").on_hover_text("Paste it on the activation page to get a key for this PC").clicked() { ui.ctx().copy_text(id.clone()); self.say("Copied this PC's ID.", true); }
+            });
+        }
+        if let Some(days) = key_days_left(&l) {
+            if days <= 7 { ui.label(RichText::new(format!("Your key ends in {} day{}. The renewal code comes by email; paste it below.", days.max(0), if days == 1 { "" } else { "s" })).color(WARN)); }
+        }
+        if !self.state.has_key || key_days_left(&l).map_or(false, |d| d <= 7) {
             ui.add_space(6.0);
             ui.label(RichText::new("License code").color(TEXT));
             ui.horizontal(|ui| {
@@ -333,6 +369,60 @@ impl App {
                 }
             });
             if ui.button("Check again").clicked() { self.refresh_license(); }
+        }
+    }
+
+    /// One frame of the recorded tour. Grabs the previous frame, picks the page, draws the
+    /// caption. Returns true when this frame is a title card (nothing else to draw).
+    fn record(&mut self, ctx: &egui::Context) -> bool {
+        let Some(r) = self.rec.as_mut() else { return false };
+        use std::io::Write;
+        for e in ctx.input(|x| x.raw.events.clone()) {
+            if let egui::Event::Screenshot { image, .. } = e {
+                if r.size == (0, 0) { r.size = (image.size[0], image.size[1]); let _ = std::fs::write(r.dir.join("size.txt"), format!("{}x{}", image.size[0], image.size[1])); }
+                if (image.size[0], image.size[1]) == r.size {
+                    let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                    let _ = r.out.write_all(&rgba);
+                    r.frames += 1;
+                }
+            }
+        }
+        let t = r.start.elapsed().as_secs_f32();
+        let total: f32 = TOUR.iter().map(|s| s.1).sum();
+        if t > total + 0.3 {
+            let _ = std::fs::write(r.dir.join("frames.txt"), format!("{} {:.2}", r.frames, t));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return true;
+        }
+        if r.last.elapsed() >= Duration::from_millis(100) { r.last = Instant::now(); ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default())); }
+        ctx.request_repaint_after(Duration::from_millis(30));
+        let (mut acc, mut step) = (0.0, TOUR.len() - 1);
+        for (i, s) in TOUR.iter().enumerate() { if t < acc + s.1 { step = i; break; } acc += s.1; }
+        let (page, _, line1, line2) = TOUR[step];
+        self.welcome = false;
+        match page {
+            None => {
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.28);
+                        if let Some(l) = &self.logo { ui.add(egui::Image::new(l).fit_to_exact_size(Vec2::splat(120.0))); }
+                        ui.add_space(10.0);
+                        ui.label(bold(line1, 54.0).color(TEXT));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(line2).size(24.0).color(ACCENT));
+                    });
+                });
+                true
+            }
+            Some(p) => {
+                self.page = p;
+                egui::Area::new(egui::Id::new("caption")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -28.0]).show(ctx, |ui| {
+                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(10, 11, 14, 235)).stroke(Stroke::new(1.5, ACCENT)).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(22, 12)).show(ui, |ui| {
+                        ui.label(bold(line1, 22.0).color(TEXT));
+                    });
+                });
+                false
+            }
         }
     }
 
@@ -1143,6 +1233,14 @@ impl App {
     }
 }
 
+/// Days until the installed key ends, from the status text ("valid until YYYY-MM-DD").
+fn key_days_left(status: &str) -> Option<i64> {
+    let d = status.split("valid until ").nth(1)?.get(0..10)?;
+    let u = data::iso_unix(&format!("{}T00:00:00Z", d))?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64();
+    Some(((u - now) / 86400.0).ceil() as i64)
+}
+
 fn glob(p: &str, name: &str) -> bool {
     let n = name.to_lowercase();
     if !p.contains('*') && !p.contains('?') { return p == n; }
@@ -1178,6 +1276,7 @@ impl eframe::App for App {
             }
             ctx.request_repaint_after(Duration::from_millis(200));
         }
+        if self.rec.is_some() && self.record(ctx) { return; }
         if self.welcome { self.welcome_view(ctx); ctx.request_repaint_after(Duration::from_millis(1000)); return; }
         let live = self.live.lock().map(|g| g.clone()).unwrap_or_default();
         egui::SidePanel::left("nav").exact_width(220.0).resizable(false).frame(egui::Frame::new().fill(SIDE).inner_margin(Margin::symmetric(12, 0))).show(ctx, |ui| self.nav(ui));

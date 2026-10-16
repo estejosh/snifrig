@@ -8,7 +8,7 @@
 //! HASH is what `snifrig-fix machine-id` prints on the buyer's machine.
 //! Refuses to write the secret inside a git working tree (walks up looking for .git).
 use ed25519_compact::{KeyPair, SecretKey, Seed};
-use snifrig_fix::license::{b64_encode, build_payload, valid_date};
+use snifrig_fix::license::{b64_encode, build_payload_plan, valid_date};
 use std::path::Path;
 
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
@@ -63,7 +63,9 @@ fn sign(args: &[String]) -> Result<(), String> {
             return Err("--machine must be 64 lowercase hex chars (from `snifrig-fix machine-id`)".into());
         }
     }
-    let payload = build_payload(&licensee, seats, &issued, &not_after, machine.as_deref());
+    let plan = get("--plan");
+    if let Some(p) = &plan { if !matches!(p.as_str(), "monthly" | "annual" | "lifetime") { return Err("--plan must be monthly, annual or lifetime".into()); } }
+    let payload = build_payload_plan(&licensee, seats, &issued, &not_after, machine.as_deref(), plan.as_deref());
     let sig = sk.sign(payload.as_bytes(), None);
     println!("{}.{}", b64_encode(payload.as_bytes()), b64_encode(sig.as_ref()));
     Ok(())
@@ -74,7 +76,7 @@ fn main() {
     let r = match args.first().map(|s| s.as_str()) {
         Some("new-keypair") if args.len() == 2 => new_keypair(&args[1]),
         Some("sign") => sign(&args[1..]),
-        _ => Err("usage: snifrig-keygen new-keypair OUTDIR | sign --secret PATH --licensee NAME --seats N --issued YYYY-MM-DD --not-after YYYY-MM-DD [--machine HASH]".into()),
+        _ => Err("usage: snifrig-keygen new-keypair OUTDIR | sign --secret PATH --licensee NAME --seats N --issued YYYY-MM-DD --not-after YYYY-MM-DD [--machine HASH] [--plan monthly|annual|lifetime]".into()),
     };
     if let Err(e) = r {
         eprintln!("error: {}", e);

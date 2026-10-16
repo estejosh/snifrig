@@ -1,0 +1,5 @@
+# Build the C runtime into every program, so snifrig runs on a fresh Windows without the
+# Visual C++ Redistributable installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+

@@ -30,7 +30,9 @@ const ACCEPTED_FILE: &str = "fix-accepted.json";
 const NO_KEY_NOTE: &str = "no production signing key configured yet";
 
 #[derive(Clone, Debug, Default)]
-pub struct LicenseStatus { pub licensed: bool, pub licensee: String, pub seats: u32, pub not_after: String, pub note: String }
+pub struct LicenseStatus { pub licensed: bool, pub licensee: String, pub seats: u32, pub not_after: String, pub note: String,
+    /// "monthly", "annual" or "lifetime" when the key says; empty for older keys.
+    pub plan: String }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -67,10 +69,18 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 /// The signed payload, byte for byte what keygen.py writes (sorted keys, compact).
 pub fn build_payload(licensee: &str, seats: u32, issued_at: &str, not_after: &str, machine: Option<&str>) -> String {
+    build_payload_plan(licensee, seats, issued_at, not_after, machine, None)
+}
+
+/// Same, with the plan it was sold on ("monthly", "annual", "lifetime"), still sorted keys.
+/// Subscriptions are short keys (period end plus a grace week) that the shop's webhook
+/// re-issues on each payment and emails; nothing on the PC ever calls home.
+pub fn build_payload_plan(licensee: &str, seats: u32, issued_at: &str, not_after: &str, machine: Option<&str>, plan: Option<&str>) -> String {
     let m = match machine { Some(m) if !m.is_empty() => format!(r#""machine":"{}","#, esc(m)), _ => String::new() };
+    let p = match plan { Some(p) if !p.is_empty() => format!(r#""plan":"{}","#, esc(p)), _ => String::new() };
     format!(
-        r#"{{"component":"{}","issued_at":"{}","license":"{}","licensee":"{}",{}"not_after":"{}","seats":{},"v":1}}"#,
-        COMPONENT, esc(issued_at), LICENSE_ID, esc(licensee), m, esc(not_after), seats
+        r#"{{"component":"{}","issued_at":"{}","license":"{}","licensee":"{}",{}"not_after":"{}",{}"seats":{},"v":1}}"#,
+        COMPONENT, esc(issued_at), LICENSE_ID, esc(licensee), m, esc(not_after), p, seats
     )
 }
 
@@ -199,6 +209,7 @@ pub fn verify(line: &str, pk: &[u8; 32], today: &str, machine: Option<&str>, las
         seats: num_field(&json, "seats").unwrap_or(1.0) as u32,
         not_after: until,
         note: String::new(),
+        plan: str_field(&json, "plan").unwrap_or_default(),
     })
 }
 
@@ -327,5 +338,21 @@ mod tests {
     fn machine_hash_is_64_hex() {
         let h = machine_hash().unwrap();
         assert!(h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use ed25519_compact::{KeyPair, Seed};
+    #[test]
+    fn plan_is_signed_and_read_back() {
+        let kp = KeyPair::from_seed(Seed::new([9u8; 32]));
+        let payload = build_payload_plan("A", 1, "2026-01-01", "2026-12-31", None, Some("annual"));
+        assert!(payload.contains(r#""not_after":"2026-12-31","plan":"annual","seats":1"#), "{}", payload);
+        let key = format!("{}.{}", b64_encode(payload.as_bytes()), b64_encode(kp.sk.sign(payload.as_bytes(), None).as_ref()));
+        let st = verify(&key, &kp.pk, "2026-06-01", None, None).unwrap();
+        assert_eq!(st.plan, "annual");
+        assert_eq!(build_payload_plan("A", 1, "2026-01-01", "2026-12-31", None, None), build_payload("A", 1, "2026-01-01", "2026-12-31", None), "old keys unchanged");
     }
 }

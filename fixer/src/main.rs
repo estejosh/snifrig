@@ -814,7 +814,8 @@ fn main() {
             let l = license::status(&dir);
             println!("mode: {}", p.mode.as_str());
             println!("paused: {}", if p.now < p.paused_until { format!("yes, {:.0} min left", (p.paused_until - p.now) / 60.0) } else { "no".into() });
-            println!("license: {}", if l.licensed { format!("{} ({} seats, valid until {})", l.licensee, l.seats, l.not_after) } else { format!("none ({})", l.note) });
+            println!("license: {}", if l.licensed { format!("{} ({} seats{}, valid until {})", l.licensee, l.seats, if l.plan.is_empty() { String::new() } else { format!(", {}", l.plan) }, l.not_after) } else { format!("none ({})", l.note) });
+            if let Some(id) = license::machine_hash() { println!("this PC: {}", id); }
             println!("pending: {}", ledger::load_pending(&dir).len());
         }
         ["pending"] => for p in ledger::load_pending(&dir) { println!("{}  {} {}#{}  {}", p.id, p.action, p.name, p.pid, p.why); },
