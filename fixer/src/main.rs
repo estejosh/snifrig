@@ -305,8 +305,11 @@ fn state_json(gov: &snifrig_fix::governor::Governor, acting: bool, sugg: &[(Stri
     let f = snifrig_fix::feel::recent(10);
     let feel = format!("{{\"word\":\"{}\",\"ping_ms\":{:.0},\"lag_ms\":{:.0},\"hung\":{},\"desktop_pct\":{:.0},\"input_ms\":{:.0},\"input_events\":{}}}", snifrig_fix::feel::word_with(&f, gov.dwm_pct), f.ping_ms, f.lag_ms, f.hung, gov.dwm_pct, f.input_ms, f.input_events);
     let tail = format!("\"busy\":{},\"game\":{},\"busy_pct\":{:.0},\"demoted\":[{}],\"suggestions\":[{}]}}\n", gov.mood.busy_with(&gov.tuning), game, gov.tuning.busy_pct, demoted.join(","), sg.join(","));
-    let full = format!("{{\"unix\":{:.0},\"acting\":{},\"cpu\":{:.0},\"feel\":{},{}", now_unix(), acting, gov.total_pct, feel, tail);
-    (full, format!("{}{}", acting, tail))
+    let slow: Vec<String> = gov.apps_slow.iter().map(|(n, ms, base, why)| format!("{{\"name\":\"{}\",\"ms\":{:.0},\"usual_ms\":{:.0},\"why\":\"{}\"}}", snifrig_fix::json::esc(n), ms, base, snifrig_fix::json::esc(why))).collect();
+    let vis: Vec<String> = gov.visible.iter().map(|n| format!("\"{}\"", snifrig_fix::json::esc(n))).collect();
+    let full = format!("{{\"unix\":{:.0},\"acting\":{},\"cpu\":{:.0},\"feel\":{},\"apps_slow\":[{}],\"visible\":[{}],{}", now_unix(), acting, gov.total_pct, feel, slow.join(","), vis.join(","), tail);
+    let names: Vec<&str> = gov.apps_slow.iter().map(|a| a.0.as_str()).collect();
+    (full, format!("{}{}{}", acting, names.join(","), tail))
 }
 
 /// The watch loop: alerts every 30 ticks, governor + rules every tick (1 s).
@@ -430,9 +433,91 @@ fn stop_brain(dir: &Path) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("stop command exited with {}", st)) }
 }
 
+/// One round of "which app feels slow": measure every window on a screen, judge, announce new ones.
+fn check_apps(dir: &Path, gov: &mut snifrig_fix::governor::Governor, rules: &[rules::Rule], tracker: &mut snifrig_fix::slowapp::Tracker) {
+    use snifrig_fix::slowapp::{AppNow, Ctx};
+    let mut by: Vec<(String, f64, bool)> = Vec::new();
+    for (pid, ms, hung) in snifrig_fix::feel::apps() {
+        let Some(name) = gov.procs().iter().find(|p| p.pid == pid).map(|p| p.name.clone()) else { continue };
+        match by.iter_mut().find(|x| x.0.eq_ignore_ascii_case(&name)) { Some(x) => { x.1 = x.1.max(ms); x.2 |= hung; } None => by.push((name, ms, hung)) }
+    }
+    gov.visible = by.iter().map(|x| x.0.clone()).collect();
+    let apps: Vec<(AppNow, Ctx)> = by.into_iter().map(|(name, ms, hung)| {
+        let (cores, total) = gov.name_cores(&name);
+        let a = AppNow { name: name.clone(), ms, hung, pct: gov.name_pct(&name), cores };
+        let c = Ctx { total_cores: total, dwm_pct: gov.dwm_pct, total_pct: gov.total_pct,
+            eased: gov.eased(&name).iter().map(|e| e.1).max(),
+            rule_capped: rules.iter().any(|r| r.affinity.is_some() && rules::glob_match(&r.pattern, &name.to_lowercase())),
+            hog: gov.top.iter().find(|(n, _)| !n.eq_ignore_ascii_case(&name) && !n.starts_with("snifrig")).map(|(n, _)| n.clone()) };
+        (a, c)
+    }).collect();
+    for (name, why) in tracker.update(&apps) {
+        let msg = format!("{} feels slow: {}", name.trim_end_matches(".exe"), why);
+        let alert = snifrig_fix::Alert { t: String::new(), key: format!("app:slow:{}", name.to_lowercase()), msg: msg.clone() };
+        ledger::record(dir, &alert, &Action::Report, None, "report", &msg);
+    }
+    gov.apps_slow = tracker.slow.clone();
+}
+
+/// You said this app feels slow (tray or `snifrig-fix slow NAME`): find out why and do what fits.
+fn handle_slow(dir: &Path, gov: &mut snifrig_fix::governor::Governor, rules: &[rules::Rule], name: &str, act: bool) {
+    let (cores, total) = gov.name_cores(name);
+    let pct = gov.name_pct(name);
+    let short = name.trim_end_matches(".exe").to_string();
+    let mut done: Vec<String> = Vec::new();
+    // 1. snifrig itself is holding it back: give it full speed now (and leave it alone from now on).
+    let eased = gov.eased(name);
+    if !eased.is_empty() {
+        let mut changes = Vec::new();
+        for (pid, _) in &eased { changes.extend(gov.undo(*pid, act)); }
+        log_gov(dir, changes, act);
+        done.push("gave it full speed back (snifrig had it eased)".into());
+    }
+    // 2. A rule pins it to a few cores: offer more cores, still in the background.
+    let rule = rules.iter().find(|r| r.affinity.is_some() && rules::glob_match(&r.pattern, &name.to_lowercase()));
+    // Only when it really is using (nearly) all the cores the rule allows; otherwise more cores would not help.
+    let maxed = pct >= 70.0 * cores as f64;
+    if let Some(r) = rule.filter(|_| cores < total && maxed) {
+        let want = (cores * 2).min(total);
+        let new_aff = format!("{}-{}", total - want, total - 1);
+        let text: Vec<String> = r.text.split_whitespace().map(|t| if t.to_lowercase().starts_with("affinity=") { format!("affinity={}", new_aff) } else { t.to_string() }).collect();
+        let reason = format!("{} is held to {} core{} by your rule and uses {:.0}% of {}. You said it feels slow: this gives it {} cores and keeps everything else in the rule.",
+            short, cores, if cores == 1 { "" } else { "s" }, pct / cores.max(1) as f64, if cores == 1 { "it" } else { "them" }, want);
+        add_card(dir, "rule", name, &text.join(" "), &reason);
+        done.push(format!("asked you to allow {} cores instead of {} (card in the app)", want, cores));
+    }
+    // 3. Otherwise make room: ease busy background apps, this one kept at full speed.
+    if eased.is_empty() && !(rule.is_some() && maxed && cores < total) {
+        let changes = gov.quick(act, 120.0, Some(name));
+        let n = changes.iter().filter(|c| c.result.is_ok()).count();
+        log_gov(dir, changes, act);
+        done.push(format!("eased {} busy background app{} to make room for it", n, if n == 1 { "" } else { "s" }));
+    }
+    learn::append_feedback(dir, &Feedback::new("app_slow", "feel", "", name));
+    let msg = format!("you said {} feels slow ({:.0}% of a core, {} of {} cores allowed): {}", short, pct, cores, total, done.join("; "));
+    let alert = snifrig_fix::Alert { t: String::new(), key: format!("app:you-slow:{}", name.to_lowercase()), msg: msg.clone() };
+    ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
+    let _ = std::fs::write(dir.join("app-slow-result.txt"), &msg);
+}
+
+/// Add a card to the app's suggestions (kind rule|restart_desktop|...), shown with buttons.
+fn add_card(dir: &Path, kind: &str, app: &str, rule: &str, reason: &str) {
+    use snifrig_fix::json::esc;
+    let path = dir.join("ai-suggestions.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.contains(&format!("\"rule\":\"{}\"", esc(rule))) { return; }
+    let now = now_unix();
+    let item = format!("{{\"id\":\"snif-{:.0}\",\"unix\":{:.0},\"kind\":\"{}\",\"app\":\"{}\",\"rule\":\"{}\",\"setting\":\"\",\"reason\":\"{}\",\"source\":\"snifrig\"}}", now, now, esc(kind), esc(app), esc(rule), esc(reason));
+    let body = match text.find("\"items\":[") {
+        Some(i) => { let at = i + 9; let rest = &text[at..]; format!("{}{}{}{}", &text[..at], item, if rest.trim_start().starts_with(']') { "" } else { "," }, rest) }
+        None => format!("{{\"items\":[{}]}}\n", item),
+    };
+    rules::write_atomic(&path, &body);
+}
+
 /// Run a quick-fix request (from the tray, the hotkey, the phone or `snifrig-fix quick`).
 fn run_quick(dir: &Path, gov: &mut snifrig_fix::governor::Governor, act: bool) {
-    let changes = gov.quick(act, 120.0);
+    let changes = gov.quick(act, 120.0, None);
     let n = changes.iter().filter(|c| c.result.is_ok()).count();
     let names: Vec<String> = changes.iter().filter(|c| c.result.is_ok()).take(6).map(|c| c.name.clone()).collect();
     let mut freed = 0;
@@ -604,6 +689,7 @@ fn watch(dir: &Path) {
     enf.reapply_secs = t0.reapply_secs;
     let mut tune_mt = tuning_mt(dir);
     let mut dwm_hot = 0.0f64;
+    let mut slow_apps = snifrig_fix::slowapp::Tracker::default();
     let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
     // The feel gate was turned off while the meter was checked; it comes back on by itself after a day.
     if !t0.feel_gate && !dir.join("feel-gate-on-at").exists() && !dir.join("feel-gate-stays-off").exists() {
@@ -738,6 +824,12 @@ fn watch(dir: &Path) {
         }
         handle_undo(dir, &mut gov, act);
         if dir.join("quick-fix").exists() { let _ = std::fs::remove_file(dir.join("quick-fix")); run_quick(dir, &mut gov, act); }
+        if let Ok(name) = std::fs::read_to_string(dir.join("app-slow")) {
+            let _ = std::fs::remove_file(dir.join("app-slow"));
+            let name = name.trim().to_string();
+            if !name.is_empty() { handle_slow(dir, &mut gov, &rule_set, &name, act); }
+        }
+        if n % 3 == 1 { check_apps(dir, &mut gov, &rule_set, &mut slow_apps); }
         if n % 10 == 0 {
             let (now, m) = (now_unix(), metrics(&gov));
             learner.poll_feedback(now, &m);
@@ -922,6 +1014,7 @@ fn main() {
         ["desktop", w @ ("restart" | "no")] => out(desktop(&dir, *w == "restart")),
         ["unlearn", name, action] => out(unlearn(&dir, name, action)),
         ["launch", "sync"] => out(launch_sync(&dir)),
+        ["slow", name] => { let _ = std::fs::write(dir.join("app-slow"), name); println!("noted; the fixer looks at {} within a second", name); }
         ["quick"] => { let _ = std::fs::write(dir.join("quick-fix"), "cli"); println!("quick fix asked; the fixer runs it within a second"); }
         ["phone", w @ ("on" | "off")] => out(phone_cmd(&dir, *w == "on")),
         ["mode", m] => match Mode::parse(m) {

@@ -164,6 +164,27 @@ pub fn set_cpu_sets(pid: u32, ids: &[u32]) -> Result<(), String> {
     if ok == 0 { Err(format!("cpu sets: error {}", unsafe { windows_sys::Win32::Foundation::GetLastError() })) } else { Ok(()) }
 }
 
+/// Windows showing on a screen right now (titled, not minimised, not cloaked): (hwnd, pid), at most 16.
+pub fn visible_windows() -> Vec<(isize, u32)> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, IsIconic, IsWindowVisible};
+    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> i32 {
+        let v = &mut *(lp as *mut Vec<(isize, u32)>);
+        if v.len() < 16 && IsWindowVisible(h) != 0 && IsIconic(h) == 0 && GetWindowTextLengthW(h) > 0 {
+            let mut cloaked = 0u32;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED as _, &mut cloaked as *mut u32 as *mut _, 4);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid != 0 && cloaked == 0 && pid != std::process::id() { v.push((h as isize, pid)); }
+        }
+        1
+    }
+    let mut v: Vec<(isize, u32)> = Vec::new();
+    unsafe { EnumWindows(Some(cb), &mut v as *mut _ as LPARAM); }
+    v
+}
+
 /// Pids that own a real, titled top-level window. Cloaked windows (hidden UWP hosts such as
 /// TextInputHost, windows parked on another virtual desktop) do not count.
 pub fn window_pids() -> std::collections::HashSet<u32> { windows().0 }

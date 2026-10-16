@@ -16,6 +16,7 @@ button.ok{background:var(--a);color:#111;border:0}#msg{color:var(--g);min-height
 <h1>snifrig</h1><div class="sub" id="head"><span class="dot" id="dot"></span><span id="state">connecting...</span></div>
 <button id="quick">Quick fix</button><div id="msg"></div>
 <div class="card row"><div class="stat"><b id="cpu">-</b><span>CPU</span></div><div class="stat"><b id="feel">-</b><span>feels</span></div><div class="stat"><b id="held">-</b><span>eased</span></div></div>
+<div class="card" id="slowc" style="display:none"><div style="font-weight:600;margin-bottom:8px">Feels slow right now</div><div id="slow"></div></div>
 <div class="card"><div style="font-weight:600;margin-bottom:8px">Waiting for your OK</div><div id="pend" style="color:var(--m)">Nothing to decide.</div></div>
 <script>
 const k=new URLSearchParams(location.search).get('k');const q=s=>document.getElementById(s);
@@ -23,6 +24,7 @@ const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',
 async function api(p,post){const r=await fetch('/api/'+p+(p.includes('?')?'&':'?')+'k='+encodeURIComponent(k),{method:post?'POST':'GET'});if(!r.ok)throw new Error(await r.text());return r.json()}
 async function load(){try{const s=await api('status');const g=s.gov||{};q('cpu').textContent=(g.cpu??'-')+'%';q('feel').textContent=(g.feel&&g.feel.word)||'-';q('held').textContent=(g.demoted||[]).length;
 const live=s.live;q('dot').style.background=live?'var(--g)':'var(--bad)';q('state').textContent=live?'connected to '+s.pc:'fixer not running';
+const sl=g.apps_slow||[];q('slowc').style.display=sl.length?'block':'none';q('slow').innerHTML=sl.map(a=>`<div class="p"><b>${esc(a.name.replace(/\.exe$/i,''))}</b><small>${esc(a.why)}</small></div>`).join('');
 const it=(s.pending&&s.pending.items)||[];q('pend').innerHTML=it.length?it.map(p=>`<div class="p"><b>${esc(p.name)}</b> &middot; ${esc(p.action)}<small>${esc(p.why||p.msg||'')}</small><button class="s ok" onclick="act('approve','${esc(p.id)}')">Approve</button><button class="s" onclick="act('dismiss','${esc(p.id)}')">Dismiss</button></div>`).join(''):'Nothing to decide.'}
 catch(e){q('dot').style.background='var(--bad)';q('state').textContent='cannot reach your PC'}}
 async function act(a,id){try{const r=await api(a+'?id='+encodeURIComponent(id),1);q('msg').textContent=r.msg}catch(e){q('msg').textContent=e.message}load()}

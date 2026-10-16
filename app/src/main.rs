@@ -707,6 +707,19 @@ impl App {
             });
         });
         ui.add_space(8.0);
+        if !self.state.apps_slow.is_empty() {
+            card(ui, |ui| {
+                ui.horizontal(|ui| { chip(ui, "feels slow", WARN); ui.label(bold("Apps that feel slow right now", 15.0).color(TEXT)); });
+                for (name, ms, usual, why) in self.state.apps_slow.clone() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(bold(name.trim_end_matches(".exe"), 14.0).color(TEXT));
+                        ui.label(RichText::new(format!("answers in {:.0} ms (usually {:.0}); {}", ms, usual, why)).color(MUTED));
+                    });
+                }
+                ui.label(RichText::new("Tell snifrig which app feels slow from the tray menu: An app feels slow.").size(12.0).color(MUTED));
+            });
+            ui.add_space(8.0);
+        }
         if !self.state.seen_before.is_empty() {
             card(ui, |ui| {
                 ui.horizontal(|ui| { chip(ui, "seen before", BLUE); ui.label(bold("snifrig remembers this one", 15.0).color(TEXT)); });

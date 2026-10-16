@@ -308,6 +308,10 @@ pub struct Governor {
     pub hold_until: f64,
     /// Share of a core each pid used on the latest tick.
     last_pct: HashMap<u32, f64>,
+    /// Apps that feel slow right now: (name, ms, usual ms, reason). Set by the watch loop.
+    pub apps_slow: Vec<(String, f64, f64, String)>,
+    /// Names of apps with a window on a screen (for the tray's "an app feels slow" list).
+    pub visible: Vec<String>,
 }
 
 /// One change made, for the ledger and the tray.
@@ -317,7 +321,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), onscreen: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0, user_says: None, hold_until: 0.0, last_pct: HashMap::new() }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), onscreen: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0, user_says: None, hold_until: 0.0, last_pct: HashMap::new(), apps_slow: Vec::new(), visible: Vec::new() }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -456,9 +460,9 @@ impl Governor {
     /// at once (apps showing on a screen only to efficiency mode), the app in front and snifrig
     /// itself are left alone, and nothing comes back on its own for `hold_secs`. Undo and
     /// switching to an app work as always.
-    pub fn quick(&mut self, act: bool, hold_secs: f64) -> Vec<Change> {
+    pub fn quick(&mut self, act: bool, hold_secs: f64, keep: Option<&str>) -> Vec<Change> {
         let fg = sys::foreground_pid();
-        let fg_name = fg.and_then(|p| self.last_procs.iter().find(|x| x.pid == p)).map(|p| p.name.to_lowercase());
+        let fg_name = keep.map(|k| k.to_lowercase()).or_else(|| fg.and_then(|p| self.last_procs.iter().find(|x| x.pid == p)).map(|p| p.name.to_lowercase()));
         let on_names: HashSet<String> = self.last_procs.iter().filter(|p| self.onscreen.contains(&p.pid)).map(|p| p.name.to_lowercase()).collect();
         let me = std::process::id();
         let busy: Vec<Proc> = self.last_procs.iter()
@@ -473,6 +477,23 @@ impl Governor {
         }
         self.hold_until = crate::now_unix() + hold_secs;
         out
+    }
+
+    /// Share of a core used by every process of this image name on the latest tick.
+    pub fn name_pct(&self, name: &str) -> f64 {
+        self.last_procs.iter().filter(|p| p.name.eq_ignore_ascii_case(name)).map(|p| self.last_pct.get(&p.pid).copied().unwrap_or(0.0)).sum()
+    }
+
+    /// Cores this app may run on (its first process's affinity), and all cores.
+    pub fn name_cores(&self, name: &str) -> (u32, u32) {
+        let all = self.cores as u32;
+        let n = self.last_procs.iter().find(|p| p.name.eq_ignore_ascii_case(name)).and_then(|p| sys::get_affinity(p.pid)).map(|(p, s)| (p & s).count_ones()).unwrap_or(all);
+        (n.max(1), all)
+    }
+
+    /// Pids of this name the governor holds back, with their level.
+    pub fn eased(&self, name: &str) -> Vec<(u32, u8)> {
+        self.demoted.values().filter(|d| d.name.eq_ignore_ascii_case(name)).map(|d| (d.pid, d.level)).collect()
     }
 
     /// Put everything back, e.g. on exit or pause.

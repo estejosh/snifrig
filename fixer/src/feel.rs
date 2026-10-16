@@ -164,6 +164,23 @@ fn sample() -> Sample {
     Sample { ping_ms, lag_ms, hung }
 }
 
+static APPS: Mutex<Vec<(u32, f64, bool)>> = Mutex::new(Vec::new());
+
+/// Every window on a screen, how fast it answered on the latest round: (pid, ms, not responding).
+pub fn apps() -> Vec<(u32, f64, bool)> { APPS.lock().map(|g| g.clone()).unwrap_or_default() }
+
+fn ping_window(h: isize) -> (f64, bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsHungAppWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL};
+    let h = h as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        if IsHungAppWindow(h) != 0 { return (1000.0, true); }
+        let mut r: usize = 0;
+        let t = Instant::now();
+        let ok = SendMessageTimeoutW(h, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &mut r);
+        (if ok == 0 { 500.0 } else { t.elapsed().as_secs_f64() * 1000.0 }, false)
+    }
+}
+
 /// Start the meter (once). Samples every second; input timing as it happens.
 pub fn start() {
     start_input();
@@ -171,6 +188,12 @@ pub fn start() {
         let s = sample();
         if let Ok(mut g) = RING.lock() { g.push_back(s); while g.len() > KEEP { g.pop_front(); } }
         std::thread::sleep(Duration::from_millis(900));
+    }).ok();
+    // Every window on a screen, every 3 seconds, on its own thread: a hung window cannot stall the loop.
+    std::thread::Builder::new().name("feel-apps".into()).stack_size(64 * 1024).spawn(|| loop {
+        let v: Vec<(u32, f64, bool)> = crate::sys::visible_windows().into_iter().map(|(h, pid)| { let (ms, hung) = ping_window(h); (pid, ms, hung) }).collect();
+        if let Ok(mut g) = APPS.lock() { *g = v; }
+        std::thread::sleep(Duration::from_secs(3));
     }).ok();
 }
 

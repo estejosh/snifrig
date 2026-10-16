@@ -107,6 +107,8 @@ pub struct State {
     pub feel: (String, f64, f64),
     /// Incident memory: "this looks like ..." for the slowdown happening now.
     pub seen_before: String,
+    /// Apps that feel slow right now: (name, ms, usual ms, reason).
+    pub apps_slow: Vec<(String, f64, f64, String)>,
     /// Past slowdowns, newest first: (start, minutes, headline, fixed_by).
     pub incidents: Vec<(f64, f64, String, String)>,
 }
@@ -137,6 +139,7 @@ pub fn load_state(dir: &Path, with_history: bool, old: &State) -> State {
         mem_hist: Vec::new(),
         feel: (gov.get("feel").get("word").str().to_string(), gov.get("feel").get("ping_ms").num().max(gov.get("feel").get("input_ms").num()), gov.get("feel").get("lag_ms").num()),
         seen_before: read_json(dir, "incident-now.json").get("text").str().to_string(),
+        apps_slow: gov.get("apps_slow").arr().iter().map(|a| (a.get("name").str().to_string(), a.get("ms").num(), a.get("usual_ms").num(), a.get("why").str().to_string())).collect(),
         incidents: read(dir, "incidents.jsonl").lines().rev().take(20).filter_map(json::parse)
             .map(|j| (j.get("start").num(), j.get("minutes").num(), j.get("headline").str().to_string(), j.get("fixed_by").str().to_string())).collect(),
     };

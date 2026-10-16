@@ -320,6 +320,17 @@ unsafe fn menu(hwnd: HWND) {
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("Quick fix now\tCtrl+Alt+Shift+S").as_ptr());
         cmds.push(vec!["quick".into()]);
+        // "This app feels slow": the apps showing on a screen, from the fixer's latest round.
+        let g = std::fs::read_to_string(dir().join("governor.json")).unwrap_or_default();
+        let vis: Vec<String> = g.split("\"visible\":[").nth(1).and_then(|s| s.split(']').next()).map(|s| s.split('"').skip(1).step_by(2).map(String::from).collect()).unwrap_or_default();
+        if !vis.is_empty() {
+            let am = CreatePopupMenu();
+            for n in vis.iter().filter(|n| !n.to_lowercase().starts_with("snifrig")).take(15) {
+                AppendMenuW(am, MF_STRING, 200 + cmds.len(), wide(&esc(n.trim_end_matches(".exe"))).as_ptr());
+                cmds.push(vec!["slow".into(), n.clone()]);
+            }
+            AppendMenuW(m, MF_STRING | MF_POPUP, am as usize, wide("An app feels slow").as_ptr());
+        }
         AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("PC feels slow right now").as_ptr());
         cmds.push(vec!["feel".into(), "slow".into()]);
         AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("PC feels fine").as_ptr());
