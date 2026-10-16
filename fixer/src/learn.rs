@@ -33,6 +33,8 @@ pub const MIN_NAME_TRIES: u32 = 3;
 pub const BLOCK_TRIES: u32 = 5;
 pub const BLOCK_PROB: f64 = 0.15;
 pub const PROTECT_UNDOS: usize = 2;
+/// Approvals of the same fix on the same app before snifrig does it without asking.
+pub const EARN_APPROVALS: usize = 2;
 pub const PROTECT_WINDOW_SECS: f64 = 14.0 * 86400.0;
 const KEEP_FEEDBACK_SECS: f64 = 90.0 * 86400.0;
 const LEARN_CAP: u64 = 1024 * 1024;
@@ -331,6 +333,24 @@ impl Learner {
         undos >= PROTECT_UNDOS && undos > rules
     }
 
+    /// How many times the user undid snifrig on this name (kept feedback window).
+    pub fn undos(&self, name: &str) -> usize { let n = name.to_lowercase(); self.feedback.iter().filter(|f| f.signal == "undo" && f.name == n).count() }
+
+    /// Trust ladder: Some(why) once the user approved this fix for this app at least EARN_APPROVALS
+    /// times and it measurably helped at least half the time (the score includes how the PC felt).
+    /// An undo, or a "no" to this fix, after those approvals takes it back to asking. Ending or
+    /// restarting an app never earns trust.
+    pub fn earned(&self, action: &str, name: &str) -> Option<String> {
+        let (a, n) = (action_kind(action).to_lowercase(), name.to_lowercase());
+        if a == "terminate" || a.starts_with("restart") || a == "report" { return None; }
+        let same = |f: &Feedback| f.name == n && action_kind(&f.action).to_lowercase() == a;
+        let last_no = self.feedback.iter().filter(|f| f.name == n && (f.signal == "undo" || (f.signal == "dismiss" && same(f)))).map(|f| f.unix).fold(0.0, f64::max);
+        let yes = self.feedback.iter().filter(|f| f.signal == "approve" && same(f) && f.unix > last_no).count();
+        let st = self.stats.get(&skey("fix", &a, &n))?;
+        (yes >= EARN_APPROVALS && st.successes >= 2 && st.successes * 2 >= st.tries)
+            .then(|| format!("you said yes {} times and it helped {} of {} times", yes, st.successes, st.tries))
+    }
+
     /// The user undid this name at least twice in 14 days and has not answered with a rule.
     pub fn user_protects(&self, name: &str) -> bool { self.user_protects_at(name, self.now) }
 
@@ -548,5 +568,30 @@ mod learn_tests {
         f.start = true;
         f.trigger = "mem".into();
         assert_eq!(Feedback::parse(&f.to_line()), Some(f));
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    fn fb(sig: &str, action: &str, t: f64) -> Feedback { let mut f = Feedback::new(sig, "fix", action, "Git.exe"); f.unix = t; f }
+    #[test]
+    fn trust_is_earned_and_lost() {
+        let mut l = Learner::new();
+        l.stats.insert(skey("fix", "lower-priority", "git.exe"), Stat { tries: 3, successes: 2, mean_imp: 0.3 });
+        l.add_feedback(fb("approve", "lower-priority", 10.0));
+        assert!(l.earned("lower-priority", "git.exe").is_none(), "one yes is not enough");
+        l.add_feedback(fb("approve", "lower-priority", 20.0));
+        assert!(l.earned("lower-priority", "GIT.EXE").is_some());
+        assert!(l.earned("terminate", "git.exe").is_none(), "ending never goes automatic");
+        l.add_feedback(fb("dismiss", "trim", 30.0));
+        assert!(l.earned("lower-priority", "git.exe").is_some(), "a no to another fix does not count");
+        l.add_feedback(fb("undo", "demote", 40.0));
+        assert!(l.earned("lower-priority", "git.exe").is_none(), "an undo sends it back to asking");
+        l.add_feedback(fb("approve", "lower-priority", 50.0));
+        l.add_feedback(fb("approve", "lower-priority", 60.0));
+        assert!(l.earned("lower-priority", "git.exe").is_some(), "and it can be earned back");
+        l.stats.get_mut(&skey("fix", "lower-priority", "git.exe")).unwrap().tries = 6;
+        assert!(l.earned("lower-priority", "git.exe").is_none(), "stops when it stops helping");
     }
 }

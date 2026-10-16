@@ -141,7 +141,9 @@ pub enum Step {
 
 /// One process as seen this tick.
 #[derive(Clone, Debug)]
-pub struct Seen { pub key: Key, pub name: String, pub core_pct: f64, pub foreground: bool, pub protected: bool, pub windowed: bool }
+pub struct Seen { pub key: Key, pub name: String, pub core_pct: f64, pub foreground: bool, pub protected: bool, pub windowed: bool,
+    /// Has a window showing on a monitor (another screen, or beside the app in front): you can see it, so it stays smooth.
+    pub onscreen: bool }
 
 /// Counters that carry between ticks.
 #[derive(Clone, Debug, Default)]
@@ -204,6 +206,8 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
             // A windowless helper (a browser tab, a renderer) of the app in front may stay reined in, but only lightly.
             Some(s) if fg_names.contains(&s.name.as_str()) && d.level > 1 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is in front, so its busy background part is only kept in efficiency mode", d.name) }),
+            Some(s) if s.onscreen && d.level > 1 =>
+                out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is showing on a screen, so it is only kept in efficiency mode", d.name) }),
             Some(_) if mood.calm_with(t) && mood.calm_ticks % t.restore_every.max(1) == 0 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: d.level - 1, reason: format!("CPU is calm again ({:.0}%)", total_pct) }),
             _ => {}
@@ -219,7 +223,8 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
         .filter(|s| { let n = s.name.to_lowercase(); !hints.protect.contains(&n) && !hints.blocked.contains(&n) })
         .filter(|s| {
             let mut cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level);
-            if fg_names.contains(&s.name.as_str()) { cap = cap.min(1); }
+            // Helpers of the app in front, and apps showing on a screen, only get efficiency mode.
+            if fg_names.contains(&s.name.as_str()) || s.onscreen { cap = cap.min(1); }
             demoted.get(&s.key).map_or(0, |d| d.level) < cap
         })
         .collect();
@@ -279,6 +284,7 @@ pub struct Governor {
     /// Lowercase image name of the game performance mode is running for, if any.
     pub game: Option<String>,
     windowed: HashSet<u32>,
+    onscreen: HashSet<u32>,
     win_at: f64,
     /// Set by the watch loop from the feel meter before each tick.
     pub feels_slow: bool,
@@ -294,7 +300,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0 }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), onscreen: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0 }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -316,7 +322,7 @@ impl Governor {
     pub fn tick(&mut self, now: f64, act: bool) -> Vec<Change> {
         let procs = sys::snapshot(&mut self.buf);
         let fg = sys::foreground_pid();
-        if now - self.win_at >= 5.0 { self.windowed = sys::window_pids(); self.win_at = now; }
+        if now - self.win_at >= 5.0 { (self.windowed, self.onscreen) = sys::windows(); self.win_at = now; }
         let mut seen = Vec::with_capacity(procs.len());
         let mut busy_sum = 0.0;
         let mut next_prev = HashMap::with_capacity(procs.len());
@@ -334,7 +340,7 @@ impl Governor {
             // Cheap filter before the protected check, which may read a command line.
             let protected = if core_pct >= self.tuning.min_core_pct || self.demoted.contains_key(&key) { self.protected(p) } else { true };
             let protected = protected || self.undone.contains(&key);
-            seen.push(Seen { key, name: p.name.clone(), core_pct, foreground, protected, windowed: self.windowed.contains(&p.pid) });
+            seen.push(Seen { key, name: p.name.clone(), core_pct, foreground, protected, windowed: self.windowed.contains(&p.pid), onscreen: self.onscreen.contains(&p.pid) });
         }
         self.prev = next_prev;
         self.protected_cache.retain(|k, _| self.prev.contains_key(k));
@@ -343,7 +349,9 @@ impl Governor {
         self.total_pct = total_pct;
         self.mood.update(total_pct, &self.tuning, self.game.is_some(), self.feels_slow);
         self.fg_cpu_pct = seen.iter().find(|s| s.foreground).map(|s| s.core_pct);
-        self.dwm_pct = seen.iter().filter(|s| s.name.eq_ignore_ascii_case("dwm.exe")).map(|s| s.core_pct).sum();
+        let dwm_now: f64 = seen.iter().filter(|s| s.name.eq_ignore_ascii_case("dwm.exe")).map(|s| s.core_pct).sum();
+        // Smoothed over ~10 s: a one-second redraw burst is normal, a pegged compositor is not.
+        self.dwm_pct = self.dwm_pct * 0.9 + dwm_now * 0.1;
         let mut top: Vec<(String, f64)> = seen.iter().filter(|s| s.core_pct >= 5.0).map(|s| (s.name.to_lowercase(), s.core_pct)).collect();
         top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         top.truncate(5);
@@ -404,6 +412,22 @@ impl Governor {
         out
     }
 
+    /// Take over a fix the trust ladder runs by itself, so it behaves like any other demotion:
+    /// restored the moment the app comes to the front, undoable, put back when snifrig stops.
+    /// None = nothing to do (gone, in front, undone by you, or already that low).
+    pub fn adopt(&mut self, pid: u32, level: u8, reason: &str, act: bool) -> Option<Change> {
+        let p = self.last_procs.iter().find(|p| p.pid == pid)?;
+        let (key, name) = ((p.pid, p.created), p.name.clone());
+        if Some(pid) == sys::foreground_pid() || self.undone.contains(&key) { return None; }
+        let level = if self.onscreen.contains(&pid) { level.min(1) } else { level };
+        let from = self.demoted.get(&key).map_or(0, |d| d.level);
+        if from >= level { return None; }
+        let orig = self.demoted.get(&key).map(|d| d.orig_priority).or_else(|| sys::get_priority(pid)).unwrap_or(sys::NORMAL);
+        let result = if act { apply_level(pid, from, level, orig) } else { Ok(()) };
+        if result.is_ok() { self.demoted.insert(key, Demotion { pid, created: key.1, name: name.clone(), level, orig_priority: orig, since: crate::now_unix(), reason: reason.into() }); }
+        Some(Change { pid, name, from, to: level, reason: reason.into(), result })
+    }
+
     /// Put everything back, e.g. on exit or pause.
     pub fn restore_all(&mut self, act: bool) -> Vec<Change> {
         let all: Vec<(Key, Demotion)> = self.demoted.drain().collect();
@@ -417,7 +441,7 @@ impl Governor {
 #[cfg(test)]
 mod gov_tests {
     use super::*;
-    fn s(pid: u32, name: &str, pct: f64) -> Seen { Seen { key: (pid, 1), name: name.into(), core_pct: pct, foreground: false, protected: false, windowed: false } }
+    fn s(pid: u32, name: &str, pct: f64) -> Seen { Seen { key: (pid, 1), name: name.into(), core_pct: pct, foreground: false, protected: false, windowed: false, onscreen: false } }
 
     #[test]
     fn busy_tab_of_front_app_is_reined_in_lightly() {
@@ -433,6 +457,22 @@ mod gov_tests {
         assert!(decide(95.0, &m, &[fg.clone(), tab.clone()], &d).is_empty(), "already at the cap for a front app's helper, no flapping");
         d.get_mut(&(2, 1)).unwrap().level = 3;
         assert!(matches!(&decide(95.0, &m, &[fg, tab], &d)[0], Step::Restore { to_level: 1, .. }));
+    }
+
+    #[test]
+    fn app_on_another_screen_only_gets_efficiency_mode() {
+        let m = Mood { busy_ticks: BUSY_TICKS, calm_ticks: 0 };
+        let mut fg = s(1, "claude.exe", 10.0); fg.foreground = true; fg.windowed = true; fg.onscreen = true;
+        let mut game = s(2, "legendsofidleon.exe", 150.0); game.windowed = true; game.onscreen = true;
+        let mut hidden = s(3, "comet.exe", 140.0); hidden.windowed = true;
+        let mut d = HashMap::new();
+        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d.insert((3, 1), Demotion { pid: 3, created: 1, name: "comet.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        let steps = decide(95.0, &m, &[fg.clone(), game.clone(), hidden.clone()], &d);
+        assert_eq!(steps.len(), 1, "{:?}", steps);
+        assert!(matches!(&steps[0], Step::Demote { key: (3, 1), to_level: 2, .. }), "the hidden app goes further, the one on screen stays at 1");
+        d.get_mut(&(2, 1)).unwrap().level = 3;
+        assert!(decide(95.0, &m, &[fg, game, hidden], &d).iter().any(|x| matches!(x, Step::Restore { key: (2, 1), to_level: 1, .. })), "dragged back on screen: back to efficiency only");
     }
 
     #[test]

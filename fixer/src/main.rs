@@ -70,10 +70,13 @@ fn ago(secs: f64) -> String {
     if s < 7200.0 { format!("{:.0} minutes", (s / 60.0).max(1.0)) } else if s < 172800.0 { format!("{:.0} hours", s / 3600.0) } else { format!("{:.0} days", s / 86400.0) }
 }
 
-fn process_once(dir: &Path) -> usize { process_once_ex(dir).0 }
+fn process_once(dir: &Path) -> usize { process_once_ex(dir, None).0 }
 
 /// Like process_once, and also returns what ran: (action kind, lowercase name, metric it was meant to help).
-fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
+/// With `ctx` (the watch loop's learner and governor, and whether it acts), fixes the user has
+/// taught snifrig to trust run without asking; a lower priority is handed to the governor so the
+/// app is restored the moment you switch to it.
+fn process_once_ex(dir: &Path, mut ctx: Option<(&Learner, &mut snifrig_fix::governor::Governor, bool)>) -> (usize, Vec<(String, String, Trigger)>) {
     let (alerts, off) = ledger::new_alerts(dir, ledger::read_offset(dir));
     let (listen, mem, now) = if alerts.is_empty() { (Default::default(), snifrig_fix::judge::Memory::load(Path::new("")), now_unix()) } else { (snifrig_fix::judge::listening_pids(), snifrig_fix::judge::Memory::load(dir), now_unix()) };
     let mut acted = 0;
@@ -139,6 +142,19 @@ fn process_once_ex(dir: &Path) -> (usize, Vec<(String, String, Trigger)>) {
                     acted += 1;
                 }
                 Verdict::Queue => {
+                    let learned = ctx.as_ref().and_then(|(l, _, _)| l.earned(&label, &t.name));
+                    if let (Some(trust), Some((_, gov, act))) = (learned, ctx.as_mut()) {
+                        let r = if action == Action::LowerPriority {
+                            match gov.adopt(t.pid, 2, &format!("learned from you: {}", trust), *act) {
+                                Some(c) => c.result.map(|_| "eased it: efficiency mode and below-normal priority, back to full speed the moment you switch to it".to_string()),
+                                None => continue,
+                            }
+                        } else { actions::run(&action, t) };
+                        let (status, note) = match &r { Ok(m) => ("done", format!("did it without asking because {}: {}; undo it in the app if that was wrong; {}", trust, m, why)), Err(e) => ("failed", format!("learned fix: {}", e)) };
+                        ledger::record(dir, a, &action, Some(t), status, &note);
+                        if r.is_ok() { ran.push((learn::action_kind(&label), t.name.to_lowercase(), learn::trigger_for(&label, &a.msg))); acted += 1; }
+                        continue;
+                    }
                     if let Some(id) = ledger::queue(dir, a, &action, t, &why) {
                         ledger::record(dir, a, &action, Some(t), "queued", &format!("pending id {}; {}", id, why));
                     }
@@ -285,6 +301,9 @@ fn state_json(gov: &snifrig_fix::governor::Governor, acting: bool, sugg: &[(Stri
 }
 
 /// The watch loop: alerts every 30 ticks, governor + rules every tick (1 s).
+/// Times a background program is eased in a week before snifrig makes it a rule by itself.
+const AUTO_RULE_AFTER: usize = 20;
+
 fn watch(dir: &Path) {
     use snifrig_fix::governor::Governor;
     let extra = ledger::read_list(dir, "fix-deny.txt");
@@ -326,7 +345,8 @@ fn watch(dir: &Path) {
     loop {
         if stop.exists() { let _ = std::fs::remove_file(&stop); break; }
         if n % 30 == 0 {
-            let (_, ran) = process_once_ex(dir);
+            let acting = gov.acting;
+            let (_, ran) = process_once_ex(dir, Some((&learner, &mut gov, acting)));
             if !ran.is_empty() {
                 let m = metrics(&gov);
                 for (action, name, trig) in ran { learner.start("fix", &action, &name, trig, now_unix(), m.clone()); }
@@ -350,7 +370,18 @@ fn watch(dir: &Path) {
                 sugg = rules::suggestions(dir);
             }
         }
-        if n > 0 && n % 60 == 0 { sugg = rules::suggestions(dir); }
+        if n > 0 && n % 60 == 0 {
+            sugg = rules::suggestions(dir);
+            // Learned rules: a background program (no window, not in use) eased again and again all
+            // week, never undone, just always runs in the background from now on.
+            for (name, count) in sugg.clone() {
+                if count < AUTO_RULE_AFTER || learner.undos(&name) > 0 || snifrig_fix::inuse::why_in_use(&name, now_unix()).is_some() { continue; }
+                if rules::add(dir, &format!("{} background=yes", name)).is_ok() {
+                    learn::append_feedback(dir, &Feedback::new("rule_added", "rule", "add", &name));
+                    note(dir, "learn:rule", "done", &format!("{} was eased {} times this week and you never undid it, so it now always runs in the background (a rule was added; remove it on the App rules page)", name, count));
+                }
+            }
+        }
         let mode = ledger::read_mode(dir);
         let paused = now_unix() < ledger::paused_until(dir);
         let mut act = false;

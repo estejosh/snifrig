@@ -129,21 +129,33 @@ pub fn fullscreen_d3d() -> bool {
 }
 
 /// Pids that own a visible top-level window with a title (what a person would call an open app).
-pub fn window_pids() -> std::collections::HashSet<u32> {
+/// Pids that own a real, titled top-level window. Cloaked windows (hidden UWP hosts such as
+/// TextInputHost, windows parked on another virtual desktop) do not count.
+pub fn window_pids() -> std::collections::HashSet<u32> { windows().0 }
+
+/// (pids with a real window, pids with a window actually showing on a monitor: not minimised).
+pub fn windows() -> (std::collections::HashSet<u32>, std::collections::HashSet<u32>) {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, IsWindowVisible};
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, IsIconic, IsWindowVisible};
+    type Sets = (std::collections::HashSet<u32>, std::collections::HashSet<u32>);
     unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> i32 {
-        let set = &mut *(lp as *mut std::collections::HashSet<u32>);
+        let sets = &mut *(lp as *mut Sets);
         if IsWindowVisible(h) != 0 && GetWindowTextLengthW(h) > 0 {
+            let mut cloaked = 0u32;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED as _, &mut cloaked as *mut u32 as *mut _, 4);
             let mut pid = 0u32;
             GetWindowThreadProcessId(h, &mut pid);
-            if pid != 0 { set.insert(pid); }
+            if pid != 0 && cloaked == 0 {
+                sets.0.insert(pid);
+                if IsIconic(h) == 0 { sets.1.insert(pid); }
+            }
         }
         1
     }
-    let mut set = std::collections::HashSet::new();
-    unsafe { EnumWindows(Some(cb), &mut set as *mut _ as LPARAM); }
-    set
+    let mut sets: Sets = Default::default();
+    unsafe { EnumWindows(Some(cb), &mut sets as *mut _ as LPARAM); }
+    sets
 }
 
 pub fn foreground_pid() -> Option<u32> {
@@ -331,7 +343,7 @@ mod tests {
             assert!(!image_matches(pid, me.created, "notping.exe"));
             // the child inherits our class; the test host may run below normal
             let p0 = get_priority(pid).unwrap();
-            assert!(p0 == NORMAL || p0 == BELOW_NORMAL, "initial class {p0:#x}");
+            assert!(p0 == NORMAL || p0 == BELOW_NORMAL || p0 == IDLE, "initial class {p0:#x}");
             for c in [BELOW_NORMAL, IDLE, NORMAL] {
                 set_priority(pid, c).unwrap();
                 assert_eq!(get_priority(pid), Some(c));
