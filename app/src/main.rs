@@ -406,7 +406,7 @@ impl App {
             if !w.is_empty() && w != "unknown" && self.state.fixer_live {
                 let c = match w.as_str() { "snappy" => GOOD, "ok" => BLUE, "sluggish" => WARN, _ => BAD };
                 chip(ui, &format!("feels {}", w), c);
-                ui.label(RichText::new(format!("{:.0} ms", ping + lag)).size(12.0).color(MUTED)).on_hover_text("Feel meter: how long the app in front takes to answer, plus how late Windows wakes programs up. Under 30 ms feels instant; over 80 ms you notice.");
+                ui.label(RichText::new(format!("{:.0} ms", ping + lag)).size(12.0).color(MUTED)).on_hover_text("Feel meter: how late your mouse and keys reach programs, how long the app in front takes to answer, and whether the desktop itself is behind. Under 30 ms feels instant; over 50 ms you notice.");
             }
             if let Some(g) = &self.state.game { chip(ui, &format!("Performance mode: {}", g), ACCENT); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

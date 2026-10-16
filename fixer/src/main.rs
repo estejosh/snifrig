@@ -278,7 +278,7 @@ fn state_json(gov: &snifrig_fix::governor::Governor, acting: bool, sugg: &[(Stri
     let demoted: Vec<String> = d.iter().map(|x| format!("{{\"pid\":{},\"name\":\"{}\",\"level\":{},\"reason\":\"{}\",\"since\":{:.0}}}", x.pid, snifrig_fix::json::esc(&x.name), x.level, snifrig_fix::json::esc(&x.reason), x.since)).collect();
     let sg: Vec<String> = sugg.iter().map(|(n, c)| format!("{{\"name\":\"{}\",\"count\":{}}}", snifrig_fix::json::esc(n), c)).collect();
     let f = snifrig_fix::feel::recent(10);
-    let feel = format!("{{\"word\":\"{}\",\"ping_ms\":{:.0},\"lag_ms\":{:.0},\"hung\":{},\"desktop_pct\":{:.0}}}", snifrig_fix::feel::word_with(&f, gov.dwm_pct), f.ping_ms, f.lag_ms, f.hung, gov.dwm_pct);
+    let feel = format!("{{\"word\":\"{}\",\"ping_ms\":{:.0},\"lag_ms\":{:.0},\"hung\":{},\"desktop_pct\":{:.0},\"input_ms\":{:.0},\"input_events\":{}}}", snifrig_fix::feel::word_with(&f, gov.dwm_pct), f.ping_ms, f.lag_ms, f.hung, gov.dwm_pct, f.input_ms, f.input_events);
     let tail = format!("\"busy\":{},\"game\":{},\"busy_pct\":{:.0},\"demoted\":[{}],\"suggestions\":[{}]}}\n", gov.mood.busy_with(&gov.tuning), game, gov.tuning.busy_pct, demoted.join(","), sg.join(","));
     let full = format!("{{\"unix\":{:.0},\"acting\":{},\"cpu\":{:.0},\"feel\":{},{}", now_unix(), acting, gov.total_pct, feel, tail);
     (full, format!("{}{}", acting, tail))

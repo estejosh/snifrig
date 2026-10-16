@@ -309,8 +309,8 @@ fn status(cx: &Ctx) -> String {
     }
     if let Some(g) = &gv {
         if let Some(f) = g.get("feel") {
-            o += &format!("How it feels (feel meter): {} (front app answers in {:.0} ms, scheduling lag {:.0} ms{})\n",
-                gs(f, "word"), gn(f, "ping_ms").unwrap_or(0.0), gn(f, "lag_ms").unwrap_or(0.0), if matches!(f.get("hung"), Some(J::Bool(true))) { ", front window not responding" } else { "" });
+            o += &format!("How it feels (feel meter): {} (mouse/keyboard input arrives {:.0} ms late over {} events, front app answers in {:.0} ms, scheduling lag {:.0} ms, desktop compositor {:.0}% of a core{})\n",
+                gs(f, "word"), gn(f, "input_ms").unwrap_or(0.0), gn(f, "input_events").unwrap_or(0.0), gn(f, "ping_ms").unwrap_or(0.0), gn(f, "lag_ms").unwrap_or(0.0), gn(f, "desktop_pct").unwrap_or(0.0), if matches!(f.get("hung"), Some(J::Bool(true))) { ", front window not responding" } else { "" });
         }
     }
     if let Some(i) = read_json(cx, "incident-now.json") {
