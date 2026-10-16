@@ -1220,6 +1220,37 @@ impl App {
         });
         ui.add_space(8.0);
         card(ui, |ui| {
+            section(ui, "Phone remote", "A Quick fix button and your approvals on your phone, over your own Wi-Fi. Nothing goes through the internet. Off until you turn it on.");
+            let cfg = std::fs::read_to_string(self.dir.join("phone.json")).ok();
+            let key = cfg.as_deref().and_then(|c| c.split("\"key\":\"").nth(1)).and_then(|s| s.split('"').next()).map(String::from);
+            match key {
+                None => {
+                    ui.add_enabled_ui(self.state.has_key, |ui| {
+                        if ui.add(egui::Button::new(RichText::new("Turn on").color(Color32::BLACK)).fill(ACCENT)).clicked() {
+                            self.run("snifrig-fix.exe", vec!["phone".into(), "on".into()], "Phone remote is on. Scan the code with your phone's camera.");
+                        }
+                    });
+                }
+                Some(k) => {
+                    let ip = lan_ip().unwrap_or_else(|| "this-pc".into());
+                    let url = format!("http://{}:8792/?k={}", ip, k);
+                    ui.horizontal(|ui| {
+                        qr(ui, &url, 190.0);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Scan with your phone's camera, then add the page to your home screen.").color(TEXT));
+                            ui.label(RichText::new("Your phone must be on the same Wi-Fi. If Windows asks whether snifrig fix may use private networks, allow it.").size(12.5).color(MUTED));
+                            ui.add_space(4.0);
+                            if ui.small_button("Copy link").clicked() { ui.ctx().copy_text(url.clone()); self.say("Link copied.", true); }
+                            ui.add_space(4.0);
+                            if ui.button("Turn off").clicked() { self.run("snifrig-fix.exe", vec!["phone".into(), "off".into()], "Phone remote is off."); }
+                        });
+                    });
+                }
+            }
+            ui.label(RichText::new("Quick fix on this PC: Ctrl+Alt+Shift+S, or the tray menu. It gives you the PC back when it crawls.").size(12.5).color(MUTED));
+        });
+        ui.add_space(8.0);
+        card(ui, |ui| {
             section(ui, "Data folder", "Everything snifrig knows stays here, on this PC.");
             ui.horizontal(|ui| {
                 ui.label(RichText::new(self.dir.to_string_lossy()).monospace().color(MUTED));
@@ -1231,6 +1262,30 @@ impl App {
             ui.label(RichText::new(format!("snifrig {} \u{b7} snifrig snif is free, snifrig fix is paid \u{b7} UFL 3.7", env!("CARGO_PKG_VERSION"))).color(MUTED));
         });
     }
+}
+
+/// This PC's address on the local network (no packet is sent: a UDP socket only picks a route).
+fn lan_ip() -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.168.0.1:9").ok()?;
+    s.local_addr().ok().map(|a| a.ip().to_string())
+}
+
+/// Draw a QR code for `text`, `size` points square, with a white quiet zone so phones read it.
+fn qr(ui: &mut egui::Ui, text: &str, size: f32) {
+    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else { return };
+    let n = code.width();
+    let colors = code.to_colors();
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(6), Color32::WHITE);
+    let cell = size / (n as f32 + 8.0);
+    let o = rect.min + Vec2::splat(cell * 4.0);
+    for y in 0..n { for x in 0..n {
+        if colors[y * n + x] == qrcode::Color::Dark {
+            p.rect_filled(egui::Rect::from_min_size(o + Vec2::new(x as f32 * cell, y as f32 * cell), Vec2::splat(cell + 0.3)), CornerRadius::ZERO, Color32::BLACK);
+        }
+    } }
 }
 
 /// Days until the installed key ends, from the status text ("valid until YYYY-MM-DD").

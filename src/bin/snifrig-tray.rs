@@ -318,6 +318,8 @@ unsafe fn menu(hwnd: HWND) {
         cmds.clear();
         // Teach it: your word beats the meter, and every answer is kept for learning.
         AppendMenuW(m, MF_SEPARATOR, 0, null());
+        AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("Quick fix now\tCtrl+Alt+Shift+S").as_ptr());
+        cmds.push(vec!["quick".into()]);
         AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("PC feels slow right now").as_ptr());
         cmds.push(vec!["feel".into(), "slow".into()]);
         AppendMenuW(m, MF_STRING, 200 + cmds.len(), wide("PC feels fine").as_ptr());
@@ -378,6 +380,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU { menu(hwnd); } else if ev == WM_LBUTTONDBLCLK { if !open_app() { flyout::show(dir()); } } else if ev == WM_LBUTTONUP { flyout::show(dir()); }
             0
         }
+        WM_HOTKEY => { run_fix(&["quick"]); 0 }
         WM_TIMER => {
             let flag = dir().join("stop-tray");
             if flag.exists() { let _ = std::fs::remove_file(&flag); DestroyWindow(hwnd); } else { watchdog(); refresh(hwnd, false); }
@@ -448,6 +451,8 @@ fn main() {
         TASKBAR_MSG = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         refresh(hwnd, true);
         SetTimer(hwnd, 1, 15000, None);
+        // Ctrl+Alt+Shift+S: quick fix, for when the mouse barely moves but the keyboard still works.
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(hwnd, 1, 0x0002 | 0x0001 | 0x0004 | 0x4000, 'S' as u32);
         let fly = a.iter().any(|x| x == "--flyout");
         if fly { flyout::show(dir()); }
         else if std::env::var("SNIFRIG_NO_NOTICE_TEST").as_deref() != Ok("1") { snifrig::notice::show(); } // UFL 2D Notice, once per tray run

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="theme-color" content="#111317"><title>snifrig</title>
+<style>
+:root{--bg:#111317;--card:#1c2026;--b:#2c323a;--t:#e4e7eb;--m:#8a939e;--a:#e8a33d;--g:#4cc38a;--bad:#e5534b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px;padding-top:max(16px,env(safe-area-inset-top))}
+h1{font-size:20px;margin:0 0 2px}.sub{color:var(--m);font-size:14px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--b);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:10px}.stat{flex:1}.stat b{display:block;font-size:26px}.stat span{color:var(--m);font-size:13px}
+#quick{width:100%;padding:22px;font-size:22px;font-weight:700;border:0;border-radius:16px;background:var(--a);color:#111;margin:4px 0 12px}
+#quick:active{transform:scale(.98)}#quick:disabled{opacity:.6}
+.p{border-top:1px solid var(--b);padding-top:10px;margin-top:10px}.p:first-child{border:0;margin:0;padding:0}
+.p small{color:var(--m);display:block;margin:4px 0 8px}button.s{padding:10px 16px;border-radius:10px;border:1px solid var(--b);background:#232830;color:var(--t);font-size:15px;margin-right:8px}
+button.ok{background:var(--a);color:#111;border:0}#msg{color:var(--g);min-height:20px;font-size:14px}.dot{display:inline-block;width:9px;height:9px;border-radius:5px;margin-right:6px}
+</style></head><body>
+<h1>snifrig</h1><div class="sub" id="head"><span class="dot" id="dot"></span><span id="state">connecting...</span></div>
+<button id="quick">Quick fix</button><div id="msg"></div>
+<div class="card row"><div class="stat"><b id="cpu">-</b><span>CPU</span></div><div class="stat"><b id="feel">-</b><span>feels</span></div><div class="stat"><b id="held">-</b><span>eased</span></div></div>
+<div class="card"><div style="font-weight:600;margin-bottom:8px">Waiting for your OK</div><div id="pend" style="color:var(--m)">Nothing to decide.</div></div>
+<script>
+const k=new URLSearchParams(location.search).get('k');const q=s=>document.getElementById(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function api(p,post){const r=await fetch('/api/'+p+(p.includes('?')?'&':'?')+'k='+encodeURIComponent(k),{method:post?'POST':'GET'});if(!r.ok)throw new Error(await r.text());return r.json()}
+async function load(){try{const s=await api('status');const g=s.gov||{};q('cpu').textContent=(g.cpu??'-')+'%';q('feel').textContent=(g.feel&&g.feel.word)||'-';q('held').textContent=(g.demoted||[]).length;
+const live=s.live;q('dot').style.background=live?'var(--g)':'var(--bad)';q('state').textContent=live?'connected to '+s.pc:'fixer not running';
+const it=(s.pending&&s.pending.items)||[];q('pend').innerHTML=it.length?it.map(p=>`<div class="p"><b>${esc(p.name)}</b> &middot; ${esc(p.action)}<small>${esc(p.why||p.msg||'')}</small><button class="s ok" onclick="act('approve','${esc(p.id)}')">Approve</button><button class="s" onclick="act('dismiss','${esc(p.id)}')">Dismiss</button></div>`).join(''):'Nothing to decide.'}
+catch(e){q('dot').style.background='var(--bad)';q('state').textContent='cannot reach your PC'}}
+async function act(a,id){try{const r=await api(a+'?id='+encodeURIComponent(id),1);q('msg').textContent=r.msg}catch(e){q('msg').textContent=e.message}load()}
+q('quick').onclick=async()=>{q('quick').disabled=true;try{const r=await api('quick',1);q('msg').textContent=r.msg}catch(e){q('msg').textContent=e.message}setTimeout(()=>{q('quick').disabled=false;load()},2500)};
+load();setInterval(load,3000);
+</script></body></html>

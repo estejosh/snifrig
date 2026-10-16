@@ -304,6 +304,10 @@ pub struct Governor {
     /// What you told snifrig from the tray: Some(true) the PC feels slow (ease background apps
     /// now, even below the CPU threshold), Some(false) it feels fine (hold off).
     pub user_says: Option<bool>,
+    /// Quick fix: until this time, a calm CPU does not bring eased apps back (they come back when you switch to them).
+    pub hold_until: f64,
+    /// Share of a core each pid used on the latest tick.
+    last_pct: HashMap<u32, f64>,
 }
 
 /// One change made, for the ledger and the tray.
@@ -313,7 +317,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), onscreen: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0, user_says: None }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), onscreen: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0, user_says: None, hold_until: 0.0, last_pct: HashMap::new() }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -355,6 +359,7 @@ impl Governor {
             let protected = protected || self.undone.contains(&key);
             seen.push(Seen { key, name: p.name.clone(), core_pct, foreground, protected, windowed: self.windowed.contains(&p.pid), onscreen: self.onscreen.contains(&p.pid) });
         }
+        self.last_pct = seen.iter().map(|s| (s.key.0, s.core_pct)).collect();
         self.prev = next_prev;
         self.protected_cache.retain(|k, _| self.prev.contains_key(k));
         self.undone.retain(|k| self.prev.contains_key(k));
@@ -400,6 +405,7 @@ impl Governor {
                     changes.push(Change { pid: key.0, name, from, to: to_level, reason, result });
                 }
                 Step::Restore { key, name, to_level, reason } => {
+                    if now < self.hold_until && reason.starts_with("CPU is calm") { continue; }
                     let Some(d) = self.demoted.get(&key).cloned() else { continue };
                     let result = if !act { Ok(()) } else if !sys::image_matches(key.0, key.1, &name) { Err("pid reused".into()) } else { apply_level(key.0, d.level, to_level, d.orig_priority) };
                     if to_level == 0 { self.demoted.remove(&key); } else if let Some(e) = self.demoted.get_mut(&key) { e.level = to_level; }
@@ -444,6 +450,29 @@ impl Governor {
         let result = if act { apply_level(pid, from, level, orig) } else { Ok(()) };
         if result.is_ok() { self.demoted.insert(key, Demotion { pid, created: key.1, name: name.clone(), level, orig_priority: orig, since: crate::now_unix(), reason: reason.into() }); }
         Some(Change { pid, name, from, to: level, reason: reason.into(), result })
+    }
+
+    /// Quick fix, for a full slowdown: every busy background app goes to the bottom of the ladder
+    /// at once (apps showing on a screen only to efficiency mode), the app in front and snifrig
+    /// itself are left alone, and nothing comes back on its own for `hold_secs`. Undo and
+    /// switching to an app work as always.
+    pub fn quick(&mut self, act: bool, hold_secs: f64) -> Vec<Change> {
+        let fg = sys::foreground_pid();
+        let fg_name = fg.and_then(|p| self.last_procs.iter().find(|x| x.pid == p)).map(|p| p.name.to_lowercase());
+        let on_names: HashSet<String> = self.last_procs.iter().filter(|p| self.onscreen.contains(&p.pid)).map(|p| p.name.to_lowercase()).collect();
+        let me = std::process::id();
+        let busy: Vec<Proc> = self.last_procs.iter()
+            .filter(|p| p.pid > 4 && p.pid != me && self.last_pct.get(&p.pid).copied().unwrap_or(0.0) >= 2.0)
+            .filter(|p| { let n = p.name.to_lowercase(); Some(n.clone()) != fg_name && !n.starts_with("snifrig") })
+            .cloned().collect();
+        let mut out = Vec::new();
+        for p in busy {
+            if self.protected(&p) { continue; }
+            let level = if on_names.contains(&p.name.to_lowercase()) { 1 } else { 3 };
+            if let Some(c) = self.adopt(p.pid, level, "quick fix: you asked for your PC back", act) { out.push(c); }
+        }
+        self.hold_until = crate::now_unix() + hold_secs;
+        out
     }
 
     /// Put everything back, e.g. on exit or pause.

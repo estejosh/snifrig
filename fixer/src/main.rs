@@ -430,6 +430,121 @@ fn stop_brain(dir: &Path) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("stop command exited with {}", st)) }
 }
 
+/// Run a quick-fix request (from the tray, the hotkey, the phone or `snifrig-fix quick`).
+fn run_quick(dir: &Path, gov: &mut snifrig_fix::governor::Governor, act: bool) {
+    let changes = gov.quick(act, 120.0);
+    let n = changes.iter().filter(|c| c.result.is_ok()).count();
+    let names: Vec<String> = changes.iter().filter(|c| c.result.is_ok()).take(6).map(|c| c.name.clone()).collect();
+    let mut freed = 0;
+    if act {
+        // Free memory of the eased apps nobody is using; harmless, nothing closes.
+        for c in changes.iter().filter(|c| c.result.is_ok()) {
+            if snifrig_fix::inuse::why_in_use(&c.name, now_unix()).is_some() { continue; }
+            if let Some(t) = proc::target(c.pid) { if actions::run(&Action::Trim, &t).is_ok() { freed += 1; } }
+        }
+    }
+    log_gov(dir, changes, act);
+    if gov.dwm_pct >= 50.0 { offer_desktop_restart(dir, gov.dwm_pct, now_unix()); }
+    learn::append_feedback(dir, &Feedback::new("feel_slow", "feel", "", ""));
+    let msg = format!("quick fix: eased {} busy background app{}{}, freed memory of {}; holding for 2 minutes, then easing back. Undo any of them in the app.",
+        n, if n == 1 { "" } else { "s" }, if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) }, freed);
+    let alert = snifrig_fix::Alert { t: String::new(), key: "fix:quick".into(), msg: msg.clone() };
+    ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
+    let _ = std::fs::write(dir.join("quick-result.txt"), &msg);
+}
+
+/// Phone remote: a small page on this PC's Wi-Fi, opened from the phone with a private key in
+/// the link (`phone on` makes it, `phone off` ends it). Off unless you turn it on. Plain HTTP on
+/// your own network for now; the key is checked on every request.
+const PHONE_PORT: u16 = 8792;
+const PHONE_PAGE: &str = include_str!("phone.html");
+
+fn random_hex(n: usize) -> String {
+    #[link(name = "advapi32", kind = "raw-dylib")]
+    extern "system" { #[link_name = "SystemFunction036"] fn RtlGenRandom(buf: *mut u8, len: u32) -> u8; }
+    let mut b = vec![0u8; n];
+    unsafe { RtlGenRandom(b.as_mut_ptr(), n as u32); }
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+/// This PC's address on the local network (no packet is sent: a UDP socket only picks a route).
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.168.0.1:9").ok()?;
+    s.local_addr().ok().map(|a| a.ip())
+}
+
+fn phone_cmd(dir: &Path, on: bool) -> Result<String, String> {
+    let f = dir.join("phone.json");
+    if !on { let _ = std::fs::remove_file(&f); return Ok("phone remote is off".into()); }
+    let key = snifrig_fix::json::str_field(&std::fs::read_to_string(&f).unwrap_or_default(), "key").unwrap_or_else(|| random_hex(16));
+    std::fs::write(&f, format!("{{\"key\":\"{}\",\"port\":{}}}", key, PHONE_PORT)).map_err(|e| e.to_string())?;
+    let ip = lan_ip().map(|i| i.to_string()).unwrap_or_else(|| "this-pc".into());
+    Ok(format!("http://{}:{}/?k={}", ip, PHONE_PORT, key))
+}
+
+fn phone_serve(dir: PathBuf) {
+    use std::io::{Read, Write};
+    std::thread::spawn(move || {
+        let mut listener: Option<std::net::TcpListener> = None;
+        let mut key = String::new();
+        loop {
+            let cfg = std::fs::read_to_string(dir.join("phone.json")).ok();
+            match (&cfg, &listener) {
+                (None, Some(_)) => { listener = None; }
+                (Some(c), None) => {
+                    key = snifrig_fix::json::str_field(c, "key").unwrap_or_default();
+                    if key.len() >= 32 {
+                        if let Ok(l) = std::net::TcpListener::bind(("0.0.0.0", PHONE_PORT)) { let _ = l.set_nonblocking(true); listener = Some(l); }
+                    }
+                }
+                _ => {}
+            }
+            let Some(l) = &listener else { std::thread::sleep(std::time::Duration::from_secs(5)); continue };
+            match l.accept() {
+                Ok((mut s, _)) => {
+                    let _ = s.set_nonblocking(false);
+                    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let line = req.lines().next().unwrap_or("");
+                    let mut it = line.split_whitespace();
+                    let (method, target) = (it.next().unwrap_or(""), it.next().unwrap_or("/"));
+                    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                    let param = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(&format!("{}=", name))).unwrap_or("").to_string();
+                    let ok_key = { let k = param("k"); k.len() == key.len() && k.bytes().zip(key.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0 };
+                    let (code, ctype, body) = if !ok_key { ("403 Forbidden", "text/plain", "wrong or missing key: scan the code in snifrig Settings again".to_string()) } else {
+                        match (method, path) {
+                            ("GET", "/") => ("200 OK", "text/html; charset=utf-8", PHONE_PAGE.to_string()),
+                            ("GET", "/api/status") => {
+                                let gov = std::fs::read_to_string(dir.join("governor.json")).unwrap_or_else(|_| "{}".into());
+                                let pend = std::fs::read_to_string(dir.join("pending.json")).unwrap_or_else(|_| "{\"items\":[]}".into());
+                                let live = now_unix() - snifrig_fix::json::num_field(&gov, "unix").unwrap_or(0.0) < 30.0;
+                                let pc = std::env::var("COMPUTERNAME").unwrap_or_default();
+                                ("200 OK", "application/json", format!("{{\"live\":{},\"pc\":\"{}\",\"gov\":{},\"pending\":{}}}", live, snifrig_fix::json::esc(&pc), gov.trim(), pend.trim()))
+                            }
+                            ("POST", "/api/quick") => {
+                                let _ = std::fs::write(dir.join("quick-fix"), "phone");
+                                ("200 OK", "application/json", "{\"msg\":\"Quick fix sent. Your PC should come back in a second or two.\"}".to_string())
+                            }
+                            ("POST", "/api/approve") | ("POST", "/api/dismiss") => {
+                                let id = param("id");
+                                let r = if path.ends_with("approve") { approve(&dir, &id) } else { dismiss(&dir, &id) };
+                                let m = match r { Ok(m) => m, Err(e) => e };
+                                ("200 OK", "application/json", format!("{{\"msg\":\"{}\"}}", snifrig_fix::json::esc(&m)))
+                            }
+                            _ => ("404 Not Found", "text/plain", "not found".to_string()),
+                        }
+                    };
+                    let _ = write!(s, "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}", code, ctype, body.len(), body);
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(150)),
+            }
+        }
+    });
+}
+
 /// `feel slow|fine`: you tell snifrig how the PC feels right now (tray buttons).
 fn feel_cmd(dir: &Path, slow: bool) -> Result<String, String> {
     let g = std::fs::read_to_string(dir.join("governor.json")).unwrap_or_default();
@@ -473,6 +588,7 @@ fn watch(dir: &Path) {
     let mut base = Baseline::load(dir);
     let brain = snifrig_fix::brain::Brain::start(dir);
     snifrig_fix::feel::start();
+    phone_serve(dir.to_path_buf());
     let mut incidents = snifrig_fix::incident::Tracker::new();
     let note = |dir: &Path, key: &str, status: &str, msg: &str| {
         let alert = snifrig_fix::Alert { t: String::new(), key: key.into(), msg: msg.into() };
@@ -621,6 +737,7 @@ fn watch(dir: &Path) {
             log_enf(dir, applied, act);
         }
         handle_undo(dir, &mut gov, act);
+        if dir.join("quick-fix").exists() { let _ = std::fs::remove_file(dir.join("quick-fix")); run_quick(dir, &mut gov, act); }
         if n % 10 == 0 {
             let (now, m) = (now_unix(), metrics(&gov));
             learner.poll_feedback(now, &m);
@@ -805,6 +922,8 @@ fn main() {
         ["desktop", w @ ("restart" | "no")] => out(desktop(&dir, *w == "restart")),
         ["unlearn", name, action] => out(unlearn(&dir, name, action)),
         ["launch", "sync"] => out(launch_sync(&dir)),
+        ["quick"] => { let _ = std::fs::write(dir.join("quick-fix"), "cli"); println!("quick fix asked; the fixer runs it within a second"); }
+        ["phone", w @ ("on" | "off")] => out(phone_cmd(&dir, *w == "on")),
         ["mode", m] => match Mode::parse(m) {
             Some(m) => { ledger::write_mode(&dir, m); println!("fixer mode: {}", m.as_str()); }
             None => out(Err("mode must be off, dry-run, ask or auto".into())),
