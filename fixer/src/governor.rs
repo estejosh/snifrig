@@ -282,6 +282,9 @@ pub struct Governor {
     win_at: f64,
     /// Set by the watch loop from the feel meter before each tick.
     pub feels_slow: bool,
+    /// CPU (share of one core) of the desktop compositor on the latest tick. When dwm is pegged,
+    /// the mouse and every window stutter even though each app still answers instantly.
+    pub dwm_pct: f64,
 }
 
 /// One change made, for the ledger and the tray.
@@ -291,7 +294,7 @@ impl Governor {
     pub fn new(extra_deny: Vec<String>, pinned: Vec<String>) -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         Governor { buf: Vec::new(), prev: HashMap::new(), mood: Mood::default(), demoted: HashMap::new(),
-            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), win_at: 0.0, feels_slow: false }
+            protected_cache: HashMap::new(), cores, extra_deny, pinned, rules: Vec::new(), undone: HashSet::new(), last_procs: Vec::new(), total_pct: 0.0, fg_cpu_pct: None, top: Vec::new(), hints: Hints::default(), acting: false, tuning: Tuning::default(), game: None, windowed: HashSet::new(), win_at: 0.0, feels_slow: false, dwm_pct: 0.0 }
     }
 
     fn protected(&mut self, p: &Proc) -> bool {
@@ -340,6 +343,7 @@ impl Governor {
         self.total_pct = total_pct;
         self.mood.update(total_pct, &self.tuning, self.game.is_some(), self.feels_slow);
         self.fg_cpu_pct = seen.iter().find(|s| s.foreground).map(|s| s.core_pct);
+        self.dwm_pct = seen.iter().filter(|s| s.name.eq_ignore_ascii_case("dwm.exe")).map(|s| s.core_pct).sum();
         let mut top: Vec<(String, f64)> = seen.iter().filter(|s| s.core_pct >= 5.0).map(|s| (s.name.to_lowercase(), s.core_pct)).collect();
         top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         top.truncate(5);

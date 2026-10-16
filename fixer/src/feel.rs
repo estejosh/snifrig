@@ -17,6 +17,13 @@ pub struct Feel { pub ping_ms: f64, pub lag_ms: f64, pub hung: bool, pub samples
 
 pub const SLUGGISH_PING_MS: f64 = 80.0;
 pub const SLUGGISH_LAG_MS: f64 = 20.0;
+/// The desktop compositor using this much of one core means the screen itself is behind.
+pub const DWM_BUSY_PCT: f64 = 50.0;
+
+/// The meter's view combined with what the governor measured: a pegged compositor (dwm) is
+/// sluggish no matter how fast the front app answers.
+pub fn word_with(f: &Feel, dwm_pct: f64) -> &'static str { if dwm_pct >= DWM_BUSY_PCT { "sluggish" } else { f.word() } }
+pub fn sluggish_with(f: &Feel, dwm_pct: f64) -> bool { dwm_pct >= DWM_BUSY_PCT || f.sluggish() }
 const KEEP: usize = 60;
 
 static RING: Mutex<VecDeque<Sample>> = Mutex::new(VecDeque::new());

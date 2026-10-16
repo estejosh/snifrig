@@ -278,7 +278,7 @@ fn state_json(gov: &snifrig_fix::governor::Governor, acting: bool, sugg: &[(Stri
     let demoted: Vec<String> = d.iter().map(|x| format!("{{\"pid\":{},\"name\":\"{}\",\"level\":{},\"reason\":\"{}\",\"since\":{:.0}}}", x.pid, snifrig_fix::json::esc(&x.name), x.level, snifrig_fix::json::esc(&x.reason), x.since)).collect();
     let sg: Vec<String> = sugg.iter().map(|(n, c)| format!("{{\"name\":\"{}\",\"count\":{}}}", snifrig_fix::json::esc(n), c)).collect();
     let f = snifrig_fix::feel::recent(10);
-    let feel = format!("{{\"word\":\"{}\",\"ping_ms\":{:.0},\"lag_ms\":{:.0},\"hung\":{}}}", f.word(), f.ping_ms, f.lag_ms, f.hung);
+    let feel = format!("{{\"word\":\"{}\",\"ping_ms\":{:.0},\"lag_ms\":{:.0},\"hung\":{},\"desktop_pct\":{:.0}}}", snifrig_fix::feel::word_with(&f, gov.dwm_pct), f.ping_ms, f.lag_ms, f.hung, gov.dwm_pct);
     let tail = format!("\"busy\":{},\"game\":{},\"busy_pct\":{:.0},\"demoted\":[{}],\"suggestions\":[{}]}}\n", gov.mood.busy_with(&gov.tuning), game, gov.tuning.busy_pct, demoted.join(","), sg.join(","));
     let full = format!("{{\"unix\":{:.0},\"acting\":{},\"cpu\":{:.0},\"feel\":{},{}", now_unix(), acting, gov.total_pct, feel, tail);
     (full, format!("{}{}", acting, tail))
@@ -364,7 +364,7 @@ fn watch(dir: &Path) {
             if act != enf.acting { enf.reset(); }
             gov.acting = act;
             enf.acting = act;
-            gov.feels_slow = snifrig_fix::feel::recent(5).sluggish();
+            gov.feels_slow = snifrig_fix::feel::sluggish_with(&snifrig_fix::feel::recent(5), gov.dwm_pct);
             let changes = gov.tick(now_unix(), act);
             let brain_game = |name: &str| brain.cache().get(name).map_or(false, |v| v.kind == "game" && v.confidence >= snifrig_fix::brain::MIN_CONF);
             for m in perf.tick(gov.procs(), sys::foreground_pid(), &rule_set, &gov.tuning, act, &brain_game) {
@@ -440,10 +440,11 @@ fn watch(dir: &Path) {
             let headline = if fresh { snifrig_fix::json::str_field(&st, "headline").unwrap_or_default() } else { String::new() };
             let f = snifrig_fix::feel::recent(10);
             let mut toks = snifrig_fix::incident::recent_alert_tokens(dir, now, 900.0);
-            if f.sluggish() { toks.insert("feel:sluggish".into()); }
+            if snifrig_fix::feel::sluggish_with(&f, gov.dwm_pct) { toks.insert("feel:sluggish".into()); }
+            if gov.dwm_pct >= snifrig_fix::feel::DWM_BUSY_PCT { toks.insert("desktop:busy".into()); }
             for d in gov.demoted.values() { toks.insert(format!("busy:{}", d.name.to_lowercase())); }
             let date = |u: f64| local_date(u);
-            if let Some(msg) = incidents.tick(dir, now, severity >= 1.0 || f.sluggish(), &headline, toks, &date) { note(dir, "incident", "report", &msg); }
+            if let Some(msg) = incidents.tick(dir, now, severity >= 1.0 || snifrig_fix::feel::sluggish_with(&f, gov.dwm_pct), &headline, toks, &date) { note(dir, "incident", "report", &msg); }
         }
         if n > 0 && n % 60 == 0 {
             let (now, m) = (now_unix(), metrics(&gov));
