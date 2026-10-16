@@ -187,6 +187,7 @@ pub struct Rule {
     pub governor: String,   // "", exempt, on
     pub max_level: Option<u8>,
     pub game: String,       // "", yes, no
+    pub at_launch: bool,    // also set priority the moment it starts (Windows launch options)
     pub extra: Vec<String>, // tokens this window does not understand, kept as written
 }
 
@@ -238,6 +239,7 @@ impl Rule {
                 "governor" => r.governor = if v == "on" || v == "yes" { "on".into() } else { "exempt".into() },
                 "max_level" => r.max_level = v.parse().ok(),
                 "game" => r.game = if v == "yes" || v == "on" { "yes".into() } else { "no".into() },
+                "at_launch" => r.at_launch = v == "yes" || v == "on",
                 "background" if v == "yes" => { r.efficiency = "on".into(); r.io = "low".into(); r.priority = "below_normal".into(); }
                 _ => r.extra.push(tok.into()),
             }
@@ -260,6 +262,7 @@ impl Rule {
         if !self.governor.is_empty() { p.push(format!("governor={}", self.governor)); }
         if let Some(m) = self.max_level { p.push(format!("max_level={}", m)); }
         if !self.game.is_empty() { p.push(format!("game={}", self.game)); }
+        if self.at_launch { p.push("at_launch=yes".into()); }
         p.extend(self.extra.iter().cloned());
         p.join(" ")
     }
@@ -286,9 +289,45 @@ impl Rule {
             _ => {}
         }
         match self.game.as_str() { "yes" => c.push("is a game".into()), "no" => c.push("never a game".into()), _ => {} }
+        if self.at_launch { c.push("set at launch".into()); }
         for e in &self.extra { c.push(format!("{} (kept as written)", e)); }
         c
     }
+}
+
+/// The line snifrig-fix writes to launch-managed.txt for this rule ("git.exe 5 1"), or None.
+pub fn launch_line(r: &Rule) -> Option<String> {
+    if !r.at_launch || r.pattern.contains(['*', '?']) { return None; }
+    let cpu = match r.priority.as_str() { "idle" => "1", "below_normal" => "5", "normal" => "2", _ => "-" };
+    let io = match r.io.as_str() { "very_low" => "0", "low" => "1", "normal" => "2", _ => "-" };
+    (cpu != "-" || io != "-").then(|| format!("{} {} {}", r.pattern, cpu, io))
+}
+
+/// Tiny PNG writer (stored deflate, no dependencies) for `--shot`.
+pub fn png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    fn crc(d: &[u8]) -> u32 { let mut c = 0xffff_ffffu32; for &b in d { c ^= b as u32; for _ in 0..8 { c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 }; } } !c }
+    fn chunk(out: &mut Vec<u8>, t: &[u8], d: &[u8]) {
+        out.extend_from_slice(&(d.len() as u32).to_be_bytes());
+        let mut td = t.to_vec(); td.extend_from_slice(d);
+        out.extend_from_slice(&td); out.extend_from_slice(&crc(&td).to_be_bytes());
+    }
+    let row = w as usize * 4;
+    let mut raw = Vec::with_capacity((row + 1) * h as usize);
+    for y in 0..h as usize { raw.push(0); raw.extend_from_slice(&rgba[y * row..(y + 1) * row]); }
+    let mut z = vec![0x78, 0x01];
+    let n = raw.chunks(65535).count();
+    for (i, c) in raw.chunks(65535).enumerate() {
+        z.push((i + 1 == n) as u8);
+        let l = c.len() as u16;
+        z.extend_from_slice(&l.to_le_bytes()); z.extend_from_slice(&(!l).to_le_bytes()); z.extend_from_slice(c);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw { a = (a + x as u32) % 65521; b = (b + a) % 65521; }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new(); ihdr.extend_from_slice(&w.to_be_bytes()); ihdr.extend_from_slice(&h.to_be_bytes()); ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr); chunk(&mut out, b"IDAT", &z); chunk(&mut out, b"IEND", &[]);
+    out
 }
 
 pub fn level_name(n: u8) -> &'static str { match n { 0 => "nothing", 1 => "efficiency mode", 2 => "below normal", _ => "idle" } }

@@ -731,7 +731,28 @@ pub fn run() {
 
 // ---------- install / uninstall (Windows: per-user login autostart, no admin, no service) ----------
 use std::os::windows::process::CommandExt;
-use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, RegDeleteTreeW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_SZ};
+
+const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\snifrig";
+
+/// Show snifrig in Settings > Apps (per user, no admin), with Uninstall wired to `snifrig uninstall`.
+fn apps_entry(bin: &PathBuf, dir: &PathBuf) {
+    let k = wide(UNINSTALL_KEY);
+    let s = |name: &str, v: &str| { let (n, v) = (wide(name), wide(v)); unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr(), REG_SZ, v.as_ptr() as *const _, (v.len() * 2) as u32); } };
+    let d = |name: &str, v: u32| { let n = wide(name); unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr(), REG_DWORD, &v as *const u32 as *const _, 4); } };
+    let icon = if bin.join("snifrig-app.exe").exists() { bin.join("snifrig-app.exe") } else { bin.join("snifrig.exe") };
+    s("DisplayName", "snifrig");
+    s("DisplayVersion", env!("CARGO_PKG_VERSION"));
+    s("Publisher", "snifrig");
+    s("DisplayIcon", &icon.display().to_string());
+    s("InstallLocation", &bin.display().to_string());
+    s("UninstallString", &format!("\"{}\" uninstall --dir \"{}\"", bin.join("snifrig.exe").display(), dir.display()));
+    s("URLInfoAbout", "https://github.com/estejosh/snifrig");
+    d("NoModify", 1);
+    d("NoRepair", 1);
+    let kb: u64 = fs::read_dir(bin).map(|r| r.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum::<u64>() / 1024).unwrap_or(0);
+    d("EstimatedSize", kb as u32);
+}
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
@@ -816,6 +837,7 @@ fn install(dir: &PathBuf, given: Option<String>) {
     if !(set_run("Snifrig", &q("snifrigd.exe")) && set_run("SnifrigTray", &q("snifrig-tray.exe"))) {
         eprintln!("Could not write the login startup entries."); std::process::exit(1);
     }
+    apps_entry(&bin, dir);
     if fix && set_run("SnifrigFix", &q("snifrig-fix.exe")) { let _ = fs::remove_file(dir.join("stop-fix")); spawn_detached(&bin.join("snifrig-fix.exe"), dir); }
     spawn_detached(&bin.join("snifrigd.exe"), dir);
     spawn_detached(&bin.join("snifrig-tray.exe"), dir);
@@ -830,6 +852,8 @@ fn uninstall(dir: &PathBuf) {
     del_run("Snifrig");
     del_run("SnifrigTray");
     del_run("SnifrigFix");
+    let k = wide(UNINSTALL_KEY);
+    unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr()); }
     let _ = fs::write(dir.join("stop-fix"), "1");
     let _ = fs::write(dir.join("stop"), "1");
     let _ = fs::write(dir.join("stop-tray"), "1");

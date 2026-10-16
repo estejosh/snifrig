@@ -61,11 +61,21 @@ struct App {
     ask: bool,
     snoozed: Vec<String>,
     sugg: Vec<data::Suggestion>,
+    /// First run: the welcome screen until "Start using snifrig".
+    welcome: bool,
+    lic_code: String,
+    lic_accept: String,
+    /// `--shot DIR`: walk every page, save a PNG of each, then close (store screenshots).
+    shot: Option<(PathBuf, usize, Instant, bool)>,
 }
+
+const SHOTS: [(&str, Option<Page>); 8] = [("welcome", None), ("overview", Some(Page::Overview)), ("governor", Some(Page::Governor)), ("rules", Some(Page::Rules)),
+    ("performance", Some(Page::Performance)), ("activity", Some(Page::Activity)), ("report", Some(Page::Report)), ("settings", Some(Page::Settings))];
 
 fn main() -> eframe::Result<()> {
     let ask = std::env::args().any(|a| a == "--ask");
-    if already_running(if ask { "Local\\snifrig-ask" } else { "Local\\snifrig-app" }, if ask { "snifrig needs your OK" } else { "snifrig" }) { return Ok(()); }
+    let shot = std::env::args().skip_while(|a| a != "--shot").nth(1).map(PathBuf::from);
+    if shot.is_none() && already_running(if ask { "Local\\snifrig-ask" } else { "Local\\snifrig-app" }, if ask { "snifrig needs your OK" } else { "snifrig" }) { return Ok(()); }
     let dir = std::env::args().skip_while(|a| a != "--dir").nth(1).map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("snifrig"));
     let mut vp = if ask {
@@ -78,7 +88,7 @@ fn main() -> eframe::Result<()> {
     };
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-64.png")) { vp = vp.with_icon(Arc::new(icon)); }
     let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
-    eframe::run_native("snifrig", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, ask)))))
+    eframe::run_native("snifrig", opts, Box::new(move |cc| { let mut a = App::new(cc, dir, ask); if let Some(s) = shot { let _ = std::fs::create_dir_all(&s); a.shot = Some((s, 0, Instant::now(), false)); } Ok(Box::new(a)) }))
 }
 
 fn already_running(mutex: &str, title: &str) -> bool {
@@ -237,6 +247,7 @@ impl App {
             plans: Vec::new(), toast: Arc::new(Mutex::new(None)), report_days: 7, report: Arc::new(Mutex::new(None)),
             filter: Filter::All, search: String::new(), license: Arc::new(Mutex::new(String::new())), brain_up: None,
             ask, snoozed: Vec::new(), sugg: data::load_suggestions(&dir),
+            welcome: !ask && !dir.join("welcomed").exists(), lic_code: String::new(), lic_accept: String::new(), shot: None,
             live: sys::start(), state, loaded: Instant::now(), hist_loaded: Instant::now(), page: Page::Overview, logo, confirm_delete: None, dir,
         };
         app.refresh_license();
@@ -279,7 +290,91 @@ impl App {
     }
 
     fn save_rules(&mut self, msg: &str) {
-        match data::save_rules(&self.dir, &self.rules) { Ok(()) => self.say(msg, true), Err(e) => self.say(format!("Could not save rules: {}", e), false) }
+        match data::save_rules(&self.dir, &self.rules) { Ok(()) => { self.say(msg, true); self.sync_launch(); } Err(e) => self.say(format!("Could not save rules: {}", e), false) }
+    }
+
+    /// Rules with "set at launch" changed: write them to Windows (it asks you to confirm once).
+    fn sync_launch(&self) {
+        let mut want: Vec<String> = self.rules.rules.iter().filter_map(data::launch_line).collect();
+        let mut have: Vec<String> = std::fs::read_to_string(self.dir.join("launch-managed.txt")).unwrap_or_default().lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
+        want.sort(); have.sort();
+        if want != have { self.run("snifrig-fix.exe", vec!["launch".into(), "sync".into()], "Launch settings saved: those apps now start at the priority you chose."); }
+    }
+
+    /// License status, code entry and the acceptance step, as one card body (welcome and Settings).
+    fn license_body(&mut self, ui: &mut egui::Ui) {
+        let l = self.license.lock().unwrap().clone();
+        ui.label(RichText::new(if l.is_empty() { "checking..." } else { l.as_str() }).color(MUTED));
+        let accepted = std::fs::read_to_string(self.dir.join("fix-accepted.json")).map_or(false, |s| s.contains("snifrig-fix"));
+        if !accepted {
+            ui.add_space(6.0);
+            ui.label(RichText::new("snifrig fix is licensed under UFL 3.7 (paid use). To accept it, type: I accept UFL-3.7 snifrig-fix").color(TEXT));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.lic_accept).desired_width(300.0).hint_text("type it here yourself"));
+                let ok = self.lic_accept.trim() == "I accept UFL-3.7 snifrig-fix";
+                if ui.add_enabled(ok, egui::Button::new("Accept")).clicked() {
+                    self.run("snifrig-fix.exe", vec!["license".into(), "accept".into(), "--accept-license".into(), "UFL-3.7 snifrig-fix".into()], "License accepted (recorded on this PC only).");
+                    self.lic_accept.clear();
+                }
+                if ui.link("Read the license").clicked() { let _ = std::process::Command::new("explorer").arg("https://github.com/estejosh/snifrig/blob/main/LICENSE").spawn(); }
+            });
+        }
+        if !self.state.has_key {
+            ui.add_space(6.0);
+            ui.label(RichText::new("License code").color(TEXT));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.lic_code).desired_width(420.0).hint_text("paste the code from your purchase email"));
+                if ui.add_enabled(self.lic_code.trim().contains('.'), egui::Button::new(RichText::new("Activate").color(Color32::BLACK)).fill(ACCENT)).clicked() {
+                    let p = self.dir.join("license-entered.txt");
+                    if std::fs::write(&p, self.lic_code.trim()).is_ok() {
+                        self.run("snifrig-fix.exe", vec!["license".into(), "install".into(), p.to_string_lossy().into()], "Activated. snifrig fix is ready.");
+                        self.lic_code.clear();
+                    }
+                }
+            });
+            if ui.button("Check again").clicked() { self.refresh_license(); }
+        }
+    }
+
+    fn welcome_view(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(48, 28))).show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_max_width(860.0);
+                ui.horizontal(|ui| {
+                    if let Some(l) = &self.logo { ui.add(egui::Image::new(l).fit_to_exact_size(Vec2::splat(56.0))); }
+                    ui.vertical(|ui| { ui.label(bold("Welcome to snifrig", 28.0).color(TEXT)); ui.label(RichText::new("Keeps your PC fast without closing what you are using.").size(15.0).color(MUTED)); });
+                });
+                ui.add_space(14.0);
+                card(ui, |ui| {
+                    section(ui, "What it does", "");
+                    for (t, d) in [
+                        ("Watches quietly", "CPU, memory, disk, graphics card and how the PC feels: it times your own mouse and keys to catch lag. It uses very little memory itself."),
+                        ("Never closes what you use", "The app in front is never touched. Apps on another screen only get efficiency mode. Hidden apps are turned down step by step and get full speed back the moment you switch to them."),
+                        ("Learns from you", "Say yes twice to a fix that helps and it does it by itself next time, with an undo. Undo once and it asks again. Right-click the tray icon to tell it the PC feels slow."),
+                        ("Stays on your PC", "No account, no cloud, nothing sent anywhere. Your AI assistant can read it if you connect it."),
+                    ] { ui.horizontal_wrapped(|ui| { ui.label(bold(t, 14.5).color(ACCENT)); ui.label(RichText::new(d).color(TEXT)); }); ui.add_space(4.0); }
+                });
+                ui.add_space(8.0);
+                card(ui, |ui| {
+                    section(ui, "How should it act?", "You can change this any time in Settings.");
+                    if !self.state.has_key { ui.label(RichText::new("The monitor, the report and this window are free. Fixing needs a license code (below).").color(WARN)); }
+                    ui.add_enabled_ui(self.state.has_key, |ui| {
+                        let mut m = self.state.mode.clone();
+                        for (k, d) in [("ask", "Recommended. Eases busy apps by itself; asks before ending or restarting anything."), ("auto", "Also frees memory and lowers leaking apps by itself."), ("dry-run", "Only shows what it would do.")] {
+                            ui.horizontal(|ui| { ui.radio_value(&mut m, k.to_string(), bold(mode_label(k), 14.5)); ui.label(RichText::new(d).color(MUTED)); });
+                        }
+                        if m != self.state.mode { self.state.mode = m.clone(); self.run("snifrig-fix.exe", vec!["mode".into(), m.clone()], &format!("Set to {}.", mode_label(&m))); }
+                    });
+                });
+                ui.add_space(8.0);
+                card(ui, |ui| { section(ui, "snifrig fix license", ""); self.license_body(ui); });
+                ui.add_space(14.0);
+                if ui.add(egui::Button::new(bold("Start using snifrig", 16.0).color(Color32::BLACK)).fill(ACCENT).min_size(Vec2::new(220.0, 40.0))).clicked() {
+                    let _ = std::fs::write(self.dir.join("welcomed"), "1");
+                    self.welcome = false;
+                }
+            });
+        });
     }
 
     fn save_tuning(&mut self) {
@@ -794,6 +889,14 @@ impl App {
                 ui.label("Game");
                 opts(ui, "game", &mut r.game, &[("", "Detect automatically"), ("yes", "Always a game (performance mode)"), ("no", "Never a game")]);
                 ui.end_row();
+                ui.label("At launch");
+                ui.vertical(|ui| {
+                    let can = !r.pattern.contains(['*', '?']) && (!r.priority.is_empty() || !r.io.is_empty());
+                    ui.add_enabled_ui(can, |ui| ui.checkbox(&mut r.at_launch, "Start it at this priority (Windows asks you to confirm once)"));
+                    ui.label(RichText::new(if can { "Without this, snifrig sets it about a second after the app starts." } else { "Needs an exact name (no * or ?) and a priority or disk priority." }).size(12.0).color(MUTED));
+                    if !can { r.at_launch = false; }
+                });
+                ui.end_row();
             });
             ui.add_space(4.0);
             ui.label(RichText::new(format!("Saved as:  {}", r.line())).monospace().size(12.0).color(MUTED));
@@ -1014,8 +1117,7 @@ impl App {
         ui.columns(2, |c| {
             card(&mut c[0], |ui| {
                 section(ui, "License", "");
-                let l = self.license.lock().unwrap().clone();
-                ui.label(RichText::new(if l.is_empty() { "checking..." } else { l.as_str() }).color(MUTED));
+                self.license_body(ui);
             });
             card(&mut c[1], |ui| {
                 section(ui, "Local brain", "An optional AI on this PC that tells snifrig what each app is (a game, a batch job, an AI model...). Nothing leaves your machine.");
@@ -1060,6 +1162,23 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.loaded.elapsed() > Duration::from_millis(1500) { self.reload(); }
         if self.ask { self.ask_view(ctx); return; }
+        if let Some((dir, i, at, asked)) = self.shot.clone() {
+            self.welcome = SHOTS[i].1.is_none();
+            if let Some(p) = SHOTS[i].1 { self.page = p; }
+            for e in ctx.input(|x| x.raw.events.clone()) {
+                if let egui::Event::Screenshot { image, .. } = e {
+                    let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                    let _ = std::fs::write(dir.join(format!("{}-{}.png", i + 1, SHOTS[i].0)), data::png(image.size[0] as u32, image.size[1] as u32, &rgba));
+                    self.shot = if i + 1 >= SHOTS.len() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); None } else { Some((dir.clone(), i + 1, Instant::now(), false)) };
+                }
+            }
+            if !asked && at.elapsed() > Duration::from_millis(2500) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                if let Some(s) = self.shot.as_mut() { s.3 = true; }
+            }
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        if self.welcome { self.welcome_view(ctx); ctx.request_repaint_after(Duration::from_millis(1000)); return; }
         let live = self.live.lock().map(|g| g.clone()).unwrap_or_default();
         egui::SidePanel::left("nav").exact_width(220.0).resizable(false).frame(egui::Frame::new().fill(SIDE).inner_margin(Margin::symmetric(12, 0))).show(ctx, |ui| self.nav(ui));
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(20, 6)).stroke(Stroke::new(1.0, BORDER))).show(ctx, |ui| self.top_bar(ui));

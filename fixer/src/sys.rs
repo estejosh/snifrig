@@ -129,6 +129,41 @@ pub fn fullscreen_d3d() -> bool {
 }
 
 /// Pids that own a visible top-level window with a title (what a person would call an open app).
+/// CPU set ids of the efficiency (slow) cores on a hybrid CPU (Intel 12th gen and later, some
+/// ARM). None when every core is the same kind, as on most desktops: then nothing changes.
+pub fn efficiency_cpu_sets() -> Option<&'static [u32]> {
+    static SETS: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    SETS.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
+        let mut len = 0u32;
+        unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut len, std::ptr::null_mut(), 0); }
+        if len == 0 { return None; }
+        let mut buf = vec![0u8; len as usize];
+        if unsafe { GetSystemCpuSetInformation(buf.as_mut_ptr() as *mut _, len, &mut len, std::ptr::null_mut(), 0) } == 0 { return None; }
+        // SYSTEM_CPU_SET_INFORMATION: Size u32 @0, Type u32 @4, Id u32 @8, ..., EfficiencyClass u8 @18.
+        let mut sets: Vec<(u32, u8)> = Vec::new();
+        let mut off = 0usize;
+        while off + 19 <= buf.len() {
+            let size = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+            if size == 0 { break; }
+            let id = u32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+            sets.push((id, buf[off + 18]));
+            off += size;
+        }
+        let lo = sets.iter().map(|s| s.1).min()?;
+        let hi = sets.iter().map(|s| s.1).max()?;
+        (lo != hi).then(|| sets.iter().filter(|s| s.1 == lo).map(|s| s.0).collect())
+    }).as_deref()
+}
+
+/// Keep a process on these CPU sets (empty = any core again).
+pub fn set_cpu_sets(pid: u32, ids: &[u32]) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::SetProcessDefaultCpuSets;
+    let h = open(pid, 0x2000)?; // PROCESS_SET_LIMITED_INFORMATION
+    let ok = unsafe { SetProcessDefaultCpuSets(h.0, if ids.is_empty() { std::ptr::null() } else { ids.as_ptr() }, ids.len() as u32) };
+    if ok == 0 { Err(format!("cpu sets: error {}", unsafe { windows_sys::Win32::Foundation::GetLastError() })) } else { Ok(()) }
+}
+
 /// Pids that own a real, titled top-level window. Cloaked windows (hidden UWP hosts such as
 /// TextInputHost, windows parked on another virtual desktop) do not count.
 pub fn window_pids() -> std::collections::HashSet<u32> { windows().0 }

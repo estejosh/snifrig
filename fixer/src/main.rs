@@ -378,6 +378,58 @@ fn write_learned(dir: &Path, l: &Learner, h: &snifrig_fix::governor::Hints) {
     if std::fs::read_to_string(dir.join("learned.json")).map_or(true, |old| old.lines().skip(1).ne(body.lines().skip(1))) { rules::write_atomic(&dir.join("learned.json"), &body); }
 }
 
+/// `launch sync`: write Windows launch options (Image File Execution Options PerfOptions) for
+/// rules with at_launch=yes, so the program starts at that priority instead of being caught a
+/// second later. HKLM needs admin, so Windows asks you to confirm; nothing else is touched, and
+/// entries snifrig wrote before but no rule wants any more are removed.
+fn launch_sync(dir: &Path) -> Result<String, String> {
+    let want: Vec<(String, Option<u32>, Option<u32>)> = rules::load(dir).into_iter()
+        .filter(|r| r.at_launch && !r.pattern.contains(['*', '?']))
+        .filter_map(|r| {
+            let cpu = match r.priority { Some(sys::IDLE) => Some(1), Some(sys::BELOW_NORMAL) => Some(5), Some(sys::NORMAL) => Some(2), _ => None };
+            let io = r.io.map(|v| v.min(2));
+            (cpu.is_some() || io.is_some()).then_some((r.pattern, cpu, io))
+        }).collect();
+    let old: Vec<String> = ledger::read_list(dir, "launch-managed.txt").iter().filter_map(|l| l.split_whitespace().next().map(String::from)).collect();
+    let names: Vec<String> = want.iter().map(|w| w.0.clone()).collect();
+    let lines: Vec<String> = want.iter().map(|(n, c, i)| format!("{} {} {}", n, c.map_or("-".to_string(), |v| v.to_string()), i.map_or("-".to_string(), |v| v.to_string()))).collect();
+    if old == names && want.is_empty() { return Ok("nothing to set at launch".into()); }
+    let ok_name = |n: &str| n.ends_with(".exe") && n.chars().all(|c| c.is_ascii_alphanumeric() || "._- ".contains(c));
+    let mut ps = vec!["$b='HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options'".to_string()];
+    for o in old.iter().filter(|o| !names.contains(o) && ok_name(o)) { ps.push(format!("Remove-Item \"$b\\{}\\PerfOptions\" -Recurse -ErrorAction SilentlyContinue", o)); }
+    for (n, cpu, io) in want.iter().filter(|w| ok_name(&w.0)) {
+        let k = format!("\"$b\\{}\\PerfOptions\"", n);
+        ps.push(format!("New-Item {} -Force | Out-Null", k));
+        for (prop, v) in [("CpuPriorityClass", cpu), ("IoPriority", io)] {
+            ps.push(match v { Some(v) => format!("New-ItemProperty -Path {} -Name {} -PropertyType DWord -Value {} -Force | Out-Null", k, prop, v), None => format!("Remove-ItemProperty -Path {} -Name {} -ErrorAction SilentlyContinue", k, prop) });
+        }
+    }
+    let script = dir.join("launch-sync.ps1");
+    std::fs::write(&script, ps.join("\r\n")).map_err(|e| e.to_string())?;
+    use std::os::windows::process::CommandExt;
+    let cmd = format!("Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}' -Verb RunAs -Wait -WindowStyle Hidden", script.display().to_string().replace('\'', "''"));
+    let st = std::process::Command::new("powershell.exe").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &cmd]).creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
+    if !st.success() { return Err("the Windows confirmation was cancelled".into()); }
+    let _ = std::fs::write(dir.join("launch-managed.txt"), lines.join("\n"));
+    let msg = if names.is_empty() { "removed snifrig's launch settings".to_string() } else { format!("set at launch: {}", names.join(", ")) };
+    let alert = snifrig_fix::Alert { t: String::new(), key: "rule:launch".into(), msg: msg.clone() };
+    ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
+    Ok(msg)
+}
+
+/// Snifrig's own parts give way first: the local brain (OpenJev) is stopped when the graphics
+/// card has been nearly full for two GPU readings in a row (about 5 minutes). Command in
+/// brain-stop.txt (one line, run with cmd /c), default: podman stop open-jev in WSL Ubuntu.
+fn stop_brain(dir: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let custom = std::fs::read_to_string(dir.join("brain-stop.txt")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let st = match custom {
+        Some(c) => std::process::Command::new("cmd.exe").args(["/c", &c]).creation_flags(0x0800_0000).status(),
+        None => std::process::Command::new("wsl.exe").args(["-d", "Ubuntu", "--exec", "podman", "stop", "open-jev"]).creation_flags(0x0800_0000).status(),
+    }.map_err(|e| e.to_string())?;
+    if st.success() { Ok(()) } else { Err(format!("stop command exited with {}", st)) }
+}
+
 /// `feel slow|fine`: you tell snifrig how the PC feels right now (tray buttons).
 fn feel_cmd(dir: &Path, slow: bool) -> Result<String, String> {
     let g = std::fs::read_to_string(dir.join("governor.json")).unwrap_or_default();
@@ -436,6 +488,7 @@ fn watch(dir: &Path) {
     enf.reapply_secs = t0.reapply_secs;
     let mut tune_mt = tuning_mt(dir);
     let mut dwm_hot = 0.0f64;
+    let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
     // The feel gate was turned off while the meter was checked; it comes back on by itself after a day.
     if !t0.feel_gate && !dir.join("feel-gate-on-at").exists() && !dir.join("feel-gate-stays-off").exists() {
         let _ = std::fs::write(dir.join("feel-gate-on-at"), format!("{:.0}", now_unix() + 86400.0));
@@ -482,6 +535,24 @@ fn watch(dir: &Path) {
             let now = now_unix();
             if gov.dwm_pct >= DWM_STUCK_PCT { if dwm_hot == 0.0 { dwm_hot = now; } } else { dwm_hot = 0.0; }
             if dwm_hot > 0.0 && now - dwm_hot >= DWM_STUCK_SECS { offer_desktop_restart(dir, gov.dwm_pct, now); dwm_hot = now; }
+        }
+        if n % 30 == 20 {
+            let g = std::fs::read_to_string(dir.join("gpu.json")).unwrap_or_default();
+            let gu = snifrig_fix::json::num_field(&g, "unix").unwrap_or(0.0);
+            if gu != gpu_seen {
+                gpu_seen = gu;
+                let (used, total) = (snifrig_fix::json::num_field(&g, "used_mb").unwrap_or(0.0), snifrig_fix::json::num_field(&g, "total_mb").unwrap_or(0.0));
+                gpu_full = if total > 0.0 && used / total >= 0.92 { gpu_full + 1 } else { 0 };
+                let brain_up = std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], 8791)), std::time::Duration::from_millis(200)).is_ok();
+                if gpu_full >= 2 && brain_up && gov.acting {
+                    gpu_full = 0;
+                    let msg = match stop_brain(dir) {
+                        Ok(()) => format!("the graphics card was {:.0}% full for 5 minutes, so snifrig stopped its own local brain (OpenJev) to give the memory back; it starts again at the next login if there is room", used / total * 100.0),
+                        Err(e) => format!("tried to stop the local brain (graphics card {:.0}% full): {}", used / total * 100.0, e),
+                    };
+                    note(dir, "brain:gpu", "done", &msg);
+                }
+            }
         }
         if n % 60 == 30 {
             write_learned(dir, &learner, &gov.hints);
@@ -733,6 +804,7 @@ fn main() {
         ["feel", w @ ("slow" | "fine")] => out(feel_cmd(&dir, *w == "slow")),
         ["desktop", w @ ("restart" | "no")] => out(desktop(&dir, *w == "restart")),
         ["unlearn", name, action] => out(unlearn(&dir, name, action)),
+        ["launch", "sync"] => out(launch_sync(&dir)),
         ["mode", m] => match Mode::parse(m) {
             Some(m) => { ledger::write_mode(&dir, m); println!("fixer mode: {}", m.as_str()); }
             None => out(Err("mode must be off, dry-run, ask or auto".into())),

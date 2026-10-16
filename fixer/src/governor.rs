@@ -195,6 +195,9 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
     let mut out = Vec::new();
     let live: HashMap<Key, &Seen> = seen.iter().map(|s| (s.key, s)).collect();
     let fg_names: Vec<&str> = seen.iter().filter(|s| s.foreground).map(|s| s.name.as_str()).collect();
+    // Apps showing on a screen, by name: their windowless helpers (renderers, GPU process) draw
+    // the window you can see, so they get the same light touch as the window itself.
+    let on_names: Vec<&str> = seen.iter().filter(|s| s.onscreen).map(|s| s.name.as_str()).collect();
     let t = &hints.tuning;
 
     // Restores first: gone, foreground, or calm.
@@ -206,7 +209,7 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
             // A windowless helper (a browser tab, a renderer) of the app in front may stay reined in, but only lightly.
             Some(s) if fg_names.contains(&s.name.as_str()) && d.level > 1 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is in front, so its busy background part is only kept in efficiency mode", d.name) }),
-            Some(s) if s.onscreen && d.level > 1 =>
+            Some(s) if (s.onscreen || on_names.contains(&s.name.as_str())) && d.level > 1 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is showing on a screen, so it is only kept in efficiency mode", d.name) }),
             Some(_) if mood.calm_with(t) && mood.calm_ticks % t.restore_every.max(1) == 0 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: d.level - 1, reason: format!("CPU is calm again ({:.0}%)", total_pct) }),
@@ -224,7 +227,7 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
         .filter(|s| {
             let mut cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level);
             // Helpers of the app in front, and apps showing on a screen, only get efficiency mode.
-            if fg_names.contains(&s.name.as_str()) || s.onscreen { cap = cap.min(1); }
+            if fg_names.contains(&s.name.as_str()) || on_names.contains(&s.name.as_str()) { cap = cap.min(1); }
             demoted.get(&s.key).map_or(0, |d| d.level) < cap
         })
         .collect();
@@ -248,11 +251,18 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
 fn apply_level(pid: u32, from: u8, to: u8, orig_priority: u32) -> Result<(), String> {
     // Going up the ladder.
     if from < 1 && to >= 1 { sys::set_efficiency(pid, true)?; let _ = sys::set_io_priority(pid, 1); }
-    if from < 2 && to >= 2 { sys::set_priority(pid, sys::BELOW_NORMAL)?; }
+    if from < 2 && to >= 2 {
+        sys::set_priority(pid, sys::BELOW_NORMAL)?;
+        // Hybrid CPUs: an app turned this far down moves to the slow cores, leaving the fast ones to you.
+        if let Some(e) = sys::efficiency_cpu_sets() { let _ = sys::set_cpu_sets(pid, e); }
+    }
     if from < 3 && to >= 3 { sys::set_priority(pid, sys::IDLE)?; let _ = sys::set_memory_priority(pid, 2); }
     // Coming down.
     if from >= 3 && to < 3 { let _ = sys::set_memory_priority(pid, 5); sys::set_priority(pid, if to >= 2 { sys::BELOW_NORMAL } else { orig_priority })?; }
-    if from >= 2 && to < 2 { sys::set_priority(pid, orig_priority)?; }
+    if from >= 2 && to < 2 {
+        if sys::efficiency_cpu_sets().is_some() { let _ = sys::set_cpu_sets(pid, &[]); }
+        sys::set_priority(pid, orig_priority)?;
+    }
     if from >= 1 && to < 1 { let _ = sys::set_io_priority(pid, 2); sys::set_efficiency(pid, false)?; }
     Ok(())
 }
@@ -480,7 +490,14 @@ mod gov_tests {
         assert_eq!(steps.len(), 1, "{:?}", steps);
         assert!(matches!(&steps[0], Step::Demote { key: (3, 1), to_level: 2, .. }), "the hidden app goes further, the one on screen stays at 1");
         d.get_mut(&(2, 1)).unwrap().level = 3;
-        assert!(decide(95.0, &m, &[fg, game, hidden], &d).iter().any(|x| matches!(x, Step::Restore { key: (2, 1), to_level: 1, .. })), "dragged back on screen: back to efficiency only");
+        assert!(decide(95.0, &m, &[fg.clone(), game.clone(), hidden.clone()], &d).iter().any(|x| matches!(x, Step::Restore { key: (2, 1), to_level: 1, .. })), "dragged back on screen: back to efficiency only");
+        // The windowless renderer of an app on screen draws what you see: efficiency mode at most.
+        let renderer = s(4, "legendsofidleon.exe", 200.0);
+        let mut d2 = HashMap::new();
+        d2.insert((4, 1), Demotion { pid: 4, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d2.insert((2, 1), Demotion { pid: 2, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d2.insert((3, 1), Demotion { pid: 3, created: 1, name: "comet.exe".into(), level: 3, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        assert!(decide(95.0, &m, &[fg, game, hidden, renderer], &d2).is_empty(), "renderer of an on-screen app stays at 1, hidden app already at the bottom");
     }
 
     #[test]

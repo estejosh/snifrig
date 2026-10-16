@@ -1,0 +1,23 @@
+[package]
+name = "snifrig-setup"
+version = "0.3.0"
+edition = "2021"
+description = "One-file installer for snifrig (per user, no admin)"
+license-file = "../LICENSE"
+build = "build.rs"
+
+# Not part of the main workspace: it packs the programs the main build made.
+# Build with build-setup.ps1 after `cargo build --release --workspace`.
+[workspace]
+
+[[bin]]
+name = "snifrig-setup"
+path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

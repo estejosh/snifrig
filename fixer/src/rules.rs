@@ -44,6 +44,8 @@ pub struct Rule {
     pub max_level: Option<u8>,
     /// Performance mode override.
     pub game: Option<bool>,
+    /// Also set priority and disk priority the moment the program starts (Windows launch options).
+    pub at_launch: bool,
     /// The rule as written (whitespace normalised, comment removed).
     pub text: String,
 }
@@ -100,6 +102,7 @@ pub fn parse_line(line: &str) -> Result<Option<Rule>, String> {
             "governor" => r.governor = Some(match v.as_str() { "on" | "yes" => true, "exempt" | "off" | "no" => false, _ => return Err(bad("on or exempt")) }),
             "max_level" => r.max_level = Some(match v.parse::<u8>() { Ok(n) if n <= 3 => n, _ => return Err(bad("0 to 3")) }),
             "game" => r.game = Some(match v.as_str() { "yes" | "on" => true, "no" | "off" => false, _ => return Err(bad("yes or no")) }),
+            "at_launch" => r.at_launch = match v.as_str() { "yes" | "on" => true, "no" | "off" => false, _ => return Err(bad("yes or no")) },
             "background" => {
                 if v != "yes" { return Err(bad("yes")); }
                 r.efficiency = Some(true); r.io = Some(1); r.priority = Some(sys::BELOW_NORMAL);
