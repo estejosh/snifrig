@@ -1,0 +1,110 @@
+{
+  "name": "snifrig: alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## snifrig: alerts\n\n**What it does:** receives one snifrig alert per POST and tells Josh on Telegram. Nothing is stored: executions are not saved.\n\n**What it expects:** JSON `{\"source\":\"snifrig\",\"host\":\"PC\",\"t\":\"ISO time\",\"key\":\"alert key\",\"msg\":\"text\"}`. Anything else gets a 400 and is dropped.\n\n**Dedupe:** at most one Telegram message per host + key per hour. Repeats are counted and the next message says how many.\n\n**The secret:** the long random part of the webhook path is the shared secret. It lives in each PC's `webhook.txt` (set with `snifrig webhook URL`). Never commit or paste it.\n\n**Turn it off:** deactivate this workflow, or on a PC run `snifrig webhook off`.",
+        "height": 420,
+        "width": 420,
+        "color": 4
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-480, -200]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "snifrig/alerts/__SNIFRIG_ALERTS_SECRET__",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "name": "Alert in",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "8f3c2a1e-5b7d-4c9a-9e21-6a1c0f5e7b42"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate, then let at most one message per host + key through each hour.\nconst b = ($input.first().json.body) || {};\nconst str = v => typeof v === 'string' && v.trim().length > 0;\nif (b.source !== 'snifrig' || !str(b.host) || !str(b.key) || !str(b.msg)) return [{ json: { route: 2 } }];\nconst s = $getWorkflowStaticData('global');\ns.seen = s.seen || {};\nconst now = Date.now(), HOUR = 3600 * 1000;\nfor (const k of Object.keys(s.seen)) if (now - s.seen[k].at > 6 * HOUR) delete s.seen[k];\nconst id = (b.host + '|' + b.key).slice(0, 200);\nconst e = s.seen[id];\nif (e && now - e.at < HOUR) { e.extra = (e.extra || 0) + 1; return [{ json: { route: 1 } }]; }\nconst extra = e ? (e.extra || 0) : 0;\nconst recent = e && now - e.at < 2 * HOUR;\ns.seen[id] = { at: now, extra: 0 };\nconst clip = (v, n) => String(v).slice(0, n);\nlet text = 'snifrig on ' + clip(b.host, 60) + '\\n' + clip(b.msg, 900);\nif (extra > 0) text += recent ? '\\n(x' + (extra + 1) + ' in the last hour)' : '\\n(repeated ' + extra + ' more times earlier)';\nreturn [{ json: { route: 0, text } }];"
+      },
+      "id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "name": "Check and dedupe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 3,
+        "output": "={{ $json.route }}"
+      },
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Send, skip or reject",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "chatId": "1661574179",
+        "text": "={{ $json.text }}",
+        "additionalFields": { "appendAttribution": false }
+      },
+      "id": "a1b2c3d4-0005-4000-8000-000000000005",
+      "name": "Tell Josh",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [680, -140],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":true}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "a1b2c3d4-0006-4000-8000-000000000006",
+      "name": "OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, -40]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":false,\"error\":\"not a snifrig alert\"}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "a1b2c3d4-0007-4000-8000-000000000007",
+      "name": "Reject (400)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [680, 160]
+    }
+  ],
+  "connections": {
+    "Alert in": { "main": [[{ "node": "Check and dedupe", "type": "main", "index": 0 }]] },
+    "Check and dedupe": { "main": [[{ "node": "Send, skip or reject", "type": "main", "index": 0 }]] },
+    "Send, skip or reject": {
+      "main": [
+        [{ "node": "Tell Josh", "type": "main", "index": 0 }],
+        [{ "node": "OK", "type": "main", "index": 0 }],
+        [{ "node": "Reject (400)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Tell Josh": { "main": [[{ "node": "OK", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  }
+}
