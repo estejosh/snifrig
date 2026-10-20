@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "snifrig"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "embed-resource",
  "windows-sys 0.59.0",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "snifrig-app"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "eframe",
  "embed-resource",
@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "snifrig-fix"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "ed25519-compact",
  "embed-resource",
@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "snifrig-mcp"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 
 [[package]]
 name = "spirv"

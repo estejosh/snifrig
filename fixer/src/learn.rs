@@ -4,7 +4,8 @@
 //! trigger, before}. After EVAL_AFTER_SECS the machine is measured again and the episode is scored:
 //! improvement = relative drop in the metric that triggered it (total CPU, or commit / available
 //! memory). success = improvement >= IMPROVE_OK, or the metric went from over its trigger
-//! threshold to under it. Finished episodes are appended to learn.jsonl (cap 1 MB, rotated to
+//! threshold to under it. A user-approved "lower-priority" is scored by score_ease instead (it
+//! cannot lower total CPU). Finished episodes are appended to learn.jsonl (cap 1 MB, rotated to
 //! learn.jsonl.old) and rolled into learn-stats.json: per (kind, action, name) tries, successes
 //! and mean improvement.
 //!
@@ -35,6 +36,10 @@ pub const BLOCK_PROB: f64 = 0.15;
 pub const PROTECT_UNDOS: usize = 2;
 /// Approvals of the same fix on the same app before snifrig does it without asking.
 pub const EARN_APPROVALS: usize = 2;
+/// Yeses closer together than this count once (one click on several cards for the same app).
+pub const APPROVAL_GAP_SECS: f64 = 600.0;
+/// A priority ease "did no harm" unless total CPU climbed by more than this (when feel is unknown).
+pub const EASE_HARM: f64 = 0.1;
 pub const PROTECT_WINDOW_SECS: f64 = 14.0 * 86400.0;
 const KEEP_FEEDBACK_SECS: f64 = 90.0 * 86400.0;
 const LEARN_CAP: u64 = 1024 * 1024;
@@ -91,6 +96,51 @@ pub fn score(t: Trigger, b: &Metrics, a: &Metrics) -> (f64, bool) {
             (imp.max(feel_imp), ok || felt_better)
         }
         _ => (imp, ok),
+    }
+}
+
+/// Lowering an app's priority does not lower total CPU: it lets the front app go first. Scored
+/// by total CPU it almost never "helped", so trust was never earned. It helped when the PC felt
+/// fine afterwards (not sluggish, or less sluggish than before); with no feel reading, when total
+/// CPU did not climb.
+pub fn score_ease(t: Trigger, b: &Metrics, a: &Metrics) -> (f64, bool) {
+    let (imp, ok) = score(t, b, a);
+    let calm = match (b.feel_ms, a.feel_ms) {
+        (Some(fb), Some(fa)) => fa < crate::feel::SLUGGISH_PING_MS || fa < fb,
+        _ => imp > -EASE_HARM,
+    };
+    (imp, ok || calm)
+}
+
+fn score_for(kind: &str, action: &str, t: Trigger, b: &Metrics, a: &Metrics) -> (f64, bool) {
+    if kind == "fix" && action == "lower-priority" { score_ease(t, b, a) } else { score(t, b, a) }
+}
+
+fn metrics_from(s: &str) -> Metrics {
+    Metrics {
+        total_cpu_pct: num_field(s, "total_cpu_pct").unwrap_or(0.0),
+        commit_pct: num_field(s, "commit_pct").unwrap_or(0.0),
+        avail_mb: num_field(s, "avail_mb").unwrap_or(0.0),
+        fg_cpu_pct: num_field(s, "fg_cpu_pct"),
+        feel_ms: num_field(s, "feel_ms"),
+    }
+}
+
+/// Rebuild the fix/lower-priority stats from the episode log with score_ease (once: stats
+/// written before it carry no "ease":2). Undone episodes stay failures.
+fn rescore_eases(dir: &Path, stats: &mut HashMap<SKey, Stat>) {
+    stats.retain(|k, _| !(k.0 == "fix" && k.1 == "lower-priority"));
+    for f in ["learn.jsonl.old", "learn.jsonl"] {
+        for line in std::fs::read_to_string(dir.join(f)).unwrap_or_default().lines() {
+            if str_field(line, "kind").as_deref() != Some("fix") || str_field(line, "action").as_deref() != Some("lower-priority") { continue; }
+            let (Some(name), Some(at)) = (str_field(line, "name"), line.find("\"after\":{")) else { continue };
+            let undone = line.contains("\"undone\":true");
+            let (imp, ok) = score_ease(Trigger::parse(&str_field(line, "trigger").unwrap_or_default()), &metrics_from(&line[..at]), &metrics_from(&line[at..]));
+            let s = stats.entry(skey("fix", "lower-priority", &name)).or_default();
+            s.tries += 1;
+            if ok && !undone { s.successes += 1; }
+            s.mean_imp += (if undone { 0.0 } else { imp } - s.mean_imp) / s.tries as f64;
+        }
     }
 }
 
@@ -200,7 +250,8 @@ impl Learner {
         let mut l = Learner::new();
         l.dir = Some(dir.to_path_buf());
         l.now = crate::now_unix();
-        for line in std::fs::read_to_string(dir.join("learn-stats.json")).unwrap_or_default().lines() {
+        let stats_text = std::fs::read_to_string(dir.join("learn-stats.json")).unwrap_or_default();
+        for line in stats_text.lines() {
             let line = line.trim().trim_end_matches(',');
             if !line.contains("\"tries\":") { continue; }
             let (Some(k), Some(a), Some(n)) = (str_field(line, "kind"), str_field(line, "action"), str_field(line, "name")) else { continue };
@@ -210,6 +261,7 @@ impl Learner {
                 mean_imp: num_field(line, "mean_imp").unwrap_or(0.0),
             });
         }
+        if !stats_text.is_empty() && !stats_text.contains("\"ease\":2") { rescore_eases(dir, &mut l.stats); l.flush(); }
         let fp = dir.join("learn-feedback.jsonl");
         let text = std::fs::read_to_string(&fp).unwrap_or_default();
         l.fb_offset = text.len() as u64;
@@ -247,7 +299,7 @@ impl Learner {
         self.open = keep;
         let mut done = Vec::new();
         for mut e in due {
-            let (imp, ok) = score(e.trigger, &e.before, m);
+            let (imp, ok) = score_for(&e.kind, &e.action, e.trigger, &e.before, m);
             e.after = Some(m.clone());
             e.improvement = imp;
             e.success = ok;
@@ -289,7 +341,7 @@ impl Learner {
             let s = &self.stats[*k];
             format!("{{\"kind\":\"{}\",\"action\":\"{}\",\"name\":\"{}\",\"tries\":{},\"successes\":{},\"mean_imp\":{:.3}}}", esc(&k.0), esc(&k.1), esc(&k.2), s.tries, s.successes, s.mean_imp)
         }).collect();
-        crate::rules::write_atomic(&d.join("learn-stats.json"), &format!("{{\"unix\":{:.0},\"stats\":[\n{}\n]}}\n", self.now, lines.join(",\n")));
+        crate::rules::write_atomic(&d.join("learn-stats.json"), &format!("{{\"unix\":{:.0},\"ease\":2,\"stats\":[\n{}\n]}}\n", self.now, lines.join(",\n")));
     }
 
     // ---- questions ----
@@ -345,7 +397,9 @@ impl Learner {
         if a == "terminate" || a.starts_with("restart") || a == "report" { return None; }
         let same = |f: &Feedback| f.name == n && action_kind(&f.action).to_lowercase() == a;
         let last_no = self.feedback.iter().filter(|f| f.name == n && (f.signal == "undo" || (f.signal == "dismiss" && same(f)))).map(|f| f.unix).fold(0.0, f64::max);
-        let yes = self.feedback.iter().filter(|f| f.signal == "approve" && same(f) && f.unix > last_no).count();
+        let mut times: Vec<f64> = self.feedback.iter().filter(|f| f.signal == "approve" && same(f) && f.unix > last_no).map(|f| f.unix).collect();
+        times.sort_by(f64::total_cmp);
+        let yes = times.iter().fold((0usize, f64::MIN), |(n, last), &t| if t - last >= APPROVAL_GAP_SECS { (n + 1, t) } else { (n, last) }).0;
         let st = self.stats.get(&skey("fix", &a, &n))?;
         (yes >= EARN_APPROVALS && st.successes >= 2 && st.successes * 2 >= st.tries)
             .then(|| format!("you said yes {} times and it helped {} of {} times", yes, st.successes, st.tries))
@@ -607,17 +661,42 @@ mod trust_tests {
         l.stats.insert(skey("fix", "lower-priority", "git.exe"), Stat { tries: 3, successes: 2, mean_imp: 0.3 });
         l.add_feedback(fb("approve", "lower-priority", 10.0));
         assert!(l.earned("lower-priority", "git.exe").is_none(), "one yes is not enough");
-        l.add_feedback(fb("approve", "lower-priority", 20.0));
+        l.add_feedback(fb("approve", "lower-priority", 15.0));
+        assert!(l.earned("lower-priority", "git.exe").is_none(), "two cards in one go are one yes");
+        l.add_feedback(fb("approve", "lower-priority", 20.0 + APPROVAL_GAP_SECS));
         assert!(l.earned("lower-priority", "GIT.EXE").is_some());
         assert!(l.earned("terminate", "git.exe").is_none(), "ending never goes automatic");
-        l.add_feedback(fb("dismiss", "trim", 30.0));
+        l.add_feedback(fb("dismiss", "trim", 30.0 + APPROVAL_GAP_SECS));
         assert!(l.earned("lower-priority", "git.exe").is_some(), "a no to another fix does not count");
-        l.add_feedback(fb("undo", "demote", 40.0));
+        l.add_feedback(fb("undo", "demote", 40.0 + APPROVAL_GAP_SECS));
         assert!(l.earned("lower-priority", "git.exe").is_none(), "an undo sends it back to asking");
-        l.add_feedback(fb("approve", "lower-priority", 50.0));
-        l.add_feedback(fb("approve", "lower-priority", 60.0));
+        l.add_feedback(fb("approve", "lower-priority", 50.0 + APPROVAL_GAP_SECS));
+        l.add_feedback(fb("approve", "lower-priority", 60.0 + 2.0 * APPROVAL_GAP_SECS));
         assert!(l.earned("lower-priority", "git.exe").is_some(), "and it can be earned back");
         l.stats.get_mut(&skey("fix", "lower-priority", "git.exe")).unwrap().tries = 6;
         assert!(l.earned("lower-priority", "git.exe").is_none(), "stops when it stops helping");
+    }
+
+    /// The bug: approved priority eases were scored by total CPU, which they do not lower, so
+    /// kimi.exe/comet.exe/claude.exe never earned trust however often the user said yes.
+    #[test]
+    fn approved_ease_earns_trust_when_the_pc_stays_calm() {
+        let calm = |cpu: f64| Metrics { total_cpu_pct: cpu, commit_pct: 70.0, avail_mb: 20000.0, fg_cpu_pct: Some(10.0), feel_ms: Some(0.5) };
+        let mut l = Learner::new();
+        for i in 0..3 {
+            let t = i as f64 * 1000.0;
+            l.add_feedback(fb("approve", "lower-priority", t));
+            l.start("fix", "lower-priority", "git.exe", Trigger::Cpu, t, calm(60.0));
+            l.tick(t + EVAL_AFTER_SECS, &calm(61.0)); // CPU did not drop: it never does for a priority ease
+        }
+        assert!(l.earned("lower-priority", "git.exe").is_some(), "3 yeses, PC calm after each");
+        // still a failure when the PC got sluggish, and other fixes keep the CPU yardstick
+        let slow = Metrics { feel_ms: Some(200.0), ..calm(61.0) };
+        assert!(!score_ease(Trigger::Cpu, &calm(60.0), &slow).1);
+        assert!(!score_for("fix", "trim", Trigger::Cpu, &calm(60.0), &calm(61.0)).1);
+        // no feel reading: fine unless CPU climbed
+        let nf = |cpu: f64| Metrics { feel_ms: None, ..calm(cpu) };
+        assert!(score_ease(Trigger::Cpu, &nf(50.0), &nf(52.0)).1);
+        assert!(!score_ease(Trigger::Cpu, &nf(50.0), &nf(70.0)).1);
     }
 }

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snifrig</title>
+<meta name="description" content="snifrig keeps a busy Windows PC fast without closing what you use. Public beta.">
+<link rel="icon" href="https://raw.githubusercontent.com/estejosh/snifrig/main/assets/icon-64.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#111317;--card:#1c2026;--line:#2c323a;--text:#e4e7eb;--soft:#c9ced5;--muted:#a7afb9;--accent:#e8a33d;--accent2:#f3bd68;--deal:#241d12}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',system-ui,sans-serif;line-height:1.5}
+a{color:var(--accent)}a:hover{color:var(--accent2)}
+.wrap{max-width:1040px;margin:0 auto;padding:32px 16px 48px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+header img{width:48px;height:48px;border-radius:10px}
+.brand{flex-grow:1;font-family:Archivo,sans-serif;font-weight:800;font-size:30px;letter-spacing:-.5px}
+.pill{font-size:13px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:6px 14px}
+.beta{color:var(--accent);border-color:var(--accent)}
+.hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:32px;align-items:center;margin-top:40px}
+h1{margin:0;font-family:Archivo,sans-serif;font-weight:800;font-size:clamp(32px,5vw,46px);line-height:1.08;letter-spacing:-.8px}
+h1 span{color:var(--accent)}
+.hero p{color:var(--soft);font-size:16px}
+.hero img{width:100%;border-radius:10px;border:1px solid var(--line);display:block}
+.cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}
+.btn{display:inline-block;padding:12px 20px;border-radius:10px;font-weight:600;text-decoration:none;min-height:44px}
+.btn.primary{background:var(--accent);color:#16120a}.btn.primary:hover{background:var(--accent2);color:#16120a}
+.btn.ghost{border:1px solid var(--line);color:var(--text)}
+h2{margin:48px 0 14px;font-family:Archivo,sans-serif;font-weight:600;font-size:13px;letter-spacing:1.6px;text-transform:uppercase;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+.card b{display:block;color:var(--accent);font-size:15px;margin-bottom:6px}
+.card div{font-size:14px;color:var(--soft)}
+.price{font-family:Archivo,sans-serif;font-weight:800;font-size:30px;margin:4px 0}
+.price small{font-size:15px;color:var(--muted);font-weight:600}
+.deal{background:var(--deal);border:1.5px solid var(--accent)}
+ol{color:var(--soft);padding-left:20px}
+code{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:1px 6px}
+details{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin-bottom:10px}
+summary{cursor:pointer;font-weight:600}
+details p{color:var(--soft);margin:10px 0 0}
+footer{margin-top:48px;border-top:1px solid var(--line);padding-top:16px;font-size:13px;color:var(--muted);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<img src="https://raw.githubusercontent.com/estejosh/snifrig/main/assets/icon-128.png" alt="snifrig logo, a bloodhound in a horned helmet">
+<div class="brand">snifrig</div>
+<span class="pill beta">Public beta</span>
+<span class="pill">For Windows 10 and 11</span>
+</header>
+
+<section class="hero">
+<div>
+<h1>Your PC is fast. <span>Until ten apps fight over it.</span></h1>
+<p>I run local AI models, cloud tools and a browser full of tabs on one workstation, and it still crawled. So I built snifrig. It keeps a hard-working PC running like butter, without closing anything you are using.</p>
+<p style="color:var(--muted);font-size:14px">Josh, founder</p>
+<div class="cta">
+<a class="btn primary" href="https://github.com/estejosh/snifrig/releases/latest/download/snifrig-setup.exe">Download the beta</a>
+<a class="btn ghost" href="https://github.com/estejosh/snifrig/releases/latest">Release notes</a>
+</div>
+</div>
+<img src="https://raw.githubusercontent.com/estejosh/snifrig/main/assets/store/2-overview.png" alt="The snifrig window: CPU, memory and graphics card, the apps it eased in the background, and a question waiting for approval">
+</section>
+
+<h2>What it does</h2>
+<div class="grid">
+<div class="card"><b>Watches how it feels</b><div>CPU, memory, disk, graphics card, and the lag on your own mouse and keys.</div></div>
+<div class="card"><b>Never closes what you use</b><div>The app in front is never touched. Apps on your other screen stay smooth.</div></div>
+<div class="card"><b>Turns down what's hidden</b><div>Busy background apps step down, and get full speed back the moment you switch.</div></div>
+<div class="card"><b>Learns from you</b><div>Say yes twice to a fix that helps, and it does it by itself next time, with an undo.</div></div>
+<div class="card"><b>Quick fix, one press</b><div>Ctrl+Alt+Shift+S, or one tap on your phone, gives you your PC back when it crawls.</div></div>
+<div class="card"><b>Stays on your PC</b><div>No account, no cloud. Your AI assistant can read it if you connect it.</div></div>
+</div>
+
+<h2>Pricing</h2>
+<div class="grid">
+<div class="card"><div>snifrig monitor</div><div class="price">Free</div><div>Watching, alerts, and a plain-words report of what slowed you down.</div></div>
+<div class="card"><div>snifrig fix, during the beta</div><div class="price">Free<small> for 30 days</small></div><div>Easing, learning, quick fix and the phone remote. Email us for a 30-day beta key.</div></div>
+<div class="card deal"><div style="color:var(--accent);font-weight:600">Founder lifetime deal</div><div class="price">$29<small> once</small></div><div>1 PC, or $49 for 5 PCs. First 200 buyers, Nov 9 to 22. 60-day refund.</div></div>
+</div>
+<p style="color:var(--muted);font-size:14px">After the beta, snifrig fix is $4.99 a month, or $29.94 a year.</p>
+
+<h2>Install</h2>
+<ol>
+<li>Download <code>snifrig-setup.exe</code> and run it.</li>
+<li>The beta is not code-signed yet, so Windows SmartScreen may say "Windows protected your PC". Click <b>More info</b>, then <b>Run anyway</b>.</li>
+<li>snifrig starts at login with a tray icon. Open the window from the tray or the Start menu.</li>
+<li>For snifrig fix: open the app, go to Settings, copy your PC ID, and email it to us for a beta key.</li>
+</ol>
+
+<h2>Questions</h2>
+<details><summary>Is it safe to run a beta?</summary><p>snifrig never ends an app on its own. It only lowers the priority of busy background apps, and every change has an undo. Ending or restarting anything asks you first. Uninstall any time from Settings &gt; Apps.</p></details>
+<details><summary>Does it send my data anywhere?</summary><p>No. Everything stays on your PC. There is no account and no phone-home. Alerts go out only if you set up a webhook yourself.</p></details>
+<details><summary>Why is SmartScreen warning me?</summary><p>The installer is not signed with a paid code-signing certificate yet. The source is public on GitHub, so you can read or build it yourself.</p></details>
+<details><summary>Something went wrong. What now?</summary><p>Email <a href="mailto:helpmeagent@agentmail.to">helpmeagent@agentmail.to</a> with what happened. A crash leaves <code>crash.log</code> in <code>%LOCALAPPDATA%\snifrig</code>; attach it if you can.</p></details>
+<details><summary>What is the refund policy?</summary><p>Every paid plan gets a 30-day refund. Founder lifetime buyers get 60 days.</p></details>
+
+<footer>
+<span>snifrig keeps your PC fast without closing what you use.</span>
+<span><a href="https://github.com/estejosh/snifrig">GitHub</a> · <a href="mailto:helpmeagent@agentmail.to">helpmeagent@agentmail.to</a></span>
+</footer>
+</div>
+</body>
+</html>

@@ -1,6 +1,6 @@
 [package]
 name = "snifrig-setup"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 edition = "2021"
 description = "One-file installer for snifrig (per user, no admin)"
 license-file = "../LICENSE"

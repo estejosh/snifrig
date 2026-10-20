@@ -10,6 +10,24 @@ All notable changes to snifrig are listed here.
 - Earlier releases and commits keep the license they were published under (UFL 3.4 Noncommercial).
 - UFL 1C: projects move forward only.
 
+## 0.4.0-beta.1 - 2026-10-20 (public beta)
+
+This is a beta. The installer is not code-signed yet. Report problems to helpmeagent@agentmail.to.
+
+- snifrig app: a window for everything (see below), a welcome screen, license code and acceptance in the app.
+- One-file installer `snifrig-setup.exe` with an uninstall entry in Settings > Apps.
+- Feel meter: times the app in front, scheduling lag and real input (timestamps only, never keys). It gates the governor and grades every fix.
+- Which app feels slow, and why: every window on a screen is pinged against its own usual answer time.
+- Quick fix: every busy background app eased at once, held 2 minutes.
+- Learning: fixes you approve that help become automatic. An undo or a no sends them back to asking. Priority eases are now judged by how the PC felt afterwards, not by total CPU, so they can earn trust. Several cards approved in one go count as one yes.
+- Never steals focus from a game. Questions wait while a full-screen app or game is in front. Borderless games count as games.
+- "I use this, keep it fast" button (rule `keep=yes`).
+- Learns heavy loads (WSL, hidden full-screen games). Never restarts dwm while a game runs.
+- The fixer saves what it eased and undoes leftovers after a crash. Crash log, and the tray restarts the fixer if it stops.
+- Monitor: looks inside WSL, detects pileups of identical processes that never exit.
+- Never ends apps in use. snifrig eases; ending or restarting asks first.
+- snifrig-mcp server for AI clients. Alerts to Telegram via n8n (recipe in `integrations/n8n`).
+
 ## Unreleased
 
 - snifrig app: a real window for everything. Overview (live CPU, memory, GPU and graphics memory, what slows the PC, apps eased in the background with Put back, fixes waiting for your OK with Approve and Dismiss, busiest apps with Make a rule), Governor settings with sliders and a live CPU chart, App rules editor (pick a running app, priority, efficiency, disk and memory priority, core picker, CPU limit, copies, governor and game options, suggestions), Performance mode (power plan, games snifrig knows), Activity log with filters and a 24 h memory chart, Report, Settings (fixer mode, license, local brain, data folder). Opens from the tray (double-click or Open snifrig) and the Start menu. Runs only while open.

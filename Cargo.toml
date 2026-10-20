@@ -1,6 +1,6 @@
 [package]
 name = "snifrig"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 edition = "2021"
 description = "Low-footprint Windows leak monitor: kernel pool tags, handles, commit, spawn churn. One process, no children."
 license = "LicenseRef-UFL-3.7-U.P-snifrig-fix"
