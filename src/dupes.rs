@@ -168,6 +168,70 @@ pub fn unsure_message(d: &Dup, c: &[Cand], parent: &str, started: &str) -> Strin
         d.name, d.other.min(d.idle), d.other.max(d.idle), started, gb(d.other.min(d.idle)), gb(d.other.max(d.idle)), shown, parent)
 }
 
+/// Pileup: many small copies of one command that never exit, usually something scheduled that
+/// starts it again without checking it is already running. The big-process check above misses
+/// these (each copy is small); together they eat RAM and handles and make the PC crawl.
+const PILE_MIN: usize = 15;
+const PILE_MAX_READ: usize = 400;
+
+#[derive(Debug, PartialEq)]
+pub struct Pile { pub name: String, pub cmd: String, pub pids: Vec<u32>, pub first: u64, pub last: u64, pub private: u64, pub parent: u32 }
+
+/// Pure: groups of PILE_MIN or more identical command lines (programs outside C:\Windows),
+/// with launcher shims folded in (a group whose members are mostly children of another group's
+/// members belongs to that group).
+pub fn piles(c: &[Cand]) -> Vec<Pile> {
+    let mut m: HashMap<(String, &str), Vec<&Cand>> = HashMap::new();
+    for x in c {
+        let l = x.cmd.to_lowercase();
+        if x.cmd.is_empty() || l.trim_start_matches(|c: char| c == '"' || c == '\\' || c == '?').starts_with("c:\\windows\\") { continue; }
+        m.entry((x.name.to_lowercase(), x.cmd.as_str())).or_default().push(x);
+    }
+    let groups: Vec<Vec<&Cand>> = m.into_values().filter(|g| g.len() >= PILE_MIN).collect();
+    let pid_sets: Vec<HashSet<u32>> = groups.iter().map(|g| g.iter().map(|x| x.pid).collect()).collect();
+    let mut out = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        // Children of another group (the real program under a venv launcher): skip, the parent group reports.
+        let shim_child = pid_sets.iter().enumerate().any(|(j, s)| j != i && g.iter().filter(|x| s.contains(&x.ppid)).count() * 2 > g.len());
+        if shim_child { continue; }
+        let mut pids: Vec<u32> = g.iter().map(|x| x.pid).collect();
+        pids.sort();
+        let private: u64 = g.iter().map(|x| x.private).sum::<u64>()
+            + c.iter().filter(|x| pid_sets[i].contains(&x.ppid) && !pid_sets[i].contains(&x.pid)).map(|x| x.private).sum::<u64>();
+        let newest = g.iter().max_by_key(|x| x.created).unwrap();
+        out.push(Pile { name: g[0].name.clone(), cmd: g[0].cmd.clone(), pids, first: g.iter().map(|x| x.created).min().unwrap_or(0), last: newest.created, private, parent: newest.ppid });
+    }
+    out.sort_by(|a, b| b.pids.len().cmp(&a.pids.len()));
+    out
+}
+
+/// "about one every 15 minutes" from the first and last start times (FILETIME).
+fn every(p: &Pile) -> String {
+    let n = p.pids.len().max(2) as f64 - 1.0;
+    let mins = (p.last.saturating_sub(p.first) as f64 / 1e7 / 60.0) / n;
+    if mins < 1.0 { "several a minute".into() } else if mins < 90.0 { format!("about one every {:.0} minutes", mins) } else { format!("about one every {:.1} hours", mins / 60.0) }
+}
+
+pub fn pile_message(p: &Pile, parent: &str) -> String {
+    let mb = p.private as f64 / 1048576.0;
+    let size = if mb >= 1024.0 { format!("{:.1} GB", mb / 1024.0) } else { format!("{:.0} MB", mb) };
+    format!("{} copies of the same program are running and none of them exit: {} ({}). They started {} since {}, and together hold {} of RAM. Launched by: {}. Something keeps starting it again without checking that it is already running; fix the launcher, then end the extra copies (keep the newest).",
+        p.pids.len(), script_names(&p.cmd), p.name, every(p), day_hhmm(p.first), size, parent)
+}
+
+/// "Oct 17 07:12" style local time of a FILETIME.
+fn day_hhmm(ft: u64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    const M: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    unsafe {
+        let f = FILETIME { dwLowDateTime: ft as u32, dwHighDateTime: (ft >> 32) as u32 };
+        let (mut u, mut l): (SYSTEMTIME, SYSTEMTIME) = (core::mem::zeroed(), core::mem::zeroed());
+        if FileTimeToSystemTime(&f, &mut u) == 0 || SystemTimeToTzSpecificLocalTime(core::ptr::null(), &u, &mut l) == 0 { return "?".into(); }
+        format!("{} {} {:02}:{:02}", M[(l.wMonth as usize).saturating_sub(1) % 12], l.wDay, l.wHour, l.wMinute)
+    }
+}
+
 pub struct Dupes {
     last: f64,
     prev_cpu: HashMap<u32, u64>,
@@ -182,6 +246,7 @@ impl Dupes {
         if t - self.last < EVERY_SECS { return Vec::new(); }
         self.last = t;
         let mut out = self.dupes(t, procs);
+        out.extend(self.piles(t, procs));
         out.extend(self.vram(t, dir));
         out
     }
@@ -209,6 +274,33 @@ impl Dupes {
             };
             let msg = if d.sure { message(&d, &cands, &parent, &started) } else { unsure_message(&d, &cands, &parent, &started) };
             out.push((key, msg));
+        }
+        out
+    }
+
+    fn piles(&mut self, t: f64, procs: &[Proc]) -> Vec<(String, String)> {
+        let ft_now = (t * 1e7) as u64 + EPOCH_DIFF_100NS;
+        // Cheap first pass: only names with many copies get their command lines read.
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        for p in procs.iter().filter(|p| p.pid > 4) { *by_name.entry(p.name.to_lowercase()).or_default() += 1; }
+        let many: HashSet<String> = by_name.into_iter().filter(|(_, n)| *n >= PILE_MIN).map(|(k, _)| k).collect();
+        if many.is_empty() { return Vec::new(); }
+        let mut read: HashMap<String, usize> = HashMap::new();
+        let cands: Vec<Cand> = procs.iter()
+            .filter(|p| p.pid > 4 && many.contains(&p.name.to_lowercase()) && ft_now.saturating_sub(p.created) as f64 / 1e7 > MIN_AGE_SECS)
+            .filter(|p| { let n = read.entry(p.name.to_lowercase()).or_default(); *n += 1; *n <= PILE_MAX_READ })
+            .filter_map(|p| Some(Cand { pid: p.pid, ppid: p.ppid, name: p.name.clone(), private: p.private, created: p.created, cpu: p.cpu, cmd: cmdline(p.pid)? }))
+            .collect();
+        let mut out = Vec::new();
+        for p in piles(&cands) {
+            let key = format!("pile:{}:{}", p.name.to_lowercase(), script_names(&p.cmd));
+            if t - self.cool.get(&key).copied().unwrap_or(0.0) < REALERT_SECS { continue; }
+            self.cool.insert(key.clone(), t);
+            let parent = match procs.iter().find(|x| x.pid == p.parent) {
+                Some(x) => { let s = cmdline(x.pid).map(|c| script_names(&c)).unwrap_or_default(); if s.is_empty() { x.name.clone() } else { s } }
+                None => "a process that has already exited".to_string(),
+            };
+            out.push((key, pile_message(&p, &parent)));
         }
         out
     }
@@ -254,6 +346,24 @@ mod tests {
 
     fn c(pid: u32, ppid: u32, name: &str, cmd: &str, cpu: u64, created: u64) -> Cand {
         Cand { pid, ppid, name: name.into(), private: 10 << 30, created, cpu, cmd: cmd.into() }
+    }
+
+    #[test]
+    fn pileup_found_and_launcher_shim_folded() {
+        let mut v = Vec::new();
+        for i in 0..20u32 {
+            let shim = 1000 + i * 2;
+            v.push(Cand { pid: shim, ppid: 7, name: "python.exe".into(), private: 4 << 20, created: 100 + i as u64 * 9_000_000_000, cpu: 0, cmd: "\"X:\\venv\\python.exe\" -m http.server 8190".into() });
+            v.push(Cand { pid: shim + 1, ppid: shim, name: "python.exe".into(), private: 10 << 20, created: 101 + i as u64 * 9_000_000_000, cpu: 0, cmd: "\"X:\\Python\\python.exe\" -m http.server 8190".into() });
+        }
+        for i in 0..20u32 { v.push(Cand { pid: 5000 + i, ppid: 1, name: "conhost.exe".into(), private: 1 << 20, created: 0, cpu: 0, cmd: "\\??\\C:\\Windows\\system32\\conhost.exe 0xffffffff".into() }); }
+        let p = piles(&v);
+        assert_eq!(p.len(), 1, "one pileup, the shim's children folded in, Windows' own conhost ignored");
+        assert_eq!(p[0].pids.len(), 20);
+        assert_eq!(p[0].private, 20 * (14 << 20));
+        assert!(every(&p[0]).contains("15 minutes"), "{}", every(&p[0]));
+        let mut few = v.clone(); few.truncate(10);
+        assert!(piles(&few).is_empty(), "five pairs is not a pileup");
     }
 
     #[test]
