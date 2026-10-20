@@ -274,6 +274,8 @@ static mut RESTARTS: Vec<u64> = Vec::new();
 unsafe fn fixer_watchdog() {
     let d = dir();
     if d.join("stop-fix").exists() || !d.join("snifrig-fix.key").exists() { return; }
+    // Stopped on purpose a moment ago (an update): give it two minutes before bringing it back.
+    if std::fs::metadata(d.join("fix-stopped")).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map_or(false, |e| e.as_secs() < 120) { return; }
     let h = windows_sys::Win32::System::Threading::OpenMutexW(0x0010_0000, 0, wide("Global\\snifrig-fix").as_ptr());
     if !h.is_null() { windows_sys::Win32::Foundation::CloseHandle(h); return; }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

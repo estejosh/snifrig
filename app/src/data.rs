@@ -39,6 +39,8 @@ impl Suggestion {
             "ease" => format!("Always run {} in the background", self.app),
             "setting" => format!("Governor setting {}", self.setting),
             "restart_desktop" => "Restart the desktop (dwm is stuck)".into(),
+            "shutdown_wsl" => "WSL is using a lot of your CPU".into(),
+            "minimize_game" => format!("{} is hidden but still drawing", self.app),
             _ => "A note, nothing to change".into(),
         }
     }

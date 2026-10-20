@@ -131,6 +131,29 @@ pub fn fullscreen_d3d() -> bool {
     st == 3 || (st == 2 && front_covers_monitor())
 }
 
+/// True if this window covers its whole monitor (a full-screen or borderless full-screen window).
+pub fn covers_monitor(h: isize) -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    unsafe {
+        let h = h as windows_sys::Win32::Foundation::HWND;
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(h, &mut r) == 0 { return false; }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 { return false; }
+        let s = mi.rcMonitor;
+        r.left <= s.left && r.top <= s.top && r.right >= s.right && r.bottom >= s.bottom
+    }
+}
+
+/// Minimize a window without activating anything (the app keeps running).
+pub fn minimize_quietly(h: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindowAsync;
+    unsafe { ShowWindowAsync(h as windows_sys::Win32::Foundation::HWND, 7 /* SW_SHOWMINNOACTIVE */) != 0 }
+}
+
 fn front_covers_monitor() -> bool {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};

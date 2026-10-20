@@ -260,6 +260,24 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
     out
 }
 
+/// At start: put back anything a previous fixer eased and never restored (it crashed or was
+/// killed). Only processes that are still the same process (pid + start time + name).
+pub fn recover(path: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
+    let mut out = Vec::new();
+    for l in text.lines() {
+        let f: Vec<&str> = l.splitn(6, ' ').collect();
+        if f.len() < 6 { continue; }
+        let (Ok(pid), Ok(created), Ok(level), Ok(orig), Ok(g)) = (f[0].parse::<u32>(), f[1].parse::<u64>(), f[2].parse::<u8>(), f[3].parse::<u32>(), f[4].parse::<u8>()) else { continue };
+        if level == 0 || !sys::image_matches(pid, created, f[5]) { continue; }
+        if apply_level(pid, level, 0, orig, g != 0).is_ok() {
+            out.push(format!("put {} (pid {}) back to normal: the last snifrig-fix eased it and stopped before it could", f[5], pid));
+        }
+    }
+    out
+}
+
 /// Apply one level change to a live process. Level 0 = original state.
 fn apply_level(pid: u32, from: u8, to: u8, orig_priority: u32, gentle: bool) -> Result<(), String> {
     if gentle {
@@ -517,6 +535,12 @@ impl Governor {
     /// Pids of this name the governor holds back, with their level.
     pub fn eased(&self, name: &str) -> Vec<(u32, u8)> {
         self.demoted.values().filter(|d| d.name.eq_ignore_ascii_case(name)).map(|d| (d.pid, d.level)).collect()
+    }
+
+    /// Write what is eased right now, so a crash can be undone at the next start.
+    pub fn save_demoted(&self, path: &std::path::Path) {
+        let body: String = self.demoted.values().map(|d| format!("{} {} {} {} {} {}\n", d.pid, d.created, d.level, d.orig_priority, d.gentle as u8, d.name)).collect();
+        let _ = std::fs::write(path, body);
     }
 
     /// Put everything back, e.g. on exit or pause.

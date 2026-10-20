@@ -237,6 +237,136 @@ fn ease(dir: &Path, id: &str) -> Result<String, String> {
     Ok(format!("{}: {}", t.name, done.join(", ")))
 }
 
+// ---- Heavy loads the governor cannot turn down ----
+// The Linux VM (WSL) and a hidden full-screen game that keeps the desktop redrawing. snifrig
+// asks first. After you say yes twice it does it by itself (and on a quick fix), unless you
+// marked the app "keep it fast". One "no" sends it back to asking. Never while you are in a game.
+
+struct Heavy { wsl_hot: f64, game_hidden: f64, last_game: String }
+static HEAVY: std::sync::Mutex<Heavy> = std::sync::Mutex::new(Heavy { wsl_hot: 0.0, game_hidden: 0.0, last_game: String::new() });
+const WSL_HEAVY_PCT: f64 = 150.0;
+
+/// Yeses for this kind since the last no.
+fn heavy_trust(dir: &Path, kind: &str) -> usize {
+    let text = std::fs::read_to_string(dir.join("heavy-trust.txt")).unwrap_or_default();
+    let mut yes = 0;
+    for l in text.lines() {
+        let mut it = l.split_whitespace();
+        match (it.next(), it.next()) { (Some("yes"), Some(k)) if k == kind => yes += 1, (Some("no"), Some(k)) if k == kind => yes = 0, _ => {} }
+    }
+    yes
+}
+
+fn heavy_said_no_lately(dir: &Path, kind: &str, secs: f64) -> bool {
+    let text = std::fs::read_to_string(dir.join("heavy-trust.txt")).unwrap_or_default();
+    text.lines().filter_map(|l| { let f: Vec<&str> = l.split_whitespace().collect(); (f.len() >= 3 && f[0] == "no" && f[1] == kind).then(|| f[2].parse::<f64>().ok()).flatten() })
+        .any(|t| now_unix() - t < secs)
+}
+
+/// Games snifrig has seen in front (games-seen.txt), so the desktop is never restarted under one.
+fn remember_game(dir: &Path, name: &str) {
+    let p = dir.join("games-seen.txt");
+    let text = std::fs::read_to_string(&p).unwrap_or_default();
+    if text.lines().any(|l| l.trim().eq_ignore_ascii_case(name)) { return; }
+    let _ = std::fs::write(&p, format!("{}{}\n", text, name));
+}
+
+/// A game that is running right now (in front, hidden or minimized), if any.
+fn running_game(dir: &Path) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_to_string(dir.join("games-seen.txt")).unwrap_or_default().lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
+    for r in rules::load(dir) { if r.game == Some(true) && !r.pattern.contains('*') { names.push(r.pattern.clone()); } }
+    if names.is_empty() { return None; }
+    let mut buf = Vec::new();
+    sys::snapshot(&mut buf).into_iter().map(|p| p.name.to_lowercase()).find(|n| names.contains(n))
+}
+
+fn heavy_log(dir: &Path, kind: &str, yes: bool) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("heavy-trust.txt")) {
+        let _ = writeln!(f, "{} {} {:.0}", if yes { "yes" } else { "no" }, kind, now_unix());
+    }
+}
+
+/// A non-minimized window of the last game that covers its monitor while something else is in front.
+fn hidden_game_window(gov: &snifrig_fix::governor::Governor, game: &str) -> Option<(isize, String)> {
+    if game.is_empty() || gov.game.is_some() { return None; }
+    let fg = sys::foreground_pid();
+    sys::visible_windows().into_iter().filter(|(_, pid)| Some(*pid) != fg)
+        .filter_map(|(h, pid)| gov.procs().iter().find(|p| p.pid == pid).map(|p| (h, p.name.clone())))
+        .find(|(h, name)| name.eq_ignore_ascii_case(game) && sys::covers_monitor(*h))
+}
+
+fn shutdown_wsl(dir: &Path, why: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    let st = std::process::Command::new("wsl.exe").arg("--shutdown").creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
+    if !st.success() { return Err("wsl --shutdown failed".into()); }
+    let msg = format!("shut down WSL (the Linux side): {}", why);
+    let alert = snifrig_fix::Alert { t: String::new(), key: "heavy:wsl".into(), msg: msg.clone() };
+    let t = Target { pid: 0, name: "vmmemwsl.exe".into(), ..Default::default() };
+    ledger::record(dir, &alert, &Action::Report, Some(&t), "done", &msg);
+    Ok(msg)
+}
+
+/// Look at the heavy loads; act on the ones you trusted, ask about the others. Returns what it did.
+fn check_heavy(dir: &Path, gov: &snifrig_fix::governor::Governor, now: f64, quick: bool) -> Vec<String> {
+    let mut did = Vec::new();
+    let Ok(mut hv) = HEAVY.lock() else { return did };
+    if let Some(g) = &gov.game { hv.last_game = g.to_lowercase(); remember_game(dir, &hv.last_game); }
+    if gov.game.is_some() { return did; } // in a game: hold everything
+    // WSL
+    let wsl = gov.name_pct("vmmemwsl.exe");
+    if wsl >= WSL_HEAVY_PCT { if hv.wsl_hot == 0.0 { hv.wsl_hot = now; } } else { hv.wsl_hot = 0.0; }
+    let crowded = gov.total_pct >= 60.0 || gov.dwm_pct >= 70.0 || gov.feels_slow;
+    if wsl >= WSL_HEAVY_PCT && !kept(dir, "vmmemwsl.exe") && (quick || (crowded && now - hv.wsl_hot >= 180.0)) {
+        hv.wsl_hot = now;
+        let linux_on_screen = gov.visible.iter().any(|n| { let n = n.to_lowercase(); n.starts_with("wsl") || n.contains("ubuntu") });
+        if heavy_trust(dir, "wsl") >= 2 && !linux_on_screen {
+            if let Ok(m) = shutdown_wsl(dir, &format!("it used {:.1} cores while the PC was crowded; you said yes to this before", wsl / 100.0)) { did.push(m); }
+        } else if !heavy_said_no_lately(dir, "wsl", 86400.0) {
+            add_card(dir, "shutdown_wsl", "vmmemwsl.exe", "shutdown_wsl", &format!("WSL (the Linux side of this PC) is using {:.1} cores while the PC is crowded. Shutting it down frees them at once; whatever runs in Linux stops. Say yes twice and snifrig does this by itself next time (never while a Linux window is on screen).", wsl / 100.0));
+        }
+    }
+    // A hidden game still drawing full screen keeps dwm busy.
+    let game = hv.last_game.clone();
+    match (gov.dwm_pct >= 50.0).then(|| hidden_game_window(gov, &game)).flatten() {
+        Some((h, name)) if !kept(dir, &name) => {
+            if hv.game_hidden == 0.0 { hv.game_hidden = now; }
+            if quick || now - hv.game_hidden >= 60.0 {
+                hv.game_hidden = now;
+                if quick || heavy_trust(dir, "minimize") >= 2 {
+                    if sys::minimize_quietly(h) {
+                        let m = format!("minimized {}: it was hidden but still drawing full screen, keeping the desktop at {:.0}% of a core", name, gov.dwm_pct);
+                        let alert = snifrig_fix::Alert { t: String::new(), key: "heavy:game".into(), msg: m.clone() };
+                        ledger::record(dir, &alert, &Action::Report, None, "done", &m);
+                        did.push(m);
+                    }
+                } else if !heavy_said_no_lately(dir, "minimize", 86400.0) {
+                    add_card(dir, "minimize_game", &name, "minimize_game", &format!("{} is hidden but still drawing full screen, which keeps the desktop (dwm) at {:.0}% of a core and makes every window stutter. Minimizing it stops that; the game keeps running. Say yes twice and snifrig does this by itself next time.", name, gov.dwm_pct));
+                }
+            }
+        }
+        _ => hv.game_hidden = 0.0,
+    }
+    did
+}
+
+/// `heavy wsl|minimize yes|no APP`: your answer on a card.
+fn heavy_cmd(dir: &Path, kind: &str, yes: bool, app: &str) -> Result<String, String> {
+    heavy_log(dir, kind, yes);
+    if !yes { return Ok("ok, snifrig won't ask about this for a day".into()); }
+    match kind {
+        "wsl" => shutdown_wsl(dir, "you said yes"),
+        "minimize" => {
+            let fg = sys::foreground_pid();
+            let n = sys::visible_windows().into_iter().filter(|(_, pid)| Some(*pid) != fg)
+                .filter(|(h, pid)| sys::covers_monitor(*h) && proc::target(*pid).map_or(false, |t| t.name.eq_ignore_ascii_case(app)))
+                .filter(|(h, _)| sys::minimize_quietly(*h)).count();
+            if n == 0 { Err(format!("{} has no hidden full-screen window right now", app)) } else { Ok(format!("minimized {}", app)) }
+        }
+        _ => Err("unknown kind".into()),
+    }
+}
+
 /// Apps you marked "I use this, keep it fast".
 fn kept(dir: &Path, name: &str) -> bool {
     let rs = rules::load(dir);
@@ -365,10 +495,12 @@ fn offer_desktop_restart(dir: &Path, pct: f64, now: f64) {
     let mem = snifrig_fix::judge::Memory::load(dir);
     let label = Action::RestartService("dwm".into()).label();
     if mem.declined("dwm.exe", &label, now).is_some() || mem.asked_recently("dwm.exe", &label, now) { return; }
+    // Restarting the desktop can freeze a game (even a minimized one): never while one runs.
+    if running_game(dir).is_some() { return; }
     let path = dir.join("ai-suggestions.json");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     if text.contains("\"restart_desktop\"") { return; }
-    let reason = format!("The desktop compositor (dwm) has used {:.0}% of a core for over 3 minutes. That is what makes the mouse and every window stutter. Restarting it takes a second: the screen flashes, your apps stay open. Windows asks you to confirm.", pct);
+    let reason = format!("The desktop compositor (dwm) has used {:.0}% of a core for over 3 minutes. That is what makes the mouse and every window stutter. Restarting it takes a second: the screen flashes and your apps stay open (games can freeze, so snifrig never offers this while one is running). Windows asks you to confirm.", pct);
     let item = format!("{{\"id\":\"desktop-{:.0}\",\"unix\":{:.0},\"kind\":\"restart_desktop\",\"app\":\"dwm.exe\",\"rule\":\"\",\"setting\":\"\",\"reason\":\"{}\",\"source\":\"snifrig\"}}", now, now, snifrig_fix::json::esc(&reason));
     let body = match text.find("\"items\":[") {
         Some(i) => { let at = i + 9; let rest = &text[at..]; format!("{}{}{}{}", &text[..at], item, if rest.trim_start().starts_with(']') { "" } else { "," }, rest) }
@@ -388,7 +520,12 @@ fn desktop(dir: &Path, yes: bool) -> Result<String, String> {
     if !yes {
         ledger::record(dir, &alert, &action, Some(&t), "dismissed", "you said not to restart the desktop");
         learn::append_feedback(dir, &Feedback::new("dismiss", "fix", "restart-service", "dwm.exe"));
+        heavy_log(dir, "desktop", false);
         return Ok("ok, leaving the desktop alone".into());
+    }
+    if let Some(g) = running_game(dir) {
+        ledger::record(dir, &alert, &action, Some(&t), "refused", &format!("{} is running; restarting the desktop can freeze it", g));
+        return Err(format!("{} is running, and restarting the desktop can freeze it. Close the game first.", g));
     }
     // dwm belongs to the system: ending it needs admin, so Windows shows its own confirmation.
     use std::os::windows::process::CommandExt;
@@ -396,6 +533,7 @@ fn desktop(dir: &Path, yes: bool) -> Result<String, String> {
         .creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
     if !st.success() { ledger::record(dir, &alert, &action, Some(&t), "refused", "the Windows confirmation was cancelled"); return Err("cancelled".into()); }
     ledger::record(dir, &alert, &action, Some(&t), "done", "restarted the desktop compositor with your OK; Windows started it again");
+    heavy_log(dir, "desktop", true);
     let mut f = Feedback::new("approve", "fix", "restart-service", "dwm.exe");
     f.start = true;
     learn::append_feedback(dir, &f);
@@ -586,10 +724,16 @@ fn run_quick(dir: &Path, gov: &mut snifrig_fix::governor::Governor, act: bool) {
         }
     }
     log_gov(dir, changes, act);
-    if gov.dwm_pct >= 50.0 { offer_desktop_restart(dir, gov.dwm_pct, now_unix()); }
+    let heavy = if act { check_heavy(dir, gov, now_unix(), true) } else { Vec::new() };
+    if gov.dwm_pct >= 70.0 && heavy.is_empty() && heavy_trust(dir, "desktop") >= 2 {
+        // You said yes to this twice: restart dwm now (Windows still asks you to confirm).
+        let d = dir.to_path_buf();
+        std::thread::spawn(move || { let _ = desktop(&d, true); });
+    } else if gov.dwm_pct >= 50.0 && heavy.is_empty() { offer_desktop_restart(dir, gov.dwm_pct, now_unix()); }
     learn::append_feedback(dir, &Feedback::new("feel_slow", "feel", "", ""));
-    let msg = format!("quick fix: eased {} busy background app{}{}, freed memory of {}; holding for 2 minutes, then easing back. Undo any of them in the app.",
+    let mut msg = format!("quick fix: eased {} busy background app{}{}, freed memory of {}; holding for 2 minutes, then easing back. Undo any of them in the app.",
         n, if n == 1 { "" } else { "s" }, if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) }, freed);
+    for h in &heavy { msg.push(' '); msg.push_str(h); }
     let alert = snifrig_fix::Alert { t: String::new(), key: "fix:quick".into(), msg: msg.clone() };
     ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
     let _ = std::fs::write(dir.join("quick-result.txt"), &msg);
@@ -746,6 +890,7 @@ fn watch(dir: &Path) {
     enf.reapply_secs = t0.reapply_secs;
     let mut tune_mt = tuning_mt(dir);
     let mut dwm_hot = 0.0f64;
+    for m in snifrig_fix::governor::recover(&dir.join("demoted.txt")) { note(dir, "gov:recover", "done", &m); }
     let mut slow_apps = snifrig_fix::slowapp::Tracker::default();
     let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
     // The feel gate was turned off while the meter was checked; it comes back on by itself after a day.
@@ -763,7 +908,12 @@ fn watch(dir: &Path) {
         Metrics { total_cpu_pct: gov.total_pct, commit_pct, avail_mb, fg_cpu_pct: gov.fg_cpu_pct, feel_ms: (f.samples >= 10).then(|| f.ms()) }
     };
     loop {
-        if stop.exists() { let _ = std::fs::remove_file(&stop); break; }
+        if stop.exists() {
+            let _ = std::fs::remove_file(&stop);
+            // Tells the tray's watchdog this stop was on purpose (an update, a pause): wait.
+            let _ = std::fs::write(dir.join("fix-stopped"), format!("{:.0}", now_unix()));
+            break;
+        }
         if n % 30 == 0 {
             let acting = gov.acting;
             let (_, ran) = process_once_ex(dir, Some((&learner, &mut gov, acting)));
@@ -793,7 +943,10 @@ fn watch(dir: &Path) {
         if n % 10 == 7 {
             let now = now_unix();
             if gov.dwm_pct >= DWM_STUCK_PCT { if dwm_hot == 0.0 { dwm_hot = now; } } else { dwm_hot = 0.0; }
-            if dwm_hot > 0.0 && now - dwm_hot >= DWM_STUCK_SECS { offer_desktop_restart(dir, gov.dwm_pct, now); dwm_hot = now; }
+            if gov.acting { check_heavy(dir, &gov, now, false); }
+            // A hidden game drawing full screen is the usual reason dwm is busy; only ask about
+            // restarting dwm when that is not it.
+            if dwm_hot > 0.0 && now - dwm_hot >= DWM_STUCK_SECS && hidden_game_window(&gov, &HEAVY.lock().map(|h| h.last_game.clone()).unwrap_or_default()).is_none() { offer_desktop_restart(dir, gov.dwm_pct, now); dwm_hot = now; }
         }
         if n % 30 == 20 {
             let g = std::fs::read_to_string(dir.join("gpu.json")).unwrap_or_default();
@@ -858,6 +1011,7 @@ fn watch(dir: &Path) {
             gov.user_says = learner.user_feel(now_unix());
             if let Some(s) = gov.user_says { gov.feels_slow = s; }
             let changes = gov.tick(now_unix(), act);
+            if !changes.is_empty() || n % 30 == 3 { gov.save_demoted(&dir.join("demoted.txt")); }
             let brain_game = |name: &str| brain.cache().get(name).map_or(false, |v| v.kind == "game" && v.confidence >= snifrig_fix::brain::MIN_CONF);
             for m in perf.tick(gov.procs(), sys::foreground_pid(), &rule_set, &gov.tuning, act, &brain_game) {
                 note(dir, "perf:mode", if act { "done" } else { "would" }, &m);
@@ -1092,6 +1246,7 @@ fn main() {
         ["approve", id] => out(approve(&dir, id)),
         ["dismiss", id] => out(dismiss(&dir, id)),
         ["keep", name] => out(keep_cmd(&dir, name)),
+        ["heavy", kind, yn @ ("yes" | "no"), app] => out(heavy_cmd(&dir, kind, *yn == "yes", app)),
         ["unkeep", name] => out(unkeep_cmd(&dir, name)),
         ["license", "install", path] => out(license::install(&dir, Path::new(path))),
         ["license", "accept"] => out(accept(&dir, flag("--accept-license"))),
