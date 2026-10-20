@@ -126,6 +126,9 @@ pub struct Demotion {
     pub created: u64,
     pub name: String,
     pub level: u8,
+    /// An app you asked to keep fast: its only "level" is below-normal priority (no efficiency
+    /// mode, no slow cores, no idle), so it gives way when the PC is swamped but never crawls.
+    pub gentle: bool,
     pub orig_priority: u32,
     pub since: f64,
     pub reason: String,
@@ -177,12 +180,15 @@ pub struct Hints {
     pub boost: HashMap<String, f64>,
     /// Deepest level the brain allows for this name (default MAX_LEVEL).
     pub max_level: HashMap<String, u8>,
+    /// Apps you said you use and want fast (rule keep=yes): untouched while on a screen,
+    /// only a lower priority while hidden.
+    pub keep: HashSet<String>,
     /// Thresholds in force (the Governor copies its settings in before deciding).
     pub tuning: Tuning,
 }
 
 impl Default for Hints {
-    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new(), tuning: Tuning::default() } }
+    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new(), keep: HashSet::new(), tuning: Tuning::default() } }
 }
 
 /// Pure policy without learning hints.
@@ -206,6 +212,10 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
             None => out.push(Step::Forget { key: *k }),
             Some(s) if s.foreground || (fg_names.contains(&s.name.as_str()) && s.windowed) =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 0, reason: format!("{} is now the app you are using", d.name) }),
+            // You asked to keep this app fast: on a screen it gets everything back; hidden, an old
+            // (not gentle) easing is put back so only the gentle one can apply.
+            Some(s) if hints.keep.contains(&s.name.to_lowercase()) && (s.onscreen || on_names.contains(&s.name.as_str()) || fg_names.contains(&s.name.as_str()) || !d.gentle) =>
+                out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 0, reason: format!("you asked snifrig to keep {} fast", d.name) }),
             // A windowless helper (a browser tab, a renderer) of the app in front may stay reined in, but only lightly.
             Some(s) if fg_names.contains(&s.name.as_str()) && d.level > 1 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is in front, so its busy background part is only kept in efficiency mode", d.name) }),
@@ -228,6 +238,9 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
             let mut cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level);
             // Helpers of the app in front, and apps showing on a screen, only get efficiency mode.
             if fg_names.contains(&s.name.as_str()) || on_names.contains(&s.name.as_str()) { cap = cap.min(1); }
+            if hints.keep.contains(&s.name.to_lowercase()) {
+                cap = if s.onscreen || fg_names.contains(&s.name.as_str()) || on_names.contains(&s.name.as_str()) { 0 } else { cap.min(1) };
+            }
             demoted.get(&s.key).map_or(0, |d| d.level) < cap
         })
         .collect();
@@ -248,7 +261,12 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
 }
 
 /// Apply one level change to a live process. Level 0 = original state.
-fn apply_level(pid: u32, from: u8, to: u8, orig_priority: u32) -> Result<(), String> {
+fn apply_level(pid: u32, from: u8, to: u8, orig_priority: u32, gentle: bool) -> Result<(), String> {
+    if gentle {
+        if from < 1 && to >= 1 { sys::set_priority(pid, sys::BELOW_NORMAL)?; }
+        if from >= 1 && to < 1 { sys::set_priority(pid, orig_priority)?; }
+        return Ok(());
+    }
     // Going up the ladder.
     if from < 1 && to >= 1 { sys::set_efficiency(pid, true)?; let _ = sys::set_io_priority(pid, 1); }
     if from < 2 && to >= 2 {
@@ -391,6 +409,7 @@ impl Governor {
             let n = s.name.to_lowercase();
             if let Some(m) = crate::rules::rule_max_level(&self.rules, &n) { self.hints.max_level.insert(n.clone(), m); }
         }
+        self.hints.keep = seen.iter().map(|s| s.name.to_lowercase()).filter(|n| crate::rules::rule_keeps(&self.rules, n)).collect();
         if let Some(g) = &self.game { self.hints.protect.insert(g.clone()); }
         for step in decide_with(total_pct, &self.mood, &seen, &self.demoted, &self.hints) {
             match step {
@@ -398,9 +417,10 @@ impl Governor {
                 Step::Demote { key, name, to_level, reason } => {
                     let from = self.demoted.get(&key).map_or(0, |d| d.level);
                     let orig = self.demoted.get(&key).map(|d| d.orig_priority).or_else(|| sys::get_priority(key.0)).unwrap_or(sys::NORMAL);
-                    let result = if !act { Ok(()) } else if !sys::image_matches(key.0, key.1, &name) { Err("pid reused".into()) } else { apply_level(key.0, from, to_level, orig) };
+                    let gentle = self.demoted.get(&key).map(|d| d.gentle).unwrap_or_else(|| self.hints.keep.contains(&name.to_lowercase()));
+                    let result = if !act { Ok(()) } else if !sys::image_matches(key.0, key.1, &name) { Err("pid reused".into()) } else { apply_level(key.0, from, to_level, orig, gentle) };
                     if result.is_ok() { // dry run tracks levels too, so it logs each step once, not every tick
-                        let e = self.demoted.entry(key).or_insert(Demotion { pid: key.0, created: key.1, name: name.clone(), level: 0, orig_priority: orig, since: now, reason: reason.clone() });
+                        let e = self.demoted.entry(key).or_insert(Demotion { pid: key.0, created: key.1, name: name.clone(), level: 0, orig_priority: orig, since: now, reason: reason.clone(), gentle });
                         e.level = to_level; e.reason = reason.clone();
                     }
                     // A process we cannot open or verify (Windows Update, protected services) is left
@@ -411,7 +431,7 @@ impl Governor {
                 Step::Restore { key, name, to_level, reason } => {
                     if now < self.hold_until && reason.starts_with("CPU is calm") { continue; }
                     let Some(d) = self.demoted.get(&key).cloned() else { continue };
-                    let result = if !act { Ok(()) } else if !sys::image_matches(key.0, key.1, &name) { Err("pid reused".into()) } else { apply_level(key.0, d.level, to_level, d.orig_priority) };
+                    let result = if !act { Ok(()) } else if !sys::image_matches(key.0, key.1, &name) { Err("pid reused".into()) } else { apply_level(key.0, d.level, to_level, d.orig_priority, d.gentle) };
                     if to_level == 0 { self.demoted.remove(&key); } else if let Some(e) = self.demoted.get_mut(&key) { e.level = to_level; }
                     changes.push(Change { pid: key.0, name, from: d.level, to: to_level, reason, result });
                 }
@@ -434,7 +454,7 @@ impl Governor {
         for k in keys {
             let Some(d) = self.demoted.remove(&k) else { continue };
             self.undone.insert(k);
-            let result = if !act { Ok(()) } else if !sys::image_matches(k.0, k.1, &d.name) { Err("pid reused".into()) } else { apply_level(k.0, d.level, 0, d.orig_priority) };
+            let result = if !act { Ok(()) } else if !sys::image_matches(k.0, k.1, &d.name) { Err("pid reused".into()) } else { apply_level(k.0, d.level, 0, d.orig_priority, d.gentle) };
             out.push(Change { pid, name: d.name, from: d.level, to: 0, reason: "you asked to undo it".into(), result });
         }
         out
@@ -448,11 +468,14 @@ impl Governor {
         let (key, name) = ((p.pid, p.created), p.name.clone());
         if Some(pid) == sys::foreground_pid() || self.undone.contains(&key) { return None; }
         let level = if self.onscreen.contains(&pid) { level.min(1) } else { level };
+        let gentle = self.hints.keep.contains(&name.to_lowercase()) || crate::rules::rule_keeps(&self.rules, &name.to_lowercase());
+        if gentle && self.onscreen.contains(&pid) { return None; }
+        let level = if gentle { level.min(1) } else { level };
         let from = self.demoted.get(&key).map_or(0, |d| d.level);
         if from >= level { return None; }
         let orig = self.demoted.get(&key).map(|d| d.orig_priority).or_else(|| sys::get_priority(pid)).unwrap_or(sys::NORMAL);
-        let result = if act { apply_level(pid, from, level, orig) } else { Ok(()) };
-        if result.is_ok() { self.demoted.insert(key, Demotion { pid, created: key.1, name: name.clone(), level, orig_priority: orig, since: crate::now_unix(), reason: reason.into() }); }
+        let result = if act { apply_level(pid, from, level, orig, gentle) } else { Ok(()) };
+        if result.is_ok() { self.demoted.insert(key, Demotion { pid, created: key.1, name: name.clone(), level, orig_priority: orig, since: crate::now_unix(), reason: reason.into(), gentle }); }
         Some(Change { pid, name, from, to: level, reason: reason.into(), result })
     }
 
@@ -500,7 +523,7 @@ impl Governor {
     pub fn restore_all(&mut self, act: bool) -> Vec<Change> {
         let all: Vec<(Key, Demotion)> = self.demoted.drain().collect();
         all.into_iter().map(|(k, d)| {
-            let result = if !act { Ok(()) } else if sys::image_matches(k.0, k.1, &d.name) { apply_level(k.0, d.level, 0, d.orig_priority) } else { Ok(()) };
+            let result = if !act { Ok(()) } else if sys::image_matches(k.0, k.1, &d.name) { apply_level(k.0, d.level, 0, d.orig_priority, d.gentle) } else { Ok(()) };
             Change { pid: k.0, name: d.name, from: d.level, to: 0, reason: "governor stopped or paused".into(), result }
         }).collect()
     }
@@ -521,7 +544,7 @@ mod gov_tests {
         assert_eq!(steps.len(), 1, "{:?}", steps);
         assert!(matches!(&steps[0], Step::Demote { key: (2, 1), to_level: 1, .. }));
         let mut d = HashMap::new();
-        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "comet.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "comet.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
         assert!(decide(95.0, &m, &[fg.clone(), tab.clone()], &d).is_empty(), "already at the cap for a front app's helper, no flapping");
         d.get_mut(&(2, 1)).unwrap().level = 3;
         assert!(matches!(&decide(95.0, &m, &[fg, tab], &d)[0], Step::Restore { to_level: 1, .. }));
@@ -534,8 +557,8 @@ mod gov_tests {
         let mut game = s(2, "legendsofidleon.exe", 150.0); game.windowed = true; game.onscreen = true;
         let mut hidden = s(3, "comet.exe", 140.0); hidden.windowed = true;
         let mut d = HashMap::new();
-        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
-        d.insert((3, 1), Demotion { pid: 3, created: 1, name: "comet.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
+        d.insert((3, 1), Demotion { pid: 3, created: 1, name: "comet.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
         let steps = decide(95.0, &m, &[fg.clone(), game.clone(), hidden.clone()], &d);
         assert_eq!(steps.len(), 1, "{:?}", steps);
         assert!(matches!(&steps[0], Step::Demote { key: (3, 1), to_level: 2, .. }), "the hidden app goes further, the one on screen stays at 1");
@@ -544,9 +567,9 @@ mod gov_tests {
         // The windowless renderer of an app on screen draws what you see: efficiency mode at most.
         let renderer = s(4, "legendsofidleon.exe", 200.0);
         let mut d2 = HashMap::new();
-        d2.insert((4, 1), Demotion { pid: 4, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
-        d2.insert((2, 1), Demotion { pid: 2, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
-        d2.insert((3, 1), Demotion { pid: 3, created: 1, name: "comet.exe".into(), level: 3, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d2.insert((4, 1), Demotion { pid: 4, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
+        d2.insert((2, 1), Demotion { pid: 2, created: 1, name: "legendsofidleon.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
+        d2.insert((3, 1), Demotion { pid: 3, created: 1, name: "comet.exe".into(), level: 3, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
         assert!(decide(95.0, &m, &[fg, game, hidden, renderer], &d2).is_empty(), "renderer of an on-screen app stays at 1, hidden app already at the bottom");
     }
 
@@ -567,7 +590,7 @@ mod gov_tests {
         h.tuning.max_level = 1;
         let m = Mood { busy_ticks: BUSY_TICKS, calm_ticks: 0 };
         let mut d = HashMap::new();
-        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "b.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d.insert((2, 1), Demotion { pid: 2, created: 1, name: "b.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
         let steps = decide_with(95.0, &m, &[s(1, "a.exe", 80.0), s(2, "b.exe", 300.0), s(3, "c.exe", 200.0)], &d, &h);
         assert_eq!(steps.len(), 1, "a under min_core_pct, b already at max_level 1: {:?}", steps);
         assert!(matches!(&steps[0], Step::Demote { key: (3, 1), to_level: 1, .. }));
@@ -615,7 +638,7 @@ mod gov_tests {
     #[test]
     fn foreground_restores_at_once_and_calm_restores_stepwise() {
         let mut d = HashMap::new();
-        d.insert((1, 1), Demotion { pid: 1, created: 1, name: "ffmpeg.exe".into(), level: 3, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d.insert((1, 1), Demotion { pid: 1, created: 1, name: "ffmpeg.exe".into(), level: 3, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
         let mut fg = s(1, "ffmpeg.exe", 300.0); fg.foreground = true;
         let steps = decide(90.0, &Mood { busy_ticks: 5, calm_ticks: 0 }, &[fg], &d);
         assert!(matches!(&steps[0], Step::Restore { to_level: 0, .. }));
@@ -647,8 +670,8 @@ mod gov_tests {
     #[test]
     fn gone_process_is_forgotten_and_max_level_not_exceeded() {
         let mut d = HashMap::new();
-        d.insert((9, 1), Demotion { pid: 9, created: 1, name: "gone.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
-        d.insert((1, 1), Demotion { pid: 1, created: 1, name: "ffmpeg.exe".into(), level: MAX_LEVEL, orig_priority: sys::NORMAL, since: 0.0, reason: String::new() });
+        d.insert((9, 1), Demotion { pid: 9, created: 1, name: "gone.exe".into(), level: 1, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
+        d.insert((1, 1), Demotion { pid: 1, created: 1, name: "ffmpeg.exe".into(), level: MAX_LEVEL, orig_priority: sys::NORMAL, since: 0.0, reason: String::new(), gentle: false });
         let steps = decide(95.0, &Mood { busy_ticks: BUSY_TICKS, calm_ticks: 0 }, &[s(1, "ffmpeg.exe", 400.0)], &d);
         assert!(steps.contains(&Step::Forget { key: (9, 1) }));
         assert!(!steps.iter().any(|x| matches!(x, Step::Demote { key: (1, 1), .. })));

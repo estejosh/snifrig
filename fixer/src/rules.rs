@@ -46,6 +46,9 @@ pub struct Rule {
     pub game: Option<bool>,
     /// Also set priority and disk priority the moment the program starts (Windows launch options).
     pub at_launch: bool,
+    /// keep=yes: you use this app and want it fast. Never slowed on a screen; hidden, only a
+    /// lower priority. Never asked about, never given a learned background rule.
+    pub keep: bool,
     /// The rule as written (whitespace normalised, comment removed).
     pub text: String,
 }
@@ -103,6 +106,10 @@ pub fn parse_line(line: &str) -> Result<Option<Rule>, String> {
             "max_level" => r.max_level = Some(match v.parse::<u8>() { Ok(n) if n <= 3 => n, _ => return Err(bad("0 to 3")) }),
             "game" => r.game = Some(match v.as_str() { "yes" | "on" => true, "no" | "off" => false, _ => return Err(bad("yes or no")) }),
             "at_launch" => r.at_launch = match v.as_str() { "yes" | "on" => true, "no" | "off" => false, _ => return Err(bad("yes or no")) },
+            "keep" => {
+                if v != "yes" { return Err(bad("yes")); }
+                r.keep = true;
+            }
             "background" => {
                 if v != "yes" { return Err(bad("yes")); }
                 r.efficiency = Some(true); r.io = Some(1); r.priority = Some(sys::BELOW_NORMAL);
@@ -160,6 +167,11 @@ pub fn pinned_names(dir: &Path) -> Vec<String> {
 pub fn is_pinned(rules: &[Rule], name: &str) -> bool { rules.iter().any(|r| r.pins() && glob_match(&r.pattern, name)) }
 
 /// The deepest governor level a rule allows for this name (first matching rule that sets one).
+/// True if a rule says you want this app kept fast (keep=yes).
+pub fn rule_keeps(rules: &[Rule], name: &str) -> bool {
+    rules.iter().any(|r| r.keep && glob_match(&r.pattern, name))
+}
+
 pub fn rule_max_level(rules: &[Rule], name: &str) -> Option<u8> {
     rules.iter().filter(|r| glob_match(&r.pattern, name)).find_map(|r| r.max_level.filter(|_| !r.pins()))
 }

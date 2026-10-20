@@ -125,7 +125,28 @@ extern "system" { fn SHQueryUserNotificationState(state: *mut i32) -> i32; }
 /// True while a Direct3D app runs exclusive full screen (QUNS_RUNNING_D3D_FULL_SCREEN).
 pub fn fullscreen_d3d() -> bool {
     let mut st = 0i32;
-    unsafe { SHQueryUserNotificationState(&mut st) == 0 && st == 3 }
+    if unsafe { SHQueryUserNotificationState(&mut st) } != 0 { return false; }
+    // 3 = exclusive full screen; 2 = busy: a borderless full-screen game shows up this way too,
+    // so check that the window in front really covers its whole monitor.
+    st == 3 || (st == 2 && front_covers_monitor())
+}
+
+fn front_covers_monitor() -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.is_null() { return false; }
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(h, &mut r) == 0 { return false; }
+        let m = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(m, &mut mi) == 0 { return false; }
+        let s = mi.rcMonitor;
+        r.left <= s.left && r.top <= s.top && r.right >= s.right && r.bottom >= s.bottom
+    }
 }
 
 /// Pids that own a visible top-level window with a title (what a person would call an open app).

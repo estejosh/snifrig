@@ -150,6 +150,8 @@ fn process_once_ex(dir: &Path, mut ctx: Option<(&Learner, &mut snifrig_fix::gove
                     acted += 1;
                 }
                 Verdict::Queue => {
+                    // You said you use this app and want it fast: never ask about slowing it.
+                    if kept(dir, &t.name) { continue; }
                     let learned = ctx.as_ref().and_then(|(l, _, _)| l.earned(&label, &learn_name(t)));
                     if let (Some(trust), Some((_, gov, act))) = (learned, ctx.as_mut()) {
                         let r = if action == Action::LowerPriority {
@@ -233,6 +235,46 @@ fn ease(dir: &Path, id: &str) -> Result<String, String> {
     ledger::record(dir, &alert, &Action::LowerPriority, Some(&t), "done", &note);
     learn::append_feedback(dir, &Feedback::new("dismiss", "fix", &item.action, &item.name));
     Ok(format!("{}: {}", t.name, done.join(", ")))
+}
+
+/// Apps you marked "I use this, keep it fast".
+fn kept(dir: &Path, name: &str) -> bool {
+    let rs = rules::load(dir);
+    rules::rule_keeps(&rs, &name.to_lowercase())
+}
+
+/// `keep NAME`: you use this app and want it fast. Replaces any rule written for exactly that
+/// name (a core limit, a background rule) with keep=yes, and drops the questions about it.
+fn keep_cmd(dir: &Path, name: &str) -> Result<String, String> {
+    let mut n = name.trim().to_lowercase();
+    if n.is_empty() || n.contains(char::is_whitespace) || n.contains('=') { return Err("give the program name, e.g. claude.exe".into()); }
+    if !n.ends_with(".exe") { n.push_str(".exe"); }
+    let mut removed = Vec::new();
+    loop {
+        let lines = rules::rule_lines(dir);
+        let Some(i) = lines.iter().position(|l| l.split_whitespace().next().map_or(false, |p| p.eq_ignore_ascii_case(&n))) else { break };
+        removed.push(lines[i].trim().to_string());
+        rules::remove(dir, i + 1)?;
+    }
+    rules::add(dir, &format!("{} keep=yes", n))?;
+    let mut items = ledger::load_pending(dir);
+    let before = items.len();
+    items.retain(|x| !x.name.eq_ignore_ascii_case(&n));
+    if items.len() != before { ledger::save_pending(dir, &items); }
+    learn::append_feedback(dir, &Feedback::new("keep", "user", "keep", &n));
+    let mut msg = format!("{} is kept fast: never slowed while it is on a screen, only a lower priority while hidden.", n);
+    if !removed.is_empty() { msg.push_str(&format!(" Replaced: {}.", removed.join("; "))); }
+    Ok(msg)
+}
+
+/// `unkeep NAME`: snifrig may ease it again like any other app.
+fn unkeep_cmd(dir: &Path, name: &str) -> Result<String, String> {
+    let mut n = name.trim().to_lowercase();
+    if !n.ends_with(".exe") { n.push_str(".exe"); }
+    let lines = rules::rule_lines(dir);
+    let i = lines.iter().position(|l| l.trim().eq_ignore_ascii_case(&format!("{} keep=yes", n))).ok_or("that app is not on the keep-fast list")?;
+    rules::remove(dir, i + 1)?;
+    Ok(format!("{} is no longer on the keep-fast list.", n))
 }
 
 fn dismiss(dir: &Path, id: &str) -> Result<String, String> {
@@ -515,6 +557,21 @@ fn add_card(dir: &Path, kind: &str, app: &str, rule: &str, reason: &str) {
     rules::write_atomic(&path, &body);
 }
 
+/// Write any panic (thread, message, where) to crash.log before the process ends, so a crash
+/// is never silent again. Kept to the last ~64 KB.
+fn crash_log(dir: &Path) {
+    let p = dir.join("crash.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current().name().unwrap_or("main").to_string();
+        let msg = info.payload().downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_default();
+        let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let line = format!("{:.0} snifrig-fix {} panicked at {}: {}\n", now_unix(), thread, loc, msg);
+        if std::fs::metadata(&p).map(|m| m.len() > 65536).unwrap_or(false) { let _ = std::fs::remove_file(&p); }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) { let _ = f.write_all(line.as_bytes()); }
+    }));
+}
+
 /// Run a quick-fix request (from the tray, the hotkey, the phone or `snifrig-fix quick`).
 fn run_quick(dir: &Path, gov: &mut snifrig_fix::governor::Governor, act: bool) {
     let changes = gov.quick(act, 120.0, None);
@@ -773,6 +830,7 @@ fn watch(dir: &Path) {
         }
         if n > 0 && n % 60 == 0 {
             sugg = rules::suggestions(dir);
+            sugg.retain(|(n, _)| !kept(dir, n));
             // Learned rules: a background program (no window, not in use) eased again and again all
             // week, never undone, just always runs in the background from now on.
             for (name, count) in sugg.clone() {
@@ -1033,6 +1091,8 @@ fn main() {
         ["pending"] => for p in ledger::load_pending(&dir) { println!("{}  {} {}#{}  {}", p.id, p.action, p.name, p.pid, p.why); },
         ["approve", id] => out(approve(&dir, id)),
         ["dismiss", id] => out(dismiss(&dir, id)),
+        ["keep", name] => out(keep_cmd(&dir, name)),
+        ["unkeep", name] => out(unkeep_cmd(&dir, name)),
         ["license", "install", path] => out(license::install(&dir, Path::new(path))),
         ["license", "accept"] => out(accept(&dir, flag("--accept-license"))),
         ["machine-id"] => match license::machine_hash() {
@@ -1044,7 +1104,14 @@ fn main() {
             println!("{}", if l.licensed { format!("licensed to {}, valid until {}; UFL-3.7 accepted: {}", l.licensee, l.not_after, if license::accepted(&dir) { "yes" } else { "no" }) } else { format!("{} (UFL-3.7 accepted: {})", l.note, if license::accepted(&dir) { "yes" } else { "no" }) });
         }
         ["once"] => { let n = process_once(&dir); println!("processed; {} automatic actions", n); }
-        [] => watch(&dir),
+        [] => {
+            // One fixer at a time (the tray's watchdog restarts it if it dies).
+            let name: Vec<u16> = "Global\\snifrig-fix".encode_utf16().chain(Some(0)).collect();
+            let _m = unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if unsafe { windows_sys::Win32::Foundation::GetLastError() } == 183 { eprintln!("snifrig-fix is already running."); std::process::exit(1); }
+            crash_log(&dir);
+            watch(&dir)
+        }
         ["governor", "status"] => out(gov_status(&dir)),
         ["governor", "undo", pid] => match pid.parse::<u32>() {
             Ok(p) => {

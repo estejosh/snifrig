@@ -46,6 +46,13 @@ fn fixer_exe() -> Option<PathBuf> {
 }
 
 /// The small "needs your OK" card, if the window app is installed.
+/// True while you are in a full-screen app (a game, a video, a presentation) or Focus is on:
+/// snifrig then shows nothing at all, and catches up when you come back.
+fn user_busy() -> bool {
+    let mut st = 0i32;
+    unsafe { windows_sys::Win32::UI::Shell::SHQueryUserNotificationState(&mut st) == 0 && st != 5 && st != 0 }
+}
+
 fn open_ask() -> bool {
     use std::os::windows::process::CommandExt;
     let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrig-app.exe"))).filter(|p| p.exists()) else { return false };
@@ -209,7 +216,7 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         let last = &mut *std::ptr::addr_of_mut!(LAST_HEAD);
         let changed = *last != st.headline;
         *last = st.headline.clone();
-        changed && st.severity >= 1 && !st.headline.is_empty() && now.saturating_sub(LAST_BALLOON) >= 1800 && !shown.iter().any(|x| x.0 == st.headline)
+        changed && !user_busy() && st.severity >= 1 && !st.headline.is_empty() && now.saturating_sub(LAST_BALLOON) >= 1800 && !shown.iter().any(|x| x.0 == st.headline)
     };
     if head_ball {
         let shown = &mut *std::ptr::addr_of_mut!(HEAD_SHOWN);
@@ -220,7 +227,7 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         put(&mut n.szInfo, &match st.causes.first() { Some(c) => format!("{} {}", st.headline, c), None => st.headline.clone() });
         n.dwInfoFlags = NIIF_WARNING;
     }
-    if !FIRST && st.level == 1 && st.last_alert_unix > LAST_ALERT && st.headline.is_empty() {
+    if !FIRST && !user_busy() && st.level == 1 && st.last_alert_unix > LAST_ALERT && st.headline.is_empty() {
         n.uFlags |= NIF_INFO;
         put(&mut n.szInfoTitle, "Snifrig alert");
         put(&mut n.szInfo, &st.last_alert);
@@ -233,6 +240,9 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
     let mut ids: Vec<(String, String)> = read_pending().into_iter().map(|p| (p.id, format!("Snifrig wants to {} {}.", p.action, p.name))).collect();
     let sug = std::fs::read_to_string(dir().join("ai-suggestions.json")).unwrap_or_default();
     for part in sug.split("\"id\":\"").skip(1) { if let Some(id) = part.split('"').next() { ids.push((id.to_string(), "Your AI assistant has a suggestion for snifrig.".into())); } }
+    // In a game or full screen: hold every question (not marked seen) until you are back.
+    let busy = user_busy();
+    if busy { ids.clear(); }
     if let Some((_, text)) = ids.iter().find(|(id, _)| !seen.contains(id)) {
         if FIRST || !open_ask() {
             n.uFlags |= NIF_INFO;
@@ -260,6 +270,24 @@ unsafe fn open_report() {
 static mut RESTARTS: Vec<u64> = Vec::new();
 
 // Restart the hidden monitor if it died: status is stale, its mutex is free, and the user did not stop it. Max 3 per hour.
+/// Bring the fixer back if it is installed, licensed, not asked to stop, and not running.
+unsafe fn fixer_watchdog() {
+    let d = dir();
+    if d.join("stop-fix").exists() || !d.join("snifrig-fix.key").exists() { return; }
+    let h = windows_sys::Win32::System::Threading::OpenMutexW(0x0010_0000, 0, wide("Global\\snifrig-fix").as_ptr());
+    if !h.is_null() { windows_sys::Win32::Foundation::CloseHandle(h); return; }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let r = &mut *std::ptr::addr_of_mut!(FIX_RESTARTS);
+    r.retain(|&t| now - t < 3600);
+    if r.len() >= 3 { return; }
+    if let Some(exe) = fixer_exe() {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        if std::process::Command::new(exe).arg("--dir").arg(d).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0000_0008 | 0x0800_0000).spawn().is_ok() { r.push(now); }
+    }
+}
+static mut FIX_RESTARTS: Vec<u64> = Vec::new();
+
 unsafe fn watchdog() {
     if read_status().level != 2 || dir().join("stop").exists() { return; }
     let h = windows_sys::Win32::System::Threading::OpenMutexW(0x0010_0000, 0, wide("Global\\snifrig-monitor").as_ptr());
@@ -394,7 +422,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_HOTKEY => { run_fix(&["quick"]); 0 }
         WM_TIMER => {
             let flag = dir().join("stop-tray");
-            if flag.exists() { let _ = std::fs::remove_file(&flag); DestroyWindow(hwnd); } else { watchdog(); refresh(hwnd, false); }
+            if flag.exists() { let _ = std::fs::remove_file(&flag); DestroyWindow(hwnd); } else { watchdog(); fixer_watchdog(); refresh(hwnd, false); }
             0
         }
         WM_COMMAND => {

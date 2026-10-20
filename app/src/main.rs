@@ -106,15 +106,45 @@ fn main() -> eframe::Result<()> {
         let (w, h) = (460.0, 440.0);
         egui::ViewportBuilder::default().with_title("snifrig needs your OK").with_inner_size([w, h]).with_position([r - w - 16.0, b - h - 16.0])
             .with_decorations(false).with_always_on_top().with_resizable(false).with_taskbar(false)
+            // Never take focus from what you are doing: the card appears, the click stays with you.
+            .with_active(false)
     } else {
         egui::ViewportBuilder::default().with_title("snifrig").with_inner_size(if rec.is_some() { [1280.0, 720.0] } else { [1280.0, 840.0] }).with_min_inner_size([900.0, 560.0])
     };
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-64.png")) { vp = vp.with_icon(Arc::new(icon)); }
+    if ask { no_focus_guard("snifrig needs your OK"); }
     let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
     eframe::run_native("snifrig", opts, Box::new(move |cc| { let mut a = App::new(cc, dir, ask);
         if demo { a.demo = true; a.live = demo::live(); *a.license.lock().unwrap() = "mode: ask\npaused: no\nlicense: Demo PC (1 seat, lifetime)\npending: 1".into(); }
         if let Some(r) = rec { let _ = std::fs::create_dir_all(&r); if let Ok(out) = std::fs::File::create(r.join("frames.rgba")) { a.rec = Some(Rec { dir: r, out, start: Instant::now(), last: Instant::now(), frames: 0, size: (0, 0) }); } }
         if let Some(s) = shot { let _ = std::fs::create_dir_all(&s); a.shot = Some((s, 0, Instant::now(), false)); } Ok(Box::new(a)) }))
+}
+
+/// The question card must never take focus (a game in front stays in front). Windows may still
+/// activate it when eframe first shows it, so: give it the never-activate style the moment it
+/// exists, and for its first seconds hand focus straight back to whatever had it.
+/// Clicks on its buttons still work with this style.
+fn no_focus_guard(title: &'static str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetForegroundWindow, GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW};
+    let prev = unsafe { GetForegroundWindow() } as isize;
+    std::thread::Builder::new().name("no-focus".into()).spawn(move || {
+        let t: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        let mut styled = false;
+        for _ in 0..100 {
+            unsafe {
+                let h = FindWindowW(std::ptr::null(), t.as_ptr());
+                if !h.is_null() {
+                    if !styled {
+                        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize);
+                        styled = true;
+                    }
+                    if prev != 0 && GetForegroundWindow() == h { SetForegroundWindow(prev as _); }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }).ok();
 }
 
 fn already_running(mutex: &str, title: &str) -> bool {
@@ -127,7 +157,10 @@ fn already_running(mutex: &str, title: &str) -> bool {
         if GetLastError() != 183 { return false; }
         let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
         let h = FindWindowW(std::ptr::null(), title.as_ptr());
-        if !h.is_null() { ShowWindow(h, SW_RESTORE); SetForegroundWindow(h); }
+        if !h.is_null() {
+            // The question card only shows itself; it never takes the keyboard from you.
+            if mutex.ends_with("-ask") { ShowWindow(h, 4 /* SW_SHOWNOACTIVATE */); } else { ShowWindow(h, SW_RESTORE); SetForegroundWindow(h); }
+        }
         true
     }
 }
@@ -517,6 +550,10 @@ impl App {
                     }
                 } else if ui.add(egui::Button::new(RichText::new("Approve").color(Color32::BLACK)).fill(ACCENT)).clicked() {
                     self.run("snifrig-fix.exe", vec!["approve".into(), p.id.clone()], &format!("Done: {} {}.", action_label(&p.action).to_lowercase(), p.name));
+                    self.snoozed.push(p.id.clone());
+                }
+                if ui.button("I use this, keep it fast").on_hover_text("Never slowed while it is on a screen; only a lower priority while hidden, so it can't swamp the PC. snifrig stops asking about it.").clicked() {
+                    self.run("snifrig-fix.exe", vec!["keep".into(), p.name.clone()], &format!("{} is kept fast. snifrig won't ask about it again.", p.name));
                     self.snoozed.push(p.id.clone());
                 }
                 if ui.button("Dismiss").clicked() { self.run("snifrig-fix.exe", vec!["dismiss".into(), p.id.clone()], "Dismissed."); self.snoozed.push(p.id.clone()); }
