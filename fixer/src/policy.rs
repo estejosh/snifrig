@@ -23,6 +23,15 @@ pub const DENY_CMDLINE: &[&str] = &["gpu_arbiter", "ferryman"];
 /// Safe to restart a service inside, never safe to terminate: one svchost can host many services.
 pub const NO_TERMINATE: &[&str] = &["svchost.exe"];
 
+/// True for a program cargo built (a test or dev binary under target\debug or target\release,
+/// or any ...\deps\ folder), judged from the program path at the start of the command line.
+pub fn build_output(cmd: &str) -> bool {
+    let c = cmd.to_lowercase();
+    let exe = c.trim_start_matches('"');
+    let exe = if c.starts_with('"') { exe.split('"').next().unwrap_or(exe) } else { exe.split(' ').next().unwrap_or(exe) };
+    (exe.contains("\\debug\\") || exe.contains("\\release\\")) && (exe.contains("target\\") || exe.contains("\\deps\\"))
+}
+
 pub const MIN_AGE_SECS: f64 = 120.0;
 pub const MAX_AUTO_PER_HOUR: usize = 3;
 
@@ -57,7 +66,11 @@ pub fn denied(t: &Target, action: &Action, extra: &[String]) -> Option<String> {
         return Some(format!("{} is on the never-touch list", t.name));
     }
     if let Some(p) = DENY_CMDLINE.iter().find(|p| cmd.contains(*p)) {
-        return Some(format!("{} is running {} which is on the never-touch list", t.name, p));
+        // A compile or test run built from that project (cargo's target\debug, ...\deps) is not
+        // the protected program itself: it may be eased like any batch job, never ended.
+        if !(build_output(&cmd) && *action != Action::Terminate) {
+            return Some(format!("{} is running {} which is on the never-touch list", t.name, p));
+        }
     }
     if let Some(e) = extra.iter().find(|e| entry_matches(e, &name, &cmd)) {
         return Some(format!("{} matches '{}' in fix-deny.txt", t.name, e.trim()));

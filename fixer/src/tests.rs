@@ -48,6 +48,15 @@ fn gpu_arbiter_script_refused_under_python() {
 }
 
 #[test]
+fn ferryman_test_build_may_be_eased_not_ended() {
+    let t = tgt("ferryman_server-0779810885cbdb01.exe", "\"X:\\ferry\\tmp\\ferryman-fleet-target\\debug\\deps\\ferryman_server-0779810885cbdb01.exe\"", 600.0);
+    assert!(policy::denied(&t, &Action::LowerPriority, &[]).is_none(), "a cargo test run is a batch job");
+    assert!(policy::denied(&t, &Action::Terminate, &[]).is_some(), "but snifrig never ends it");
+    let real = tgt("ferry.exe", "\"C:\\Users\\x\\AppData\\Local\\Ferryman\\bin\\ferry.exe\" dashboard", 600.0);
+    assert!(policy::denied(&real, &Action::LowerPriority, &[]).is_some(), "Ferryman itself stays untouched");
+}
+
+#[test]
 fn ferryman_cmdline_refused() {
     let t = tgt("node.exe", "node.exe C:\\ferry\\Ferryman\\index.js", 600.0);
     assert!(denied(&t, &Action::Terminate, &[]).is_some());
