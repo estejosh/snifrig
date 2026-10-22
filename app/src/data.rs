@@ -43,6 +43,7 @@ impl Suggestion {
             "minimize_game" => format!("{} is hidden but still drawing", self.app),
             "impact_ask" => "Can I run a small test?".into(),
             "game_ask" => format!("How did {} run?", self.app),
+            "model_differs" => "Which copy of this model is right?".into(),
             "popup_guard" => format!("{} takes the screen from you", self.app.trim_start_matches('\\')),
             "jobs_handback" => "Windows needs your OK to run your jobs again".into(),
             "take_over_task" => "Windows needs your OK to hand jobs to snifrig".into(),
@@ -73,6 +74,36 @@ pub fn load_impact(dir: &Path) -> Impact {
     days.reverse();
     Impact { ready: s.get("ready").bool(), faster: s.get("faster_pct").num(), on_slow: s.get("on_slow").num(), off_slow: s.get("off_slow").num(),
         on_ms: s.get("on_ms").num(), off_ms: s.get("off_ms").num(), hours: s.get("hours").num(), off_minutes: s.get("off_minutes").num(), text: s.get("text").str().to_string(), days }
+}
+
+/// The junk scan (junk-report.json).
+#[derive(Clone, Debug, Default)]
+pub struct JunkItem { pub id: String, pub name: String, pub note: String, pub safety: String, pub bytes: u64, pub files: u64, pub denied: bool }
+pub fn load_junk(dir: &Path) -> (f64, u64, Vec<JunkItem>) {
+    let j = read_json(dir, "junk-report.json");
+    let mut items: Vec<JunkItem> = j.get("items").arr().iter().map(|x| JunkItem { id: x.get("id").str().into(), name: x.get("name").str().into(), note: x.get("note").str().into(),
+        safety: x.get("safety").str().into(), bytes: x.get("bytes").num() as u64, files: x.get("files").num() as u64, denied: x.get("denied").bool() }).collect();
+    items.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    (j.get("unix").num(), j.get("total").num() as u64, items)
+}
+
+/// The disk scan (disk-report.json): duplicate model groups and virtual disks.
+#[derive(Clone, Debug, Default)]
+pub struct DupGroup { pub size: u64, pub reclaim: u64, pub cross: bool, pub files: Vec<String> }
+#[derive(Clone, Debug, Default)]
+pub struct VDisk { pub name: String, pub path: String, pub bytes: u64, pub used: Option<u64>, pub wsl: String }
+pub fn load_disk(dir: &Path) -> (f64, u64, u64, Vec<DupGroup>, Vec<VDisk>) {
+    let j = read_json(dir, "disk-report.json");
+    let g = j.get("groups").arr().iter().map(|x| DupGroup { size: x.get("size").num() as u64, reclaim: x.get("reclaim").num() as u64, cross: x.get("cross_drive").bool(),
+        files: x.get("files").arr().iter().map(|f| f.str().to_string()).collect() }).collect();
+    let v = j.get("vdisks").arr().iter().map(|x| VDisk { name: x.get("name").str().into(), path: x.get("path").str().into(), bytes: x.get("bytes").num() as u64,
+        used: (!x.get("used").is_null()).then(|| x.get("used").num() as u64), wsl: x.get("wsl").str().into() }).collect();
+    (j.get("unix").num(), j.get("dup_reclaim").num() as u64, j.get("vdisk_reclaim").num() as u64, g, v)
+}
+
+pub fn human(b: u64) -> String {
+    let b = b as f64;
+    if b >= 1e12 { format!("{:.1} TB", b / 1e12) } else if b >= 1e9 { format!("{:.1} GB", b / 1e9) } else if b >= 1e6 { format!("{:.0} MB", b / 1e6) } else { format!("{:.0} KB", b / 1e3) }
 }
 
 /// A measured result from other PCs, shipped with snifrig (impact-estimate.json): faster %, PCs.

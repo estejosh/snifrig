@@ -29,7 +29,7 @@ const BAD: Color32 = Color32::from_rgb(229, 83, 75);
 const BLUE: Color32 = Color32::from_rgb(96, 165, 250);
 
 #[derive(PartialEq, Clone, Copy)]
-enum Page { Overview, Governor, Rules, Jobs, Performance, Activity, Report, Settings }
+enum Page { Overview, Governor, Rules, Jobs, Cleanup, Performance, Activity, Report, Settings }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Filter { All, Governor, Rules, Fixes, Performance, Learning, Incidents }
@@ -570,7 +570,7 @@ impl App {
 
     fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
         card(ui, |ui| {
-            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask" | "game_ask");
+            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask" | "game_ask" | "model_differs");
             ui.horizontal(|ui| { chip(ui, if ours { "snifrig noticed" } else { "suggested by your AI assistant" }, BLUE); });
             ui.label(bold(s.summary(), 15.0).color(TEXT));
             ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
@@ -581,6 +581,17 @@ impl App {
                         self.dismiss_suggestion(s);
                     }
                     if ui.button("No").clicked() { self.run("snifrig-fix.exe", vec!["desktop".into(), "no".into()], "Ok, snifrig will not ask about this for a week."); self.dismiss_suggestion(s); }
+                } else if s.kind == "model_differs" {
+                    ui.vertical(|ui| {
+                        for p in s.app.split('|').take(4) {
+                            let short = p.rsplit('\\').take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\\");
+                            if ui.button(format!("This one is right: ...\\{}", short)).on_hover_text(p).clicked() {
+                                self.run("snifrig-fix.exe", vec!["disk".into(), "keep".into(), p.to_string()], "Kept it; the other copies link to it now (undo for 7 days).");
+                                self.dismiss_suggestion(s);
+                            }
+                        }
+                        if ui.button("Leave them all as they are").clicked() { self.dismiss_suggestion(s); }
+                    });
                 } else if s.kind == "game_ask" {
                     for (a, label, done) in [("smooth", "Smooth", "Good to hear."), ("stutter", "A few stutters", "Thanks. snifrig will turn the culprits down harder next time."), ("bad", "Bad", "Thanks. snifrig will turn the culprits down harder next time.")] {
                         if ui.button(label).clicked() { self.run("snifrig-fix.exe", vec!["game".into(), "answer".into(), a.into()], done); self.dismiss_suggestion(s); }
@@ -716,6 +727,7 @@ impl App {
             (Page::Governor, "\u{26A1}  Governor".to_string()),
             (Page::Rules, format!("\u{1F4CB}  App rules  {}", if self.rules.rules.is_empty() { String::new() } else { format!("({})", self.rules.rules.len()) })),
             (Page::Jobs, "\u{1F552}  Jobs".to_string()),
+            (Page::Cleanup, "\u{1F9F9}  Cleanup".to_string()),
             (Page::Performance, "\u{1F3AE}  Performance mode".to_string()),
             (Page::Activity, "\u{1F4DC}  Activity".to_string()),
             (Page::Report, "\u{1F4CA}  Report".to_string()),
@@ -961,6 +973,96 @@ impl App {
             if ui.add_enabled(dirty, egui::Button::new("Undo changes")).clicked() { self.tuning = self.tuning_saved.clone(); }
             if ui.button("Back to defaults").clicked() { let plan = self.tuning.game_plan.clone(); self.tuning = Tuning { game_plan: plan, ..Tuning::default() }; }
             if dirty { ui.label(RichText::new("Unsaved changes").color(WARN)); }
+        });
+    }
+
+    /// What takes space for nothing: junk, duplicate AI models, virtual disks that never shrink.
+    /// Scanning is free; cleaning (with 7-day undo) is snifrig fix.
+    fn cleanup_page(&mut self, ui: &mut egui::Ui) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static PICK: OnceLock<Mutex<Option<HashSet<String>>>> = OnceLock::new();
+        let pick = PICK.get_or_init(|| Mutex::new(None));
+        let (junk_at, junk_total, items) = data::load_junk(&self.dir);
+        let (disk_at, dup, vd, groups, vdisks) = data::load_disk(&self.dir);
+        let paid = self.state.has_key;
+        ui.heading("Cleanup");
+        ui.label(RichText::new("What takes space on your drives for nothing. snifrig fix cleans it safely: files go to a quarantine on the same drive and can be put back for 7 days.").color(MUTED));
+        ui.horizontal(|ui| {
+            if ui.button("Scan again").on_hover_text("Takes a few minutes on big drives; runs at the lowest priority.").clicked() {
+                self.run("snifrig.exe", vec!["junk".into()], "Junk scan finished.");
+                self.run("snifrig.exe", vec!["disk".into()], "Disk scan finished.");
+            }
+            if junk_at > 0.0 { ui.label(RichText::new(format!("last scan {}", local_time(junk_at.max(disk_at), true))).size(12.0).color(MUTED)); }
+        });
+        ui.add_space(6.0);
+        // Junk
+        card(ui, |ui| {
+            section(ui, &format!("Junk: {} found", data::human(junk_total)), "Ticked items are cleaned. Safe: nothing needs it. Rebuilds: it comes back by itself when needed. Review: check you do not need it.");
+            let mut g = pick.lock().unwrap();
+            let sel = g.get_or_insert_with(|| items.iter().filter(|i| matches!(i.safety.as_str(), "safe" | "rebuilds") && !i.id.starts_with("build:")).map(|i| i.id.clone()).collect());
+            for it in items.iter().take(60) {
+                ui.horizontal(|ui| {
+                    let can = !matches!(it.safety.as_str(), "admin" | "no-undo");
+                    let mut on = sel.contains(&it.id);
+                    if can && ui.checkbox(&mut on, "").changed() { if on { sel.insert(it.id.clone()); } else { sel.remove(&it.id); } }
+                    if !can { ui.add_space(24.0); }
+                    ui.label(bold(format!("{:>9}", data::human(it.bytes)), 13.0).color(TEXT));
+                    ui.label(RichText::new(&it.name).color(TEXT));
+                    let (w, c) = match it.safety.as_str() { "safe" => ("safe", GOOD), "rebuilds" => ("rebuilds", BLUE), "review" => ("review", WARN), "admin" => ("needs admin", MUTED), _ => ("no undo", BAD) };
+                    chip(ui, w, c);
+                }).response.on_hover_text(&it.note);
+            }
+            let chosen: Vec<String> = sel.iter().cloned().collect();
+            let bytes: u64 = items.iter().filter(|i| sel.contains(&i.id)).map(|i| i.bytes).sum();
+            drop(g);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if paid {
+                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new(RichText::new(format!("Clean {} (undo for 7 days)", data::human(bytes))).color(Color32::BLACK)).fill(ACCENT)).clicked() {
+                        let mut a = vec!["junk".to_string(), "clean".to_string()];
+                        a.extend(chosen.clone());
+                        self.run("snifrig-fix.exe", a, "Cleaned. Undo for 7 days with Undo last cleanup.");
+                        *pick.lock().unwrap() = None;
+                    }
+                    if ui.button("Undo last cleanup").clicked() { self.run("snifrig-fix.exe", vec!["junk".into(), "undo".into()], "Put back."); }
+                    if items.iter().any(|i| i.id == "recycle") && ui.button("Empty Recycle Bin (cannot be undone)").clicked() { self.run("snifrig-fix.exe", vec!["junk".into(), "empty-bin".into()], "The Recycle Bin is empty."); }
+                } else {
+                    ui.label(RichText::new(format!("snifrig fix cleans this for you, safely, with a 7-day undo.")).color(WARN));
+                    if ui.button("Get snifrig fix").clicked() { self.page = Page::Settings; self.refresh_license(); }
+                }
+            });
+        });
+        ui.add_space(8.0);
+        // Duplicate AI models
+        card(ui, |ui| {
+            section(ui, &format!("Duplicate AI models: {} to free", data::human(dup)), "The same model file kept more than once (ComfyUI, Ollama, LM Studio, Hugging Face, downloads). snifrig keeps one copy per drive and links the others to it: every app still finds its file, the drive stores it once. Files are compared byte for byte first.");
+            if groups.is_empty() { ui.label(RichText::new(if disk_at > 0.0 { "No duplicate models found." } else { "Not scanned yet: press Scan again." }).color(MUTED)); }
+            for (i, gr) in groups.iter().enumerate().take(25) {
+                ui.horizontal(|ui| {
+                    ui.label(bold(format!("{:>9}", data::human(gr.reclaim)), 13.0).color(TEXT));
+                    ui.label(RichText::new(format!("{} copies of a {} file{}", gr.files.len(), data::human(gr.size), if gr.cross { " (some on other drives: those stay)" } else { "" })).color(TEXT));
+                    if paid && gr.reclaim > 0 && ui.small_button("Keep one copy").clicked() { self.run("snifrig-fix.exe", vec!["disk".into(), "dedupe".into(), i.to_string()], "Linked. Undo for 7 days."); }
+                }).response.on_hover_text(gr.files.join("\n"));
+            }
+            if paid && dup > 0 && ui.add(egui::Button::new(RichText::new(format!("Keep one copy of each ({})", data::human(dup))).color(Color32::BLACK)).fill(ACCENT)).clicked() {
+                self.run("snifrig-fix.exe", vec!["disk".into(), "dedupe".into(), "all".into()], "Linked. Undo for 7 days.");
+            }
+        });
+        ui.add_space(8.0);
+        // Virtual disks
+        card(ui, |ui| {
+            section(ui, "Virtual disks", "WSL, Docker and Podman keep Linux inside one big file that grows and never shrinks by itself. snifrig can switch WSL to give space back by itself, when you are away (it restarts that distribution).");
+            if vdisks.is_empty() { ui.label(RichText::new("None found.").color(MUTED)); }
+            for v in &vdisks {
+                ui.horizontal(|ui| {
+                    ui.label(bold(format!("{:>9}", data::human(v.bytes)), 13.0).color(TEXT));
+                    ui.label(RichText::new(&v.name).color(TEXT));
+                    match v.used { Some(u) => { ui.label(RichText::new(format!("{} used inside, {} to give back", data::human(u), data::human(v.bytes.saturating_sub(u)))).color(MUTED)); } None => { ui.label(RichText::new("used space unknown (not running)").size(12.0).color(MUTED)); } }
+                    if paid && !v.wsl.is_empty() && ui.small_button("Shrink it when I'm away").clicked() { self.run("snifrig-fix.exe", vec!["disk".into(), "compact-when-away".into(), v.wsl.clone()], "snifrig shrinks it the next time you are away."); }
+                }).response.on_hover_text(&v.path);
+            }
+            if vd > 0 { ui.label(RichText::new(format!("{} could be given back.", data::human(vd))).color(TEXT)); }
         });
     }
 
@@ -1547,6 +1649,7 @@ impl eframe::App for App {
                     Page::Governor => self.governor(ui, &live),
                     Page::Rules => self.rules_page(ui, &live),
                 Page::Jobs => self.jobs_page(ui),
+                Page::Cleanup => self.cleanup_page(ui),
                     Page::Performance => self.performance(ui),
                     Page::Activity => self.activity(ui),
                     Page::Report => self.report(ui),

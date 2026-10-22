@@ -659,6 +659,57 @@ fn start_guard(dir: std::path::PathBuf) {
     });
 }
 
+/// Clean the chosen junk (moved to quarantine, undo for 7 days), then scan again. A category
+/// you clean every time is offered as a weekly cleanup, run when you are away.
+fn junk_clean(dir: &Path, ids: &[String]) -> Result<String, String> {
+    use snifrig_fix::junk;
+    let (moved, bytes, skipped, batch) = junk::clean(dir, ids);
+    let _ = junk::scan(dir);
+    let alert = snifrig_fix::Alert { t: String::new(), key: "junk:clean".into(), msg: String::new() };
+    let msg = format!("cleaned {} ({} item{}){}; undo for 7 days: snifrig-fix junk undo {}", junk::human(bytes), moved, if moved == 1 { "" } else { "s" },
+        if skipped > 0 { format!(", skipped {} in use", skipped) } else { String::new() }, batch);
+    ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
+    // Learning: the same safe categories cleaned 3 times → offer to do it weekly.
+    let hist = std::fs::read_to_string(dir.join(junk::BATCHES)).unwrap_or_default();
+    let regular: Vec<&String> = ids.iter().filter(|id| !id.starts_with("build:") && hist.lines().filter(|l| l.split('\t').nth(3).map_or(false, |c| c.split(',').any(|x| x == id.as_str()))).count() >= 3).collect();
+    let (jobs, _) = snifrig_fix::sched::load(dir);
+    if !regular.is_empty() && !jobs.iter().any(|j| j.name == "snifrig weekly cleanup") {
+        add_card(dir, "junk_auto", &regular.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","), "junk_auto", "You clean the same things every time. Want snifrig to do it weekly, when you are away? It still keeps everything 7 days so you can undo.");
+    }
+    Ok(msg)
+}
+
+/// Link duplicate model copies: `which` is a group number from disk-report.json, or "all".
+fn disk_dedupe(dir: &Path, which: &str) -> Result<String, String> {
+    let r = std::fs::read_to_string(dir.join(snifrig_fix::disk::REPORT)).map_err(|_| "scan first: snifrig-fix disk scan".to_string())?;
+    // Each group's file list, in order, from the report.
+    let groups: Vec<Vec<std::path::PathBuf>> = r.split("\"files\":[").skip(1).map(|g| {
+        g.split(']').next().unwrap_or("").split("\",\"").map(|f| std::path::PathBuf::from(f.trim_matches('"').replace("\\\\", "\\"))).filter(|p| !p.as_os_str().is_empty()).collect()
+    }).collect();
+    let pick: Vec<&Vec<std::path::PathBuf>> = if which == "all" { groups.iter().collect() } else { groups.get(which.parse::<usize>().map_err(|_| "a group number or all")?).into_iter().collect() };
+    let (mut linked, mut freed, mut skipped) = (0, 0, 0);
+    let mut batches = Vec::new();
+    let mut asked = 0;
+    for g in pick {
+        let (l, f, s, b, questions) = snifrig_fix::disk::dedupe_checked(dir, g);
+        linked += l; freed += f; skipped += s;
+        if l > 0 { batches.push(b); }
+        // Copies that differ inside: changed nothing, ask which one is right.
+        for q in questions {
+            asked += 1;
+            let list: Vec<String> = q.iter().map(|(p, h)| format!("{} (checksum {}...){}", p.display(), &h[..h.len().min(12)], if snifrig_fix::disk::expected_sha(p).as_deref() == Some(h.as_str()) { ", proven right by its own checksum" } else if snifrig_fix::disk::expected_sha(p).is_some() { ", FAILS its own checksum" } else { "" })).collect();
+            let paths: Vec<String> = q.iter().map(|(p, _)| p.display().to_string()).collect();
+            add_card(dir, "model_differs", &paths.join("|"), &format!("differs:{}", paths.join("|")), &format!("These model files look alike but are different inside, so snifrig changed nothing: {}. Which one is right? snifrig then keeps that one and replaces the others with links to it (undo for 7 days).", list.join("; ")));
+        }
+    }
+    let _ = snifrig_fix::disk::scan(dir);
+    let msg = format!("checked every copy's checksum; linked {} identical model file{}, freed {}{}{}; undo for 7 days: snifrig-fix disk undo {}", linked, if linked == 1 { "" } else { "s" }, snifrig_fix::junk::human(freed),
+        if skipped > 0 { format!(" ({} skipped: in use)", skipped) } else { String::new() },
+        if asked > 0 { format!("; {} group{} differ inside, so snifrig asks which copy is right", asked, if asked == 1 { "" } else { "s" }) } else { String::new() }, batches.join(" "));
+    ledger::record(dir, &snifrig_fix::Alert { t: String::new(), key: "disk:dedupe".into(), msg: msg.clone() }, &Action::Report, None, "done", &msg);
+    Ok(msg)
+}
+
 /// `frames on|off`: real frame-rate measuring in games. Windows lets only an administrator read
 /// a game's present events, so this sets up snifrig-frames as a scheduled task with highest
 /// privileges, once (Windows asks you to confirm). Off removes it again.
@@ -796,6 +847,17 @@ fn jobs_cmd(dir: &Path, a: &[&str]) -> Result<String, String> {
         }
         ["undo-import"] => undo_import(dir),
         ["handback"] => handback(dir, "you asked"),
+        ["add-cleanup", ids] => {
+            let (mut jobs, _) = sched::load(dir);
+            let exe = dir.join("bin").join("snifrig-fix.exe");
+            let mut j = sched::Job::new("snifrig weekly cleanup", &format!("\"{}\" --dir \"{}\" junk clean {}", exe.display(), dir.display(), ids.replace(',', " ")));
+            j.sched = sched::Sched::Every(7.0 * 86400.0);
+            j.when = sched::When::Idle;
+            j.latest_secs = 3.0 * 86400.0;
+            if !jobs.iter().any(|x| x.name == j.name) { jobs.push(j); }
+            sched::save(dir, &jobs);
+            Ok("snifrig cleans these weekly when you are away (undo still works for 7 days)".into())
+        }
         ["handback-admin"] => {
             let f = dir.join("jobs-handback-denied.txt");
             if std::fs::read_to_string(&f).unwrap_or_default().trim().is_empty() { return Ok("nothing needs your OK".into()); }
@@ -1525,6 +1587,7 @@ fn watch(dir: &Path) {
             let r = jobs.run_now(name.trim(), now_unix());
             let _ = std::fs::write(dir.join("job-run-result.txt"), r.unwrap_or_else(|e| e));
         }
+        if n % 3600 == 900 { let f = snifrig_fix::junk::purge_old(dir); if f > 0 { note(dir, "junk:purge", "done", &format!("emptied {} of cleanups older than 7 days from quarantine", snifrig_fix::junk::human(f))); } }
         if n % 3600 == 1800 && !license::status(dir).licensed {
             note(dir, "jobs", "done", &handback(dir, "the snifrig fix licence ended").unwrap_or_else(|e| e));
             break;
@@ -1756,6 +1819,41 @@ fn main() {
         ["impact", "answer", a @ ("yes" | "slow" | "no")] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::ANSWER_FILE), a); println!("thanks"); }
         ["game", "answer", a @ ("smooth" | "stutter" | "bad")] => out(game_answer(&dir, a)),
         ["frames", op @ ("on" | "off")] => out(frames_cmd(&dir, *op == "on")),
+        ["disk", "scan"] => { let (d, v) = snifrig_fix::disk::scan(&dir); println!("duplicates: {} to free; virtual disks: {} to give back", snifrig_fix::junk::human(d), snifrig_fix::junk::human(v)); }
+        ["disk", "dedupe", which] => out(disk_dedupe(&dir, which)),
+        ["disk", "keep", path] => {
+            // You picked the right copy of a model whose copies differ.
+            let r = std::fs::read_to_string(dir.join(snifrig_fix::disk::REPORT)).unwrap_or_default();
+            let group: Vec<std::path::PathBuf> = r.split("\"files\":[").skip(1).map(|g| g.split(']').next().unwrap_or("").split("\",\"").map(|f| std::path::PathBuf::from(f.trim_matches('"').replace("\\\\", "\\"))).collect::<Vec<_>>())
+                .find(|g| g.iter().any(|f| f.as_os_str().to_string_lossy().eq_ignore_ascii_case(path))).unwrap_or_default();
+            if group.is_empty() { out(Err("that file is not in the last disk scan".into())); }
+            let (l, f, s, b) = snifrig_fix::disk::keep_this(&dir, std::path::Path::new(path), &group);
+            let _ = snifrig_fix::disk::scan(&dir);
+            out(Ok(format!("kept {}; {} other cop{} now link to it, freed {}{}; undo for 7 days: snifrig-fix disk undo {}", path, l, if l == 1 { "y" } else { "ies" }, snifrig_fix::junk::human(f), if s > 0 { format!(" ({} in use, left)", s) } else { String::new() }, b)));
+        }
+        ["disk", "undo", batch] => out(snifrig_fix::disk::undo_links(&dir, batch).map(|n| format!("put back {} separate cop{}", n, if n == 1 { "y" } else { "ies" }))),
+        ["disk", "compact", distro] => out(snifrig_fix::disk::wsl_compact(distro)),
+        ["disk", "compact-when-away", distro] => {
+            let (mut jobs, _) = snifrig_fix::sched::load(&dir);
+            let exe = dir.join("bin").join("snifrig-fix.exe");
+            let name = format!("snifrig shrink {}", distro);
+            let mut j = snifrig_fix::sched::Job::new(&name, &format!("\"{}\" --dir \"{}\" disk compact {}", exe.display(), dir.display(), distro));
+            j.sched = snifrig_fix::sched::Sched::Once(now_unix() + 60.0);
+            j.when = snifrig_fix::sched::When::Idle;
+            j.latest_secs = 7.0 * 86400.0;
+            j.max_secs = 3600.0;
+            jobs.retain(|x| x.name != name);
+            jobs.push(j);
+            snifrig_fix::sched::save(&dir, &jobs);
+            println!("snifrig shrinks {} the next time you are away (it restarts that WSL distribution)", distro);
+        }
+        ["junk", "scan"] => { let t = snifrig_fix::junk::scan(&dir); println!("found {} you could free", snifrig_fix::junk::human(t)); }
+        ["junk", "clean", ids @ ..] if !ids.is_empty() => out(junk_clean(&dir, &ids.iter().map(|s| s.to_string()).collect::<Vec<_>>())),
+        ["junk", "undo"] | ["junk", "undo", _] => {
+            let b = cmd.get(2).copied().unwrap_or("last");
+            out(snifrig_fix::junk::restore(&dir, b).map(|(back, failed)| { let _ = snifrig_fix::junk::scan(&dir); format!("put back {} item{}{}", back, if back == 1 { "" } else { "s" }, if failed > 0 { format!(" ({} could not go back: something is in their place now)", failed) } else { String::new() }) }))
+        }
+        ["junk", "empty-bin"] => out(if snifrig_fix::junk::empty_recycle_bin() { let _ = snifrig_fix::junk::scan(&dir); Ok("the Recycle Bin is empty".into()) } else { Err("Windows did not empty the Recycle Bin".into()) }),
         ["frames"] | ["frames", "status"] => println!("{}", if dir.join("frames-on").exists() { "frame measuring is on (snifrig-frames runs from the scheduled task 'snifrig frames')" } else { "frame measuring is off. snifrig-fix frames on turns it on (Windows asks once)." }),
         ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: snifrig holds off for 2 minutes now, to compare"); }
         ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }

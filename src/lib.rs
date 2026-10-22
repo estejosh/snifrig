@@ -32,6 +32,12 @@ mod cpuhog;
 mod wslwatch;
 mod slowdown;
 mod report;
+#[path = "../fixer/src/junk.rs"]
+#[allow(dead_code)]
+pub mod junk;
+#[path = "../fixer/src/disk.rs"]
+#[allow(dead_code)]
+pub mod disk;
 const SLOW_CAP: u64 = 512 << 10;
 
 // ---------- raw readers ----------
@@ -664,6 +670,21 @@ pub fn run() {
         Some("webhook") => { match a.get(1) { Some(u) if u.starts_with("http") => { let _ = fs::write(dir.join("webhook.txt"), u); println!("webhook saved. test post: {}", if post_json(u, &format!("{{\"source\":\"snifrig\",\"host\":\"{}\",\"t\":\"{}\",\"key\":\"webhook-test\",\"msg\":\"webhook test: alerts from this PC will arrive here\"}}", esc(&std::env::var("COMPUTERNAME").unwrap_or_default()), iso(now()))) { "ok" } else { "failed" }); } Some(x) if x == "off" => { let _ = fs::remove_file(dir.join("webhook.txt")); println!("webhook removed."); } _ => println!("usage: snifrig webhook URL|off") } return; }
         Some("report") => { let days = flag("--days").and_then(|d| d.parse::<f64>().ok()).filter(|d| *d > 0.0).unwrap_or(7.0); print!("{}", report::run(&dir, days)); println!("\nNotice: {}", notice::NOTICE_TEXT); return; }
         Some("slowdown") => { let l = slowdown::summarize(&dir); if l.is_empty() { println!("No Windows slowdowns recorded in the last 24 hours."); } else { for x in l { println!("{}", x); } } return; }
+        Some("disk") => {
+            // The free scan: duplicate AI models, and virtual disks that never shrink.
+            let (dup, vd) = disk::scan(&dir);
+            println!("Duplicate model files: {} could be freed by keeping one copy per drive.", junk::human(dup));
+            println!("Virtual disks (WSL, Docker): {} could be given back.", junk::human(vd));
+            println!("Details: {}. snifrig fix links the copies (undo for 7 days) and shrinks the disks when you are away.", dir.join(disk::REPORT).display());
+            return;
+        }
+        Some("junk") => {
+            // The free scan: what takes space for nothing. Cleaning it (with undo) is snifrig fix.
+            let total = junk::scan(&dir);
+            println!("Found {} you could free. Details: {}", junk::human(total), dir.join(junk::REPORT).display());
+            println!("snifrig fix cleans it safely: everything can be undone for 7 days.");
+            return;
+        }
         Some("install") => { install(&dir, given); return; }
         Some("uninstall") => { uninstall(&dir); return; }
         _ => {}

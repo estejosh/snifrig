@@ -30,6 +30,8 @@ pub mod sched;
 pub mod guard;
 pub mod impact;
 pub mod game;
+pub mod junk;
+pub mod disk;
 
 /// What the fixer can do, mildest first.
 #[derive(Clone, Debug, PartialEq)]
