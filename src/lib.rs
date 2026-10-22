@@ -848,6 +848,13 @@ fn install(dir: &PathBuf, given: Option<String>) {
 }
 
 fn uninstall(dir: &PathBuf) {
+    // Jobs that snifrig took over go back to Windows Task Scheduler first, so nothing stops running.
+    let fix = dir.join("bin").join("snifrig-fix.exe");
+    if fix.exists() && dir.join("jobs.txt").exists() {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new(&fix).arg("--dir").arg(dir).args(["jobs", "handback"]).creation_flags(0x0800_0000).status();
+        let _ = std::process::Command::new(&fix).arg("--dir").arg(dir).args(["jobs", "handback-admin"]).creation_flags(0x0800_0000).status();
+    }
     start_menu_shortcut(&dir.join("bin").join("snifrig-app.exe"), false);
     del_run("Snifrig");
     del_run("SnifrigTray");

@@ -18,13 +18,16 @@ pub const JOBS_FILE: &str = "jobs.txt";
 pub const STATE_FILE: &str = "jobs-state.txt";
 pub const HISTORY_FILE: &str = "jobs-history.jsonl";
 pub const STATUS_FILE: &str = "jobs-status.json";
+/// While this file exists, Windows runs the moved jobs again (snifrig handed them back softly:
+/// licence lapsed, uninstall, or the fixer could not stay up). snifrig takes them back when it can.
+pub const HANDED_BACK: &str = "jobs-in-windows";
 
 /// When a job may start once it is due.
 #[derive(Clone, Debug, PartialEq)]
 pub enum When { Anytime, NotGaming, Idle }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Sched { Every(f64), Daily(u32), Logon, KeepRunning }
+pub enum Sched { Every(f64), Daily(u32), Logon, KeepRunning, Once(f64) }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Job {
@@ -80,6 +83,7 @@ pub fn sched_text(s: &Sched) -> String {
         Sched::Daily(m) => format!("daily {:02}:{:02}", m / 60, m % 60),
         Sched::Logon => "at logon".into(),
         Sched::KeepRunning => "keep running".into(),
+        Sched::Once(t) => format!("once {:.0}", t),
     }
 }
 
@@ -95,6 +99,7 @@ fn parse_sched(v: &str) -> Option<Sched> {
         let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
         return (h < 24 && m < 60).then_some(Sched::Daily(h * 60 + m));
     }
+    if let Some(x) = v.strip_prefix("once") { return x.trim().parse::<f64>().ok().filter(|t| *t > 1e9).map(Sched::Once); }
     match v.as_str() { "at logon" | "logon" => Some(Sched::Logon), "keep running" => Some(Sched::KeepRunning), _ => None }
 }
 
@@ -205,6 +210,7 @@ pub fn due_since(j: &Job, s: &State, ctx: &Ctx, first_seen: f64) -> Option<f64> 
         }
         Sched::Logon => (s.last_start < ctx.boot).then_some(ctx.boot.max(first_seen)),
         Sched::KeepRunning => Some(ctx.now),
+        Sched::Once(t) => (s.last_start < t && ctx.now >= t).then_some(t),
     }
 }
 
@@ -322,7 +328,9 @@ impl Scheduler {
         // Start what is due and allowed.
         let jobs = self.jobs.clone();
         let mut procs_cache: Option<Vec<(String, String)>> = None;
+        let handed_back = self.dir.join(HANDED_BACK).exists();
         for j in jobs.iter().filter(|j| j.enabled) {
+            if handed_back && !j.from_task.is_empty() { self.waiting.insert(j.name.clone(), "Windows runs this one for now".into()); continue; }
             if self.running.contains_key(&j.name) { self.waiting.remove(&j.name); continue; }
             if let Some((t, _)) = self.backoff.get(&j.name) { if ctx.now < *t { continue; } }
             let st = self.state.get(&j.name).cloned().unwrap_or_default();
@@ -425,6 +433,7 @@ impl Scheduler {
                 let today = (local / 86400.0).floor() * 86400.0 - ctx.local_offset as f64 + m as f64 * 60.0;
                 if st.last_start >= today { today + 86400.0 } else { today }
             }
+            Sched::Once(t) => if st.last_start < t { t } else { 0.0 },
             _ => 0.0,
         }
     }
@@ -528,6 +537,18 @@ mod tests {
         assert_eq!(split_cmd("\"C:\\a b\\p.exe\" -x \"y z\""), ("C:\\a b\\p.exe".to_string(), "-x \"y z\"".to_string()));
         assert_eq!(split_cmd("cmd.exe /c X:\\w.cmd"), ("cmd.exe".to_string(), "/c X:\\w.cmd".to_string()));
         assert_eq!(norm_cmd("\"C:\\P.exe\"   -m  http.server"), norm_cmd("c:\\p.exe -m http.server"));
+    }
+
+    #[test]
+    fn once_runs_once() {
+        let j = Job { sched: Sched::Once(20_000.0), ..Job::new("a", "x.exe") };
+        assert!(due_since(&j, &State::default(), &ctx(19_000.0), 0.0).is_none());
+        assert_eq!(due_since(&j, &State::default(), &ctx(20_500.0), 0.0), Some(20_000.0));
+        let done = State { last_start: 20_600.0, ..Default::default() };
+        assert!(due_since(&j, &done, &ctx(30_000.0), 0.0).is_none());
+        let (p, e) = parse("[q]\nrun = x.exe\nschedule = once 1792700000\n");
+        assert!(e.is_empty(), "{:?}", e);
+        assert_eq!(p[0].sched, Sched::Once(1792700000.0));
     }
 
     #[test]

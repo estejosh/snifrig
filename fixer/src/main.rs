@@ -441,7 +441,7 @@ fn toggle_elevated(dir: &Path, mode: &str, list: &Path) -> Result<String, String
 
 /// `jobs import`: move your script-type scheduled tasks into snifrig (Windows copies backed up
 /// and turned off; undo puts them back).
-fn import_jobs(dir: &Path) -> Result<String, String> {
+fn import_jobs(dir: &Path, admin_ok: bool) -> Result<String, String> {
     use snifrig_fix::sched;
     let report = run_ps(dir, "jobs-import.ps1", JOBS_IMPORT_PS1, &["-Dir".into(), dir.display().to_string()])?;
     let (new, errs) = sched::parse(&std::fs::read_to_string(dir.join("jobs-import.txt")).unwrap_or_default());
@@ -452,7 +452,12 @@ fn import_jobs(dir: &Path) -> Result<String, String> {
     let mut msg = report.trim().to_string();
     for e in errs { msg.push_str(&format!("\nproblem: {}", e)); }
     let denied = dir.join("jobs-import-denied.txt");
-    if !std::fs::read_to_string(&denied).unwrap_or_default().trim().is_empty() {
+    let denied_list = std::fs::read_to_string(&denied).unwrap_or_default();
+    if !denied_list.trim().is_empty() && !admin_ok {
+        // Found on its own (the task watcher): never raise a Windows prompt unasked, ask on a card.
+        let names: Vec<&str> = denied_list.lines().filter(|l| !l.trim().is_empty()).collect();
+        add_card(dir, "take_over_task", &names.join(", "), "take_over_task", &format!("snifrig now runs {} new scheduled task{} with no window, but {} belong{} to an administrator: Windows needs your OK to turn its own copy off (until then snifrig never starts a second copy).", names.len(), if names.len() == 1 { "" } else { "s" }, if names.len() == 1 { "it" } else { "they" }, if names.len() == 1 { "s" } else { "" }));
+    } else if !denied_list.trim().is_empty() {
         msg.push_str("\nSome tasks belong to an administrator; turning their Windows copies off (Windows asks you first):\n");
         msg.push_str(&toggle_elevated(dir, "disable", &denied).unwrap_or_else(|e| format!("not turned off: {}. They still run from Windows too; snifrig will not start a second copy.", e)));
     }
@@ -478,6 +483,216 @@ fn undo_import(dir: &Path) -> Result<String, String> {
     let keep: Vec<sched::Job> = jobs.into_iter().filter(|j| j.from_task.is_empty()).collect();
     sched::save(dir, &keep);
     Ok(format!("{}\nThe imported jobs are back in Windows Task Scheduler.", out.trim()))
+}
+
+/// Soft handback: Windows runs the moved jobs again (their Windows copies turned back on), and
+/// snifrig stops running them, until it can take them back. Admin-owned ones wait for your OK
+/// (a card), so nothing pops up on its own.
+fn handback(dir: &Path, why: &str) -> Result<String, String> {
+    use snifrig_fix::sched;
+    let flag = dir.join(sched::HANDED_BACK);
+    if flag.exists() { return Ok("Windows already runs the moved jobs".into()); }
+    let (jobs, _) = sched::load(dir);
+    let tasks: Vec<String> = jobs.iter().filter(|j| !j.from_task.is_empty()).map(|j| j.from_task.clone()).collect();
+    if tasks.is_empty() { return Ok("no moved jobs".into()); }
+    let list = dir.join("jobs-handback.txt");
+    std::fs::write(&list, tasks.join("\r\n")).map_err(|e| e.to_string())?;
+    let out = run_ps(dir, "jobs-toggle.ps1", JOBS_TOGGLE_PS1, &["-Mode".into(), "enable".into(), "-ListFile".into(), list.display().to_string()])?;
+    let failed: Vec<String> = out.lines().filter_map(|l| l.strip_prefix("failed: ")).map(|l| l.split(" (").next().unwrap_or(l).to_string()).collect();
+    let _ = std::fs::write(&flag, format!("{:.0} {}\n", now_unix(), why));
+    if !failed.is_empty() {
+        let _ = std::fs::write(dir.join("jobs-handback-denied.txt"), failed.join("\r\n"));
+        add_card(dir, "jobs_handback", &failed.join(", "), "jobs_handback", &format!("{}, so Windows runs your jobs again. {} of them belong to an administrator and need your OK to turn back on in Windows.", why, failed.len()));
+    }
+    Ok(format!("{}: Windows runs {} moved job{} again.", why, tasks.len() - failed.len(), if tasks.len() - failed.len() == 1 { "" } else { "s" }))
+}
+
+/// Take the moved jobs back from Windows after a handback. `admin_ok`: ask Windows right away
+/// for admin-owned ones (only when you asked); otherwise they wait for your OK on a card.
+fn takeover(dir: &Path, admin_ok: bool) -> String {
+    use snifrig_fix::sched;
+    let flag = dir.join(sched::HANDED_BACK);
+    if !flag.exists() { return "snifrig already runs the moved jobs".into(); }
+    let (jobs, _) = sched::load(dir);
+    let tasks: Vec<String> = jobs.iter().filter(|j| !j.from_task.is_empty()).map(|j| j.from_task.clone()).collect();
+    let list = dir.join("jobs-takeover.txt");
+    let _ = std::fs::write(&list, tasks.join("\r\n"));
+    let out = run_ps(dir, "jobs-toggle.ps1", JOBS_TOGGLE_PS1, &["-Mode".into(), "disable".into(), "-ListFile".into(), list.display().to_string()]).unwrap_or_default();
+    let failed: Vec<String> = out.lines().filter_map(|l| l.strip_prefix("failed: ")).map(|l| l.split(" (").next().unwrap_or(l).to_string()).collect();
+    let _ = std::fs::remove_file(&flag);
+    if !failed.is_empty() {
+        let f = dir.join("jobs-import-denied.txt");
+        let _ = std::fs::write(&f, failed.join("\r\n"));
+        if admin_ok { let _ = toggle_elevated(dir, "disable", &f); }
+        else { add_card(dir, "take_over_task", &failed.join(", "), "take_over_task", &format!("snifrig is running your jobs again. {} of them belong to an administrator: Windows needs your OK to turn its copies off (until then snifrig still never starts a second copy).", failed.len())); }
+    }
+    format!("snifrig runs the {} moved jobs again", tasks.len())
+}
+
+/// `popup yes|no WHO`: your answer to "do you want me to make it so this does not pop up and
+/// take control of the desktop?". A task becomes a silent snifrig job; an app gets no_focus=yes.
+fn popup_cmd(dir: &Path, yes: bool, who: &str) -> Result<String, String> {
+    use std::io::Write;
+    if !yes {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("popup-no.txt")) { let _ = writeln!(f, "{:.0}\t{}", now_unix(), who.to_lowercase()); }
+        return Ok("ok, snifrig will not ask about this one for a week".into());
+    }
+    if who.starts_with('\\') {
+        let report = run_ps(dir, "jobs-import.ps1", JOBS_IMPORT_PS1, &["-Dir".into(), dir.display().to_string(), "-Only".into(), who.to_string()])?;
+        if report.contains("moved:") {
+            let (new, _) = snifrig_fix::sched::parse(&std::fs::read_to_string(dir.join("jobs-import.txt")).unwrap_or_default());
+            let (mut jobs, _) = snifrig_fix::sched::load(dir);
+            for j in new { if !jobs.iter().any(|x| x.name.eq_ignore_ascii_case(&j.name)) { jobs.push(j); } }
+            snifrig_fix::sched::save(dir, &jobs);
+            let denied = dir.join("jobs-import-denied.txt");
+            if !std::fs::read_to_string(&denied).unwrap_or_default().trim().is_empty() { let _ = toggle_elevated(dir, "disable", &denied); }
+            return Ok(format!("{} now runs under snifrig, with no window.", who.trim_start_matches('\\')));
+        }
+        // Not a script task (an app's own updater, say): keep it from taking the screen instead.
+    }
+    let exe = who.rsplit('\\').next().unwrap_or(who).to_lowercase();
+    let exe = if exe.ends_with(".exe") { exe } else { format!("{}.exe", exe) };
+    rules::add(dir, &format!("{} no_focus=yes", exe))?;
+    Ok(format!("{} can no longer take the screen from you: snifrig puts you back where you were.", exe))
+}
+
+fn popup_said_no(dir: &Path, key: &str) -> bool {
+    std::fs::read_to_string(dir.join("popup-no.txt")).unwrap_or_default().lines().filter_map(|l| l.split_once('\t'))
+        .any(|(t, k)| k == key && now_unix() - t.parse::<f64>().unwrap_or(0.0) < 7.0 * 86400.0)
+}
+
+/// Process chain of a pid, newest first: (image name, command line).
+fn chain_of(pid: u32, procs: &[sys::Proc]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut p = pid;
+    for _ in 0..6 {
+        let Some(x) = procs.iter().find(|x| x.pid == p) else { break };
+        out.push((x.name.clone(), sys::cmdline(x.pid)));
+        if x.ppid == 0 || x.ppid == p { break; }
+        p = x.ppid;
+    }
+    out
+}
+
+/// Which Windows task runs this command line, if any.
+fn task_for_cmd(dir: &Path, cmd: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let script = r#"$c = ($env:SNIF_CMD.ToLower() -replace '"','' -replace '\s+',' ').Trim()
+Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } | ForEach-Object { $t = $_; foreach ($a in $t.Actions) {
+  $x = ([Environment]::ExpandEnvironmentVariables("$($a.Execute) $($a.Arguments)").ToLower() -replace '"','' -replace '\s+',' ').Trim()
+  $x = $x -replace '^\S*conhost\.exe --headless ',''
+  if ($x -and ($c.Contains($x) -or $x.Contains($c))) { "$($t.TaskPath)$($t.TaskName)" } } } | Select-Object -First 1"#;
+    let p = dir.join("popup-find-task.ps1");
+    std::fs::write(&p, script).ok()?;
+    let o = std::process::Command::new("powershell.exe").args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&p)
+        .env("SNIF_CMD", cmd).creation_flags(0x0800_0000 | 0x0000_0040).output().ok()?;
+    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// The pop-up guard thread: watches what comes to the front. When something takes the screen
+/// without you asking, it names the culprit and asks once (a card, held while you game); for
+/// apps you said yes to, it puts you straight back where you were.
+fn start_guard(dir: std::path::PathBuf) {
+    use snifrig_fix::guard;
+    let _ = std::thread::Builder::new().name("popup-guard".into()).spawn(move || {
+        let mut last = guard::foreground().unwrap_or_default();
+        let mut rules_at = 0.0f64;
+        let mut rules_set = rules::load(&dir);
+        let mut today: std::collections::HashMap<String, (f64, u32)> = std::collections::HashMap::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let Some(now_fg) = guard::foreground() else { continue };
+            if now_fg.hwnd == last.hwnd { continue; }
+            let prev = std::mem::replace(&mut last, now_fg.clone());
+            if prev.hwnd == 0 || prev.pid == now_fg.pid { continue; }
+            let idle_ms = sys::idle_secs() * 1000.0;
+            if guard::user_caused(idle_ms, guard::switch_key_down(), guard::cursor_over(now_fg.hwnd)) { continue; }
+            let mut buf = Vec::new();
+            let procs = sys::snapshot(&mut buf);
+            let Some(p) = procs.iter().find(|x| x.pid == now_fg.pid) else { continue };
+            if guard::is_system(&p.name) { continue; }
+            let t = now_unix();
+            if t - rules_at > 30.0 { rules_set = rules::load(&dir); rules_at = t; }
+            // Who did it: for a console window, the newest console program; then a task, if one launched it.
+            let culprit = if guard::is_console_host(&p.name) {
+                let ft_now = (t * 1e7) as u64 + 116_444_736_000_000_000;
+                let fresh = procs.iter().filter(|x| ft_now.saturating_sub(x.created) < 60_000_000 && !guard::is_console_host(&x.name) && !x.name.to_lowercase().starts_with("snifrig")).max_by_key(|x| x.created);
+                match fresh {
+                    Some(f) => {
+                        let ch = chain_of(f.pid, &procs);
+                        match guard::task_launch(&ch).and_then(|c| task_for_cmd(&dir, &c).map(|task| (task, c))) {
+                            Some((task, c)) => guard::Culprit::Task(task, c.split_whitespace().next().unwrap_or("").trim_matches('"').rsplit('\\').next().unwrap_or("").to_string()),
+                            None => guard::Culprit::App(ch.iter().rev().find(|(n, _)| !matches!(n.to_lowercase().as_str(), "svchost.exe" | "services.exe" | "wininit.exe" | "explorer.exe")).map(|(n, _)| n.clone()).unwrap_or_else(|| f.name.clone())),
+                        }
+                    }
+                    None => continue, // a console you opened earlier, coming forward again
+                }
+            } else {
+                let ch = chain_of(p.pid, &procs);
+                match guard::task_launch(&ch).and_then(|c| task_for_cmd(&dir, &c).map(|task| (task, c))) {
+                    Some((task, _)) => guard::Culprit::Task(task, p.name.clone()),
+                    None => guard::Culprit::App(p.name.clone()),
+                }
+            };
+            let key = culprit.key();
+            let e = today.entry(key.clone()).or_insert((t, 0));
+            if t - e.0 > 86400.0 { *e = (t, 0); }
+            e.1 += 1;
+            let count = e.1;
+            // Told to stay out of the way: put you back right away.
+            if let guard::Culprit::App(a) = &culprit {
+                if rules::rule_no_focus(&rules_set, &a.to_lowercase()) {
+                    if guard::give_back(prev.hwnd, now_fg.hwnd) { last = prev.clone(); }
+                    let m = format!("kept {} from taking the screen (back to {})", a, if prev.title.is_empty() { "what you were doing".to_string() } else { prev.title.clone() });
+                    ledger::record(&dir, &snifrig_fix::Alert { t: String::new(), key: "guard:popup".into(), msg: m.clone() }, &Action::Report, None, "done", &m);
+                    continue;
+                }
+            }
+            let m = format!("{} and took the screen from you{}", culprit.says(), if count > 1 { format!(" ({} times today)", count) } else { String::new() });
+            ledger::record(&dir, &snifrig_fix::Alert { t: String::new(), key: "guard:popup".into(), msg: m.clone() }, &Action::Report, None, "noted", &m);
+            if !popup_said_no(&dir, &key) {
+                let who = match &culprit { guard::Culprit::Task(t, _) => t.clone(), guard::Culprit::App(a) => a.clone() };
+                add_card(&dir, "popup_guard", &who, &format!("popup:{}", key), &format!("{} at {}. Do you want me to make it so this does not pop up and take control of the desktop?", m, local_hhmm(t)));
+            }
+        }
+    });
+}
+
+fn local_hhmm(t: f64) -> String {
+    let l = t as i64 + sys::local_offset_secs();
+    format!("{:02}:{:02}", l.rem_euclid(86400) / 3600, l.rem_euclid(3600) / 60)
+}
+
+/// The task watcher: anything newly scheduled in Windows is moved into snifrig right away
+/// (checked every 30 seconds, at the lowest priority). Not while Windows has the jobs back.
+fn start_task_watch(dir: std::path::PathBuf) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::thread::Builder::new().name("task-watch".into()).spawn(move || {
+        let list = || -> Option<std::collections::HashSet<String>> {
+            let o = std::process::Command::new("schtasks.exe").args(["/query", "/fo", "csv", "/nh"]).creation_flags(0x0800_0000 | 0x0000_0040).output().ok()?;
+            Some(String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| {
+                let f: Vec<&str> = l.split("\",\"").collect();
+                let name = f.first()?.trim_matches('"');
+                (!name.starts_with("\\Microsoft\\") && name != "TaskName" && !l.contains("\"Disabled\"")).then(|| name.to_string())
+            }).collect())
+        };
+        let mut seen = list();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if dir.join(snifrig_fix::sched::HANDED_BACK).exists() || dir.join("jobs-auto-off").exists() { seen = None; continue; }
+            let Some(now) = list() else { continue };
+            let fresh: Vec<&String> = match &seen { Some(s) => now.iter().filter(|n| !s.contains(*n)).collect(), None => Vec::new() };
+            seen = Some(now.clone());
+            if fresh.is_empty() { continue; }
+            let Ok(report) = import_jobs(&dir, false) else { continue };
+            for l in report.lines().filter(|l| l.starts_with("moved: ")) {
+                let m = format!("a new scheduled task appeared and now runs under snifrig, with no window: {}", l.trim_start_matches("moved: "));
+                ledger::record(&dir, &snifrig_fix::Alert { t: String::new(), key: "jobs:new".into(), msg: m.clone() }, &Action::Report, None, "done", &m);
+            }
+            seen = list();
+        }
+    });
 }
 
 fn jobs_cmd(dir: &Path, a: &[&str]) -> Result<String, String> {
@@ -520,12 +735,23 @@ fn jobs_cmd(dir: &Path, a: &[&str]) -> Result<String, String> {
             sched::save(dir, &jobs);
             Ok(format!("{} now runs: {}", jobs[i].name, sched::when_text(&jobs[i].when)))
         }
-        ["import"] => import_jobs(dir),
+        ["import"] => import_jobs(dir, true),
         ["preview"] => {
             let r = run_ps(dir, "jobs-import.ps1", JOBS_IMPORT_PS1, &["-Dir".into(), dir.display().to_string(), "-Preview".into()])?;
             Ok(format!("{}\n--- the jobs it would add (nothing was changed) ---{}", r.trim(), std::fs::read_to_string(dir.join("jobs-import-preview.txt")).unwrap_or_default()))
         }
         ["undo-import"] => undo_import(dir),
+        ["handback"] => handback(dir, "you asked"),
+        ["handback-admin"] => {
+            let f = dir.join("jobs-handback-denied.txt");
+            if std::fs::read_to_string(&f).unwrap_or_default().trim().is_empty() { return Ok("nothing needs your OK".into()); }
+            toggle_elevated(dir, "enable", &f).map(|r| format!("{}\nWindows runs these again.", r.trim()))
+        }
+        ["takeover"] => Ok(takeover(dir, true)),
+        ["takeover-admin"] => {
+            let f = dir.join("jobs-import-denied.txt");
+            toggle_elevated(dir, "disable", &f).map(|r| format!("{}\nsnifrig runs these now.", r.trim()))
+        }
         _ => Err("jobs [list] | run NAME | pause NAME | resume NAME | when NAME anytime|not-gaming|idle | import | undo-import".into()),
     }
 }
@@ -1015,6 +1241,9 @@ fn watch(dir: &Path) {
     let mut dwm_hot = 0.0f64;
     // Your recurring jobs, run by snifrig: no windows, no pileups, at a good moment for the PC.
     let mut jobs = snifrig_fix::sched::Scheduler::new(dir);
+    if dir.join(snifrig_fix::sched::HANDED_BACK).exists() { note(dir, "jobs", "done", &takeover(dir, false)); }
+    start_guard(dir.to_path_buf());
+    start_task_watch(dir.to_path_buf());
     let boot = sys::boot_unix();
     let offset = sys::local_offset_secs();
     for m in snifrig_fix::governor::recover(&dir.join("demoted.txt")) { note(dir, "gov:recover", "done", &m); }
@@ -1167,6 +1396,10 @@ fn watch(dir: &Path) {
             let _ = std::fs::remove_file(dir.join("job-run"));
             let r = jobs.run_now(name.trim(), now_unix());
             let _ = std::fs::write(dir.join("job-run-result.txt"), r.unwrap_or_else(|e| e));
+        }
+        if n % 3600 == 1800 && !license::status(dir).licensed {
+            note(dir, "jobs", "done", &handback(dir, "the snifrig fix licence ended").unwrap_or_else(|e| e));
+            break;
         }
         if n % 5 == 2 {
             let ctx = snifrig_fix::sched::Ctx { now: now_unix(), boot, gaming: gov.game.is_some() || sys::fullscreen_d3d(), cpu_pct: gov.total_pct, idle_secs: sys::idle_secs(), local_offset: offset };
@@ -1339,9 +1572,11 @@ fn main() {
         if !s.starts_with("--") { cmd.push(s); }
     }
     let help = a.iter().any(|x| matches!(x.as_str(), "--help" | "-h" | "help" | "/?"));
-    let exempt = help || matches!(cmd.as_slice(), ["license", "install", _] | ["license"] | ["license", "status"] | ["license", "accept"] | ["machine-id"]);
+    let exempt = help || matches!(cmd.as_slice(), ["license", "install", _] | ["license"] | ["license", "status"] | ["license", "accept"] | ["machine-id"] | ["jobs", "handback"] | ["jobs", "handback-admin"]);
     if !exempt {
         if let Err(why) = gate(&dir) {
+            // No valid licence: the fixer cannot run your jobs, so Windows takes them back.
+            if cmd.is_empty() { let _ = handback(&dir, "snifrig fix is not licensed on this PC"); }
             eprintln!("{}\n{}", DENIED, why);
             std::process::exit(2);
         }
@@ -1383,6 +1618,7 @@ fn main() {
         ["dismiss", id] => out(dismiss(&dir, id)),
         ["keep", name] => out(keep_cmd(&dir, name)),
         ["jobs", rest @ ..] => out(jobs_cmd(&dir, rest)),
+        ["popup", yn @ ("yes" | "no"), who @ ..] => out(popup_cmd(&dir, *yn == "yes", &who.join(" "))),
         ["heavy", kind, yn @ ("yes" | "no"), app] => out(heavy_cmd(&dir, kind, *yn == "yes", app)),
         ["unkeep", name] => out(unkeep_cmd(&dir, name)),
         ["license", "install", path] => out(license::install(&dir, Path::new(path))),

@@ -49,6 +49,9 @@ pub struct Rule {
     /// keep=yes: you use this app and want it fast. Never slowed on a screen; hidden, only a
     /// lower priority. Never asked about, never given a learned background rule.
     pub keep: bool,
+    /// no_focus=yes: this app may not take the screen from you; when it grabs focus, snifrig
+    /// puts you back where you were and sends its window behind.
+    pub no_focus: bool,
     /// The rule as written (whitespace normalised, comment removed).
     pub text: String,
 }
@@ -110,6 +113,10 @@ pub fn parse_line(line: &str) -> Result<Option<Rule>, String> {
                 if v != "yes" { return Err(bad("yes")); }
                 r.keep = true;
             }
+            "no_focus" => {
+                if v != "yes" { return Err(bad("yes")); }
+                r.no_focus = true;
+            }
             "background" => {
                 if v != "yes" { return Err(bad("yes")); }
                 r.efficiency = Some(true); r.io = Some(1); r.priority = Some(sys::BELOW_NORMAL);
@@ -167,6 +174,11 @@ pub fn pinned_names(dir: &Path) -> Vec<String> {
 pub fn is_pinned(rules: &[Rule], name: &str) -> bool { rules.iter().any(|r| r.pins() && glob_match(&r.pattern, name)) }
 
 /// The deepest governor level a rule allows for this name (first matching rule that sets one).
+/// True if a rule says this app may not take the screen from you (no_focus=yes).
+pub fn rule_no_focus(rules: &[Rule], name: &str) -> bool {
+    rules.iter().any(|r| r.no_focus && glob_match(&r.pattern, name))
+}
+
 /// True if a rule says you want this app kept fast (keep=yes).
 pub fn rule_keeps(rules: &[Rule], name: &str) -> bool {
     rules.iter().any(|r| r.keep && glob_match(&r.pattern, name))

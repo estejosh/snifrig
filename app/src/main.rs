@@ -570,7 +570,7 @@ impl App {
 
     fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
         card(ui, |ui| {
-            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game");
+            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task");
             ui.horizontal(|ui| { chip(ui, if ours { "snifrig noticed" } else { "suggested by your AI assistant" }, BLUE); });
             ui.label(bold(s.summary(), 15.0).color(TEXT));
             ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
@@ -581,6 +581,18 @@ impl App {
                         self.dismiss_suggestion(s);
                     }
                     if ui.button("No").clicked() { self.run("snifrig-fix.exe", vec!["desktop".into(), "no".into()], "Ok, snifrig will not ask about this for a week."); self.dismiss_suggestion(s); }
+                } else if s.kind == "popup_guard" {
+                    if ui.add(egui::Button::new(RichText::new("Yes, make it stop").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("A scheduled task becomes a snifrig job with no window; an app is put back behind what you were doing whenever it grabs the screen.").clicked() {
+                        self.run("snifrig-fix.exe", vec!["popup".into(), "yes".into(), s.app.clone()], "Done. It will not take the screen from you again.");
+                        self.dismiss_suggestion(s);
+                    }
+                    if ui.button("No").clicked() { self.run("snifrig-fix.exe", vec!["popup".into(), "no".into(), s.app.clone()], "Ok, not for a week."); self.dismiss_suggestion(s); }
+                } else if s.kind == "jobs_handback" || s.kind == "take_over_task" {
+                    let (cmd, label, done) = if s.kind == "jobs_handback" { ("handback-admin", "OK, let Windows run them", "Windows runs them again.") } else { ("takeover-admin", "OK, let snifrig run them", "snifrig runs them now.") };
+                    if ui.add(egui::Button::new(RichText::new(label).color(Color32::BLACK)).fill(ACCENT)).on_hover_text("Windows asks you to confirm.").clicked() {
+                        self.run("snifrig-fix.exe", vec!["jobs".into(), cmd.into()], done);
+                        self.dismiss_suggestion(s);
+                    }
                 } else if s.kind == "shutdown_wsl" || s.kind == "minimize_game" {
                     let (k, label, done) = if s.kind == "shutdown_wsl" { ("wsl", "Shut down WSL", "WSL is shut down.") } else { ("minimize", "Minimize it", "Minimized.") };
                     if ui.add(egui::Button::new(RichText::new(label).color(Color32::BLACK)).fill(ACCENT)).clicked() {

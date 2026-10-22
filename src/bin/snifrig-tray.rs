@@ -281,7 +281,17 @@ unsafe fn fixer_watchdog() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let r = &mut *std::ptr::addr_of_mut!(FIX_RESTARTS);
     r.retain(|&t| now - t < 3600);
-    if r.len() >= 3 { return; }
+    if r.len() >= 3 {
+        // The fixer keeps dying: hand your jobs back to Windows so they keep running (once;
+        // the fixer takes them back when it is up again).
+        if !d.join("jobs-in-windows").exists() && d.join("jobs.txt").exists() {
+            if let Some(exe) = fixer_exe() {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new(exe).arg("--dir").arg(&d).args(["jobs", "handback"]).creation_flags(0x0800_0000).status();
+            }
+        }
+        return;
+    }
     if let Some(exe) = fixer_exe() {
         use std::os::windows::process::CommandExt;
         use std::process::Stdio;

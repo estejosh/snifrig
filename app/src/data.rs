@@ -41,6 +41,9 @@ impl Suggestion {
             "restart_desktop" => "Restart the desktop (dwm is stuck)".into(),
             "shutdown_wsl" => "WSL is using a lot of your CPU".into(),
             "minimize_game" => format!("{} is hidden but still drawing", self.app),
+            "popup_guard" => format!("{} takes the screen from you", self.app.trim_start_matches('\\')),
+            "jobs_handback" => "Windows needs your OK to run your jobs again".into(),
+            "take_over_task" => "Windows needs your OK to hand jobs to snifrig".into(),
             _ => "A note, nothing to change".into(),
         }
     }

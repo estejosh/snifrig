@@ -2,7 +2,7 @@
 # and turns the Windows copy off. Apps' own tasks (updaters, vendor tools) stay in Windows.
 # Writes jobs-import.txt (job blocks) and jobs-import-denied.txt (tasks Windows would not let
 # us turn off without your OK). Prints one line per task.
-param([string]$Dir, [switch]$Preview)
+param([string]$Dir, [switch]$Preview, [string]$Only)
 $ErrorActionPreference = 'Continue'
 $hosts = 'powershell.exe','pwsh.exe','cmd.exe','python.exe','pythonw.exe','py.exe','wsl.exe','wscript.exe','cscript.exe','node.exe','uv.exe','bash.exe'
 # Ferryman's own tasks (it manages and silences them itself) and never-touch programs stay in Windows.
@@ -15,6 +15,7 @@ $names = @{}
 $seed = New-Object System.Text.StringBuilder
 foreach ($t in Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' -and $_.Settings.Enabled }) {
   $full = "$($t.TaskPath)$($t.TaskName)"
+  if ($Only -and $full -ne $Only) { continue }
   $acts = @($t.Actions)
   if ($acts.Count -ne 1) { continue }
   $a = $acts[0]
@@ -43,6 +44,13 @@ foreach ($t in Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microso
       if ($cls -eq 'MSFT_TaskLogonTrigger' -or $cls -eq 'MSFT_TaskBootTrigger') { $sched = 'at logon'; break }
       if ($cls -eq 'MSFT_TaskDailyTrigger') { if ($tr.DaysInterval -gt 1) { $sched = "every $($tr.DaysInterval)d" } else { $sched = "daily {0:HH:mm}" -f ([datetime]$tr.StartBoundary) }; break }
       if ($cls -eq 'MSFT_TaskWeeklyTrigger') { $sched = 'every 7d'; break }
+      if ($cls -eq 'MSFT_TaskTimeTrigger' -and $tr.StartBoundary) {
+        # A one-time task: copy it if it has not run yet.
+        $sb = [datetime]$tr.StartBoundary
+        $lr = (Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue).LastRunTime
+        if (-not $lr -or $lr -lt $sb) { $sched = "once $([DateTimeOffset]::new($sb).ToUnixTimeSeconds())" }
+        break
+      }
     }
   }
   if (-not $sched) { "skip (no schedule snifrig can copy): $full"; continue }
