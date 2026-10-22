@@ -659,6 +659,31 @@ fn start_guard(dir: std::path::PathBuf) {
     });
 }
 
+/// `frames on|off`: real frame-rate measuring in games. Windows lets only an administrator read
+/// a game's present events, so this sets up snifrig-frames as a scheduled task with highest
+/// privileges, once (Windows asks you to confirm). Off removes it again.
+fn frames_cmd(dir: &Path, on: bool) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    let exe = dir.join("bin").join("snifrig-frames.exe");
+    if on && !exe.exists() { return Err(format!("{} is missing; install snifrig again", exe.display())); }
+    let script = if on {
+        format!("$a = New-ScheduledTaskAction -Execute '{}' -Argument '--dir \"{}\"'\r\n$t = New-ScheduledTaskTrigger -AtLogOn -User \"$env:USERDOMAIN\\$env:USERNAME\"\r\n$p = New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" -LogonType Interactive -RunLevel Highest\r\n$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries\r\nRegister-ScheduledTask -TaskName 'snifrig frames' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\nStart-ScheduledTask -TaskName 'snifrig frames'\r\n'ok' | Out-File '{}'\r\n",
+            exe.display(), dir.display(), dir.join("frames-setup.out").display())
+    } else {
+        format!("Unregister-ScheduledTask -TaskName 'snifrig frames' -Confirm:$false -ErrorAction SilentlyContinue\r\n'ok' | Out-File '{}'\r\n", dir.join("frames-setup.out").display())
+    };
+    if !on { let _ = std::fs::write(dir.join("frames-off"), "1"); let _ = std::fs::remove_file(dir.join("frames-on")); }
+    let f = dir.join("frames-setup.ps1");
+    std::fs::write(&f, script).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(dir.join("frames-setup.out"));
+    let st = std::process::Command::new("powershell.exe").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command"])
+        .arg(format!("Start-Process powershell.exe -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'", f.display()))
+        .creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
+    if !st.success() || !dir.join("frames-setup.out").exists() { return Err("the Windows confirmation was cancelled".into()); }
+    if on { let _ = std::fs::write(dir.join("frames-on"), "1"); Ok("Frame measuring is on: snifrig now sees real fps and hitches in Direct3D games (Vulkan and OpenGL games still use the CPU-based check).".into()) }
+    else { Ok("Frame measuring is off.".into()) }
+}
+
 /// Your answer to "how did the game run?". Stutters: the programs that were busy during them
 /// are turned down hardest in game mode from now on.
 fn game_answer(dir: &Path, a: &str) -> Result<String, String> {
@@ -1284,6 +1309,8 @@ fn watch(dir: &Path) {
     let mut slow_apps = snifrig_fix::slowapp::Tracker::default();
     // The game sniffer and game mode's learned list.
     let mut session: Option<snifrig_fix::game::Session> = None;
+    let mut want_pid = 0u32;
+    let _ = std::fs::remove_file(dir.join("frames-want"));
     let mut game_ease = snifrig_fix::game::load_ease(dir);
     let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
     // The feel gate was turned off while the meter was checked; it comes back on by itself after a day.
@@ -1422,6 +1449,15 @@ fn watch(dir: &Path) {
             gov.feels_slow = snifrig_fix::feel::sluggish_with(&snifrig_fix::feel::recent(5), gov.dwm_pct);
             if n % 30 == 7 { game_ease = snifrig_fix::game::load_ease(dir); }
             gov.hints.game_front = gov.game.as_ref().filter(|_| gov.tuning.game_mode).map(|g| g.to_lowercase());
+            // Full when the game is in front full screen, soft when it is in front in a window,
+            // super soft when it runs but you are in another app.
+            gov.hints.game_level = match &gov.hints.game_front {
+                None => 0,
+                Some(g) => {
+                    let fg = sys::foreground_pid().and_then(|p| gov.procs().iter().find(|x| x.pid == p).map(|x| x.name.to_lowercase()));
+                    if fg.as_deref() == Some(g.as_str()) { if sys::fullscreen_d3d() { 3 } else { 2 } } else { 1 }
+                }
+            };
             gov.hints.game_ease = game_ease.clone();
             gov.user_says = learner.user_feel(now_unix());
             if let Some(s) = gov.user_says { gov.feels_slow = s; }
@@ -1438,9 +1474,20 @@ fn watch(dir: &Path) {
                     let s = session.get_or_insert_with(|| snifrig_fix::game::Session::new(g, now_unix()));
                     let (top, top_pct) = gov.top.iter().find(|(nm, _)| !nm.eq_ignore_ascii_case(g) && nm != "system" && nm != "idle").cloned().unwrap_or_default();
                     let avail = sys::memory_status().map(|m| m.1).unwrap_or(0.0);
-                    s.add(&snifrig_fix::game::Sample { t: now_unix(), game_pct: gov.name_pct(g), total: gov.total_pct, top, top_pct, avail_mb: avail, fullscreen: sys::fullscreen_d3d() });
+                    // Real frame times, if you turned frame measuring on: ask the helper for the game in front.
+                    let gpid = if gov.hints.game_level >= 2 { sys::foreground_pid().unwrap_or(0) } else { 0 };
+                    let frames = if dir.join("frames-on").exists() && gpid != 0 {
+                        if want_pid != gpid { let _ = std::fs::write(dir.join("frames-want"), gpid.to_string()); want_pid = gpid; }
+                        std::fs::read_to_string(dir.join("frames-now.txt")).ok().and_then(|l| {
+                            let f: Vec<&str> = l.split_whitespace().collect();
+                            let fresh = f.first().and_then(|x| x.parse::<f64>().ok()).map_or(false, |t| now_unix() - t <= 3.0);
+                            (f.len() >= 6 && fresh && f[1] == gpid.to_string()).then(|| (f[2].parse().unwrap_or(0.0), f[4].parse().unwrap_or(0.0), f[5].parse().unwrap_or(0)))
+                        })
+                    } else { if want_pid != 0 { let _ = std::fs::remove_file(dir.join("frames-want")); want_pid = 0; } None };
+                    s.add(&snifrig_fix::game::Sample { t: now_unix(), game_pct: gov.name_pct(g), total: gov.total_pct, top, top_pct, avail_mb: avail, fullscreen: sys::fullscreen_d3d(), frames });
                 }
                 (None, true) => {
+                    if want_pid != 0 { let _ = std::fs::remove_file(dir.join("frames-want")); want_pid = 0; }
                     let s = session.take().unwrap();
                     let c = s.culprits();
                     let line = format!("{{\"game\":\"{}\",\"start\":{:.0},\"mins\":{:.0},\"full_screen_mins\":{:.0},\"stutters\":{},\"busy\":\"{}\"}}",
@@ -1708,6 +1755,8 @@ fn main() {
         }
         ["impact", "answer", a @ ("yes" | "slow" | "no")] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::ANSWER_FILE), a); println!("thanks"); }
         ["game", "answer", a @ ("smooth" | "stutter" | "bad")] => out(game_answer(&dir, a)),
+        ["frames", op @ ("on" | "off")] => out(frames_cmd(&dir, *op == "on")),
+        ["frames"] | ["frames", "status"] => println!("{}", if dir.join("frames-on").exists() { "frame measuring is on (snifrig-frames runs from the scheduled task 'snifrig frames')" } else { "frame measuring is off. snifrig-fix frames on turns it on (Windows asks once)." }),
         ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: snifrig holds off for 2 minutes now, to compare"); }
         ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }
         ["impact", "on"] => { let _ = std::fs::remove_file(dir.join(snifrig_fix::impact::OFF_FILE)); println!("impact tests are on"); }

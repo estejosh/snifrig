@@ -823,6 +823,11 @@ fn install(dir: &PathBuf, given: Option<String>) {
         match fs::copy(&fsrc, bin.join("snifrig-fix.exe")) { Ok(_) => fix = true, Err(e) => eprintln!("could not copy snifrig-fix.exe: {}", e) }
     }
     // The window is optional too: copy it if it was built here, and add a Start menu entry.
+    // The frame-rate helper (opt-in; only used after `snifrig-fix frames on`).
+    let frs = sd.join("snifrig-frames.exe");
+    if frs.exists() && frs != bin.join("snifrig-frames.exe") {
+        if let Err(e) = fs::copy(&frs, bin.join("snifrig-frames.exe")) { eprintln!("could not copy snifrig-frames.exe (turn frame measuring off and run install again): {}", e); }
+    }
     let msrc = sd.join("snifrig-mcp.exe");
     if msrc.exists() && msrc != bin.join("snifrig-mcp.exe") {
         if let Err(e) = fs::copy(&msrc, bin.join("snifrig-mcp.exe")) { eprintln!("could not copy snifrig-mcp.exe (close AI apps using it and run install again): {}", e); }

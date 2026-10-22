@@ -186,6 +186,9 @@ pub struct Hints {
     /// Game mode: the game in front (lowercase), while performance mode is on. Everything else
     /// is turned down at once, without waiting for the PC to get busy.
     pub game_front: Option<String>,
+    /// How strong game mode is: 3 full (full-screen game in front), 2 soft (windowed game in
+    /// front), 1 super soft (a game is running but not the window you are using).
+    pub game_level: u8,
     /// Programs that made your games stutter (from your answers): turned down hardest in game mode.
     pub game_ease: HashSet<String>,
     /// Thresholds in force (the Governor copies its settings in before deciding).
@@ -193,7 +196,25 @@ pub struct Hints {
 }
 
 impl Default for Hints {
-    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new(), keep: HashSet::new(), game_front: None, game_ease: HashSet::new(), tuning: Tuning::default() } }
+    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new(), keep: HashSet::new(), game_front: None, game_level: 0, game_ease: HashSet::new(), tuning: Tuning::default() } }
+}
+
+/// Pure: the deepest level game mode may take this program to (0 = leave it alone).
+/// Full: everything else below normal (on a screen: efficiency mode), stutter culprits all the way.
+/// Soft: hidden apps efficiency mode, culprits below normal, apps on a screen untouched.
+/// Super soft: only programs that made your games stutter, efficiency mode.
+pub fn game_cap(level: u8, culprit: bool, onscreen: bool, max: u8) -> u8 {
+    let c = match (level, culprit, onscreen) {
+        (3, true, false) => max,
+        (3, _, true) => 1,
+        (3, false, false) => 2,
+        (2, _, true) => 0,
+        (2, true, false) => 2,
+        (2, false, false) => 1,
+        (1, true, _) => 1,
+        _ => 0,
+    };
+    c.min(max)
 }
 
 /// Pure policy without learning hints.
@@ -229,26 +250,39 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
             // The game is over: everything game mode turned down comes back at once.
             Some(_) if hints.game_front.is_none() && d.reason.starts_with("game mode") =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 0, reason: "the game is over".into() }),
-            Some(_) if hints.game_front.is_some() && d.reason.starts_with("game mode") => {}
+            // Game mode got softer (you left full screen, or switched away): step down to the new limit.
+            Some(s) if hints.game_front.is_some() && d.reason.starts_with("game mode") => {
+                let onscreen = s.onscreen || on_names.contains(&s.name.as_str());
+                let cap = game_cap(hints.game_level, hints.game_ease.contains(&s.name.to_lowercase()), onscreen, t.max_level);
+                if d.level > cap { out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: cap, reason: "game mode is softer now".into() }); }
+            }
             Some(_) if mood.calm_with(t) && mood.calm_ticks % t.restore_every.max(1) == 0 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: d.level - 1, reason: format!("CPU is calm again ({:.0}%)", total_pct) }),
             _ => {}
         }
     }
-    let game = hints.game_front.as_deref();
-    if !mood.busy_with(t) && game.is_none() { return out; }
+    let game = hints.game_front.as_deref().filter(|_| hints.game_level > 0);
+    // Full and soft game mode act at once; super soft only for known culprits; otherwise wait for busy.
+    let proactive = game.is_some() && (hints.game_level >= 2 || !hints.game_ease.is_empty());
+    if !mood.busy_with(t) && !proactive { return out; }
+    let busy = mood.busy_with(t);
 
     // Demote the biggest background users, one step each, a couple per tick.
     let mut cands: Vec<&Seen> = seen.iter()
         // The app in front is never touched; its windowless helpers (busy tabs, renderers) may be reined in lightly.
         .filter(|s| !s.protected && !s.foreground && (!fg_names.contains(&s.name.as_str()) || !s.windowed))
-        .filter(|s| s.core_pct >= if game.is_some() { 2.0 } else { t.min_core_pct })
+        .filter(|s| s.core_pct >= match hints.game_level { _ if game.is_none() => t.min_core_pct, 3 => 2.0, 2 => 5.0, _ => if hints.game_ease.contains(&s.name.to_lowercase()) { 2.0 } else { t.min_core_pct } })
         .filter(|s| game.map_or(true, |g| !s.name.eq_ignore_ascii_case(g)))
         .filter(|s| { let n = s.name.to_lowercase(); !hints.protect.contains(&n) && !hints.blocked.contains(&n) })
         .filter(|s| {
             let mut cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level);
-            // Game mode: everything else to below normal; what made your games stutter, all the way.
-            if game.is_some() && !hints.game_ease.contains(&s.name.to_lowercase()) { cap = cap.min(2); }
+            // Game mode sets the limit; when the PC is also busy, normal easing may go further for
+            // anything the game mode leaves alone.
+            if game.is_some() {
+                let onscreen = s.onscreen || on_names.contains(&s.name.as_str());
+                let gc = game_cap(hints.game_level, hints.game_ease.contains(&s.name.to_lowercase()), onscreen, t.max_level);
+                if !busy { cap = cap.min(gc); }
+            }
             // Helpers of the app in front, and apps showing on a screen, only get efficiency mode.
             if fg_names.contains(&s.name.as_str()) || on_names.contains(&s.name.as_str()) { cap = cap.min(1); }
             if hints.keep.contains(&s.name.to_lowercase()) {
@@ -261,10 +295,11 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
     let weight = |s: &Seen| { let n = s.name.to_lowercase();
         s.core_pct * hints.prob.get(&n).copied().unwrap_or(hints.default_prob) * hints.boost.get(&n).copied().unwrap_or(1.0) };
     cands.sort_by(|a, b| weight(b).partial_cmp(&weight(a)).unwrap_or(std::cmp::Ordering::Equal));
-    for s in cands.into_iter().take(if game.is_some() { t.max_per_tick * 3 } else { t.max_per_tick }) {
+    for s in cands.into_iter().take(if game.is_some() && hints.game_level >= 2 { t.max_per_tick * 3 } else { t.max_per_tick }) {
         let lvl = demoted.get(&s.key).map_or(0, |d| d.level) + 1;
-        let reason = if let Some(g) = game {
-            format!("game mode: {} is in front, so {} is turned down until you stop playing", g, s.name)
+        let reason = if let Some(g) = game.filter(|_| { let onscreen = s.onscreen || on_names.contains(&s.name.as_str()); game_cap(hints.game_level, hints.game_ease.contains(&s.name.to_lowercase()), onscreen, t.max_level) >= lvl }) {
+            let how = match hints.game_level { 3 => "is in front", 2 => "is in front (windowed: soft game mode)", _ => "is running (super soft game mode)" };
+            format!("game mode: {} {}, so {} is turned down until you stop playing", g, how, s.name)
         } else if fg_names.contains(&s.name.as_str()) {
             format!("CPU at {:.0}% and a background part of {} (a tab or helper, pid {}) was using {:.0}% of a core; the window you are using is untouched", total_pct, s.name, s.key.0, s.core_pct)
         } else {
@@ -620,6 +655,17 @@ mod gov_tests {
         let (t, e) = Tuning::parse("busy_pct=40\ncalm_pct=60");
         assert_eq!((t.busy_pct, t.calm_pct), (BUSY_PCT, CALM_PCT));
         assert_eq!(e.len(), 1);
+    }
+
+    #[test]
+    fn game_mode_strengths() {
+        // full screen: everything else below normal, on a screen efficiency mode, culprits all the way
+        assert_eq!((game_cap(3, false, false, 3), game_cap(3, false, true, 3), game_cap(3, true, false, 3)), (2, 1, 3));
+        // windowed game in front: soft
+        assert_eq!((game_cap(2, false, false, 3), game_cap(2, false, true, 3), game_cap(2, true, false, 3)), (1, 0, 2));
+        // game running but not focused: only culprits, lightly
+        assert_eq!((game_cap(1, false, false, 3), game_cap(1, true, false, 3), game_cap(1, true, true, 3)), (0, 1, 1));
+        assert_eq!(game_cap(0, true, false, 3), 0);
     }
 
     #[test]

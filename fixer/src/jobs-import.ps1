@@ -6,7 +6,7 @@ param([string]$Dir, [switch]$Preview, [string]$Only)
 $ErrorActionPreference = 'Continue'
 $hosts = 'powershell.exe','pwsh.exe','cmd.exe','python.exe','pythonw.exe','py.exe','wsl.exe','wscript.exe','cscript.exe','node.exe','uv.exe','bash.exe'
 # Ferryman's own tasks (it manages and silences them itself) and never-touch programs stay in Windows.
-$skip = 'ferryman','ferry-autoenable','\ferry\bin\','\ferry\service\','gpu_arbiter'
+$skip = 'ferryman','ferry-autoenable','\ferry\bin\','\ferry\service\','gpu_arbiter','snifrig'
 $bk = Join-Path $Dir 'task-backups'
 New-Item -ItemType Directory -Force $bk | Out-Null
 $out = New-Object System.Text.StringBuilder

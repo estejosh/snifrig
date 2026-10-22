@@ -1194,6 +1194,14 @@ impl App {
     }
 
     fn performance(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            let on = self.dir.join("frames-on").exists();
+            section(ui, "Measure real frame rates in games", "With this on, snifrig sees each game's real fps and every hitch (Direct3D games), so it knows exactly which app made your game stutter. Windows only lets an administrator see this, so it asks you once. It reads only the game in front, only while you play, and nothing leaves your PC.");
+            if ui.add(egui::Button::new(RichText::new(if on { "Turn frame measuring off" } else { "Turn frame measuring on" }).color(if on { TEXT } else { Color32::BLACK })).fill(if on { CARD2 } else { ACCENT })).clicked() {
+                self.run("snifrig-fix.exe", vec!["frames".into(), if on { "off" } else { "on" }.into()], if on { "Frame measuring is off." } else { "Frame measuring is on. Windows asked you once." });
+            }
+        });
+        ui.add_space(8.0);
         ui.heading("Performance mode");
         ui.label(RichText::new("When a game is in front, snifrig switches to your fastest power plan, eases background apps sooner, and never slows the game, even when you alt-tab. Your plan comes back when the game closes.").color(MUTED));
         ui.add_space(8.0);

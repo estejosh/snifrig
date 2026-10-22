@@ -11,6 +11,7 @@ const FILES: [(&str, &[u8]); 6] = [
     ("snifrig-fix.exe", include_bytes!("../../target/release/snifrig-fix.exe")),
     ("snifrig-app.exe", include_bytes!("../../target/release/snifrig-app.exe")),
     ("snifrig-mcp.exe", include_bytes!("../../target/release/snifrig-mcp.exe")),
+    ("snifrig-frames.exe", include_bytes!("../../target/release/snifrig-frames.exe")),
 ];
 const LICENSE: &[u8] = include_bytes!("../../LICENSE");
 

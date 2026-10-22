@@ -14,7 +14,9 @@ pub const LAST: &str = "game-last.txt";
 pub const MIN_SECS: f64 = 300.0;
 
 #[derive(Clone, Debug, Default)]
-pub struct Sample { pub t: f64, pub game_pct: f64, pub total: f64, pub top: String, pub top_pct: f64, pub avail_mb: f64, pub fullscreen: bool }
+pub struct Sample { pub t: f64, pub game_pct: f64, pub total: f64, pub top: String, pub top_pct: f64, pub avail_mb: f64, pub fullscreen: bool,
+    /// Real frame times from snifrig-frames, when it is on and the game uses Direct3D: (fps, 99th percentile frame ms, hitched frames).
+    pub frames: Option<(f64, f64, u32)> }
 
 #[derive(Debug)]
 pub struct Session {
@@ -26,11 +28,14 @@ pub struct Session {
     pub hitches: Vec<(f64, String, &'static str)>,
     last_hitch: f64,
     last_t: f64,
+    fps_sum: f64,
+    fps_n: u32,
+    p99s: Vec<f64>,
 }
 
 impl Session {
     pub fn new(game: &str, now: f64) -> Session {
-        Session { game: game.to_string(), start: now, secs: 0.0, fs_secs: 0.0, recent: VecDeque::new(), hitches: Vec::new(), last_hitch: 0.0, last_t: now }
+        Session { game: game.to_string(), start: now, secs: 0.0, fs_secs: 0.0, recent: VecDeque::new(), hitches: Vec::new(), last_hitch: 0.0, last_t: now, fps_sum: 0.0, fps_n: 0, p99s: Vec::new() }
     }
 
     /// Pure: feed one sample (about once a second).
@@ -43,7 +48,10 @@ impl Session {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let usual = if v.len() >= 10 { v[v.len() / 2] } else { 0.0 };
         let starved = usual >= 20.0 && s.game_pct < usual * 0.5 && (s.total >= 85.0 || s.top_pct >= 50.0);
-        let why = if starved { Some("the game suddenly got less CPU") }
+        if let Some((fps, p99, _)) = s.frames { if fps > 0.0 { self.fps_sum += fps; self.fps_n += 1; self.p99s.push(p99); } }
+        // With real frame times, a hitch is a hitch; without them, the CPU signs above.
+        let why = if let Some((_, _, hitched)) = s.frames { if hitched > 0 { Some("frames hitched") } else if s.avail_mb > 0.0 && s.avail_mb < 1500.0 { Some("memory ran short") } else { None } }
+            else if starved { Some("the game suddenly got less CPU") }
             else if s.total >= 97.0 { Some("the PC was maxed out") }
             else if s.avail_mb > 0.0 && s.avail_mb < 1500.0 { Some("memory ran short") }
             else { None };
@@ -69,15 +77,25 @@ impl Session {
         v
     }
 
+    /// Average fps and the "1% low" (fps at the 99th percentile frame time), when measured.
+    pub fn fps(&self) -> Option<(f64, f64)> {
+        if self.fps_n < 30 { return None; }
+        let mut p = self.p99s.clone();
+        p.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let worst = p[p.len() * 9 / 10];
+        Some((self.fps_sum / self.fps_n as f64, if worst > 0.0 { 1000.0 / worst } else { 0.0 }))
+    }
+
     pub fn question(&self) -> String {
         let mins = (self.secs / 60.0).round();
+        let fps = self.fps().map(|(a, low)| format!(" It averaged {:.0} fps (lows around {:.0}).", a, low)).unwrap_or_default();
         let c = self.culprits();
         let seen = match (self.hitches.len(), c.first()) {
             (0, _) => "snifrig saw no moments that looked like a stutter.".to_string(),
             (n, Some((who, k))) => format!("snifrig saw {} moment{} that may have stuttered, {} of them while {} was busy.", n, if n == 1 { "" } else { "s" }, k, who),
             (n, None) => format!("snifrig saw {} moment{} that may have stuttered.", n, if n == 1 { "" } else { "s" }),
         };
-        format!("How did {} run? You played {:.0} minutes. {}", self.game, mins, seen)
+        format!("How did {} run? You played {:.0} minutes.{} {}", self.game, mins, fps, seen)
     }
 }
 
@@ -90,7 +108,18 @@ pub fn load_ease(dir: &Path) -> std::collections::HashSet<String> {
 mod tests {
     use super::*;
 
-    fn s(t: f64, game: f64, total: f64, top: &str, top_pct: f64) -> Sample { Sample { t, game_pct: game, total, top: top.into(), top_pct, avail_mb: 8000.0, fullscreen: true } }
+    fn s(t: f64, game: f64, total: f64, top: &str, top_pct: f64) -> Sample { Sample { t, game_pct: game, total, top: top.into(), top_pct, avail_mb: 8000.0, fullscreen: true, frames: None } }
+
+    #[test]
+    fn real_frame_times_win() {
+        let mut x = Session::new("game.exe", 0.0);
+        for i in 1..=400 { let mut a = s(i as f64, 300.0, 60.0, "obs64.exe", 40.0); a.frames = Some((60.0, 18.0, if i % 100 == 0 { 2 } else { 0 })); x.add(&a); }
+        assert_eq!(x.hitches.len(), 4);
+        assert_eq!(x.culprits()[0].0, "obs64.exe");
+        let (avg, low) = x.fps().unwrap();
+        assert!((avg - 60.0).abs() < 0.1 && (low - 55.6).abs() < 0.2, "{} {}", avg, low);
+        assert!(x.question().contains("averaged 60 fps"), "{}", x.question());
+    }
 
     #[test]
     fn spots_stutters_and_who_was_busy() {
