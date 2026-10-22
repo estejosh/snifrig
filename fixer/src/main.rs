@@ -1241,6 +1241,9 @@ fn watch(dir: &Path) {
     let mut dwm_hot = 0.0f64;
     // Your recurring jobs, run by snifrig: no windows, no pileups, at a good moment for the PC.
     let mut jobs = snifrig_fix::sched::Scheduler::new(dir);
+    // Measured impact: short tests while the PC is busy (see impact.rs).
+    let mut impact = snifrig_fix::impact::Impact::new(dir);
+    snifrig_fix::impact::write_summary(dir);
     if dir.join(snifrig_fix::sched::HANDED_BACK).exists() { note(dir, "jobs", "done", &takeover(dir, false)); }
     start_guard(dir.to_path_buf());
     start_task_watch(dir.to_path_buf());
@@ -1352,13 +1355,22 @@ fn watch(dir: &Path) {
         }
         let mode = ledger::read_mode(dir);
         let paused = now_unix() < ledger::paused_until(dir);
+        {
+            let t = now_unix();
+            let f = (n % 5 == 0).then(|| snifrig_fix::feel::recent(5)).filter(|f| f.samples > 0).map(|f| f.ms());
+            let wants_help = learner.user_feel(t) == Some(true) || t < gov.hold_until;
+            let now = snifrig_fix::impact::Now { now: t, cpu: gov.total_pct, feel_ms: f, gaming: gov.game.is_some() || sys::fullscreen_d3d(), user_wants_help: wants_help };
+            if !paused && mode != Mode::Off { if let Some(m) = impact.tick(dir, &now) { note(dir, "impact", "done", &m); } }
+        }
+        let holding = impact.holding();
         let mut act = false;
         if mode == Mode::Off || paused {
             if !gov.demoted.is_empty() { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); }
             for m in perf.stop(gov.acting) { note(dir, "perf:mode", "done", &m); }
             gov.game = None;
         } else {
-            act = matches!(mode, Mode::Ask | Mode::Auto);
+            // During the "without snifrig" block of an impact test, snifrig holds off.
+            act = matches!(mode, Mode::Ask | Mode::Auto) && !holding;
             if act != gov.acting && !gov.demoted.is_empty() { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); }
             if act != enf.acting { enf.reset(); }
             gov.acting = act;
@@ -1618,6 +1630,14 @@ fn main() {
         ["dismiss", id] => out(dismiss(&dir, id)),
         ["keep", name] => out(keep_cmd(&dir, name)),
         ["jobs", rest @ ..] => out(jobs_cmd(&dir, rest)),
+        ["impact"] => {
+            let s = snifrig_fix::impact::write_summary(&dir);
+            println!("{}", snifrig_fix::impact::sentence(&s));
+            println!("tests: {} ({} counted). Every test: {}", s.tests, s.valid, dir.join(snifrig_fix::impact::LOG).display());
+        }
+        ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: a test starts within a few seconds if the PC is busy"); }
+        ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }
+        ["impact", "on"] => { let _ = std::fs::remove_file(dir.join(snifrig_fix::impact::OFF_FILE)); println!("impact tests are on"); }
         ["popup", yn @ ("yes" | "no"), who @ ..] => out(popup_cmd(&dir, *yn == "yes", &who.join(" "))),
         ["heavy", kind, yn @ ("yes" | "no"), app] => out(heavy_cmd(&dir, kind, *yn == "yes", app)),
         ["unkeep", name] => out(unkeep_cmd(&dir, name)),

@@ -25,6 +25,8 @@ static mut TASKBAR_MSG: u32 = 0;
 static mut LAST_HEAD: String = String::new();
 static mut HEAD_SHOWN: Vec<(String, u64)> = Vec::new(); // headline balloons already shown, with time
 static mut LAST_BALLOON: u64 = 0;
+static mut TRAY_START: u64 = 0;
+static mut LAST_IMPACT_DAY: u64 = 0;
 static mut SEEN: Vec<String> = Vec::new(); // pending fix ids already announced
 static mut MENU_IDS: Vec<String> = Vec::new(); // pending ids behind the current menu's Approve/Dismiss (100+2i, 101+2i)
 static mut GOV_CMDS: Vec<Vec<String>> = Vec::new(); // fixer args behind Governor menu ids 200+i
@@ -226,6 +228,21 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         put(&mut n.szInfoTitle, "Your PC is slow");
         put(&mut n.szInfo, &match st.causes.first() { Some(c) => format!("{} {}", st.headline, c), None => st.headline.clone() });
         n.dwInfoFlags = NIIF_WARNING;
+    }
+    // Once a day, when you are not busy: what snifrig measured it does for this PC (only a real,
+    // counted result; nothing while it is still measuring or found no clear difference).
+    if TRAY_START == 0 { TRAY_START = now; }
+    if !FIRST && !head_ball && !user_busy() && now.saturating_sub(LAST_BALLOON) >= 1800 && now.saturating_sub(TRAY_START) >= 600 && LAST_IMPACT_DAY != now / 86400 {
+        LAST_IMPACT_DAY = now / 86400;
+        let s = std::fs::read_to_string(dir().join("impact-summary.json")).unwrap_or_default();
+        let num = |k: &str| s.split(&format!("\"{}\":", k)).nth(1).and_then(|v| v.split(|c| c == ',' || c == '}').next()).and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(0.0);
+        if num("valid") >= 3.0 && num("low") > 0.0 {
+            LAST_BALLOON = now;
+            n.uFlags |= NIF_INFO;
+            put(&mut n.szInfoTitle, "What snifrig did for you");
+            put(&mut n.szInfo, &format!("When your PC is busy, your apps respond {:.0}% faster with snifrig. Measured on this PC in {:.0} tests; every test is in the app.", num("faster_pct"), num("valid")));
+            n.dwInfoFlags = 1;
+        }
     }
     if !FIRST && !user_busy() && st.level == 1 && st.last_alert_unix > LAST_ALERT && st.headline.is_empty() {
         n.uFlags |= NIF_INFO;

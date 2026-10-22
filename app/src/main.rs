@@ -737,7 +737,46 @@ impl App {
 
     // ---------------- pages ----------------
 
+    /// What snifrig does for this PC, measured, with every test one click away. Without snifrig
+    /// fix: what it would do, from real tests on other PCs only (never a made-up number).
+    fn impact_card(&mut self, ui: &mut egui::Ui) {
+        if self.state.has_key {
+            let m = data::load_impact(&self.dir);
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    chip(ui, "measured on this PC", GOOD);
+                    if m.valid >= 3 && m.low > 0.0 { ui.label(bold(format!("{:.0}% faster when your PC is busy", m.faster), 18.0).color(TEXT)); }
+                });
+                ui.label(RichText::new(if m.text.is_empty() { "Measuring: 0 of 3 tests done. snifrig tests only while your PC is busy, a few minutes at a time." } else { m.text.as_str() }).color(MUTED));
+                egui::CollapsingHeader::new("How this is measured, and every test").id_salt("impact-how").show(ui, |ui| {
+                    ui.label(RichText::new("While your PC is busy, snifrig runs a short test: 3 minutes where it holds off and 3 where it works, in alternating order, measuring how fast your apps and your mouse respond in each. A test counts only if the load was about the same in both halves. Never during a game, never while you ask for help, at most 4 a day. It is conservative: app rules stay in place while snifrig holds off.").size(12.5).color(MUTED));
+                    ui.add_space(4.0);
+                    for r in m.rows.iter().take(8) {
+                        ui.label(RichText::new(format!("{}   without snifrig {:.0} ms   with it {:.0} ms   CPU {:.0}% / {:.0}%{}", local_time(r.start, true), r.off_ms, r.on_ms, r.off_cpu, r.on_cpu, if r.valid { "" } else { "   (not counted: load changed)" })).size(12.0).color(if r.valid { TEXT } else { MUTED }));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Run a test now").on_hover_text("Starts when the PC is busy enough to measure.").clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "test".into()], "A test starts in a few seconds if the PC is busy."); }
+                        if ui.button("Open the test log").clicked() { let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", self.dir.join("impact.jsonl").display())).spawn(); }
+                        let off = self.dir.join("impact-off").exists();
+                        if ui.button(if off { "Turn tests on" } else { "Turn tests off" }).clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), if off { "on" } else { "off" }.into()], if off { "Tests are on." } else { "Tests are off." }); }
+                    });
+                });
+            });
+        } else {
+            card(ui, |ui| {
+                ui.horizontal(|ui| { chip(ui, "snifrig fix", ACCENT); });
+                match data::load_estimate(&self.dir) {
+                    Some((f, n)) => { ui.label(bold(format!("About {:.0}% faster when your PC is busy", f), 18.0).color(TEXT)); ui.label(RichText::new(format!("That is what snifrig fix measured on {} PC{} like yours. With it, snifrig measures it on this PC too, with real tests you can check.", n, if n == 1 { "" } else { "s" })).color(MUTED)); }
+                    None => { ui.label(RichText::new("How much faster would snifrig fix make this PC? It measures it for real, on your PC, with short tests while it is busy, and shows you every test.").color(MUTED)); }
+                }
+                if ui.button("Get snifrig fix").clicked() { self.page = Page::Settings; self.refresh_license(); }
+            });
+        }
+        ui.add_space(8.0);
+    }
+
     fn overview(&mut self, ui: &mut egui::Ui, live: &sys::Live) {
+        self.impact_card(ui);
         let cores = live.cores.max(1) as f64;
         ui.columns(4, |c| {
             card(&mut c[0], |ui| {

@@ -56,6 +56,29 @@ pub fn load_suggestions(dir: &Path) -> Vec<Suggestion> {
     }).collect()
 }
 
+/// What snifrig measured it does for this PC (impact-summary.json and every test in impact.jsonl).
+#[derive(Clone, Debug, Default)]
+pub struct Impact { pub tests: u32, pub valid: u32, pub slower: f64, pub faster: f64, pub low: f64, pub high: f64, pub text: String, pub rows: Vec<ImpactRow> }
+#[derive(Clone, Debug, Default)]
+pub struct ImpactRow { pub start: f64, pub off_ms: f64, pub on_ms: f64, pub off_cpu: f64, pub on_cpu: f64, pub valid: bool }
+
+pub fn load_impact(dir: &Path) -> Impact {
+    let s = read_json(dir, "impact-summary.json");
+    let mut rows: Vec<ImpactRow> = read(dir, "impact.jsonl").lines().filter_map(|l| json::parse(l)).map(|j| ImpactRow {
+        start: j.get("start").num(), off_ms: j.get("off_ms").num(), on_ms: j.get("on_ms").num(), off_cpu: j.get("off_cpu").num(), on_cpu: j.get("on_cpu").num(), valid: j.get("valid").bool(),
+    }).collect();
+    rows.reverse();
+    Impact { tests: s.get("tests").num() as u32, valid: s.get("valid").num() as u32, slower: s.get("slower_pct").num(), faster: s.get("faster_pct").num(),
+        low: s.get("low").num(), high: s.get("high").num(), text: s.get("text").str().to_string(), rows }
+}
+
+/// A measured result from other PCs, shipped with snifrig (impact-estimate.json): faster %, PCs.
+pub fn load_estimate(dir: &Path) -> Option<(f64, u32)> {
+    let j = read_json(dir, "impact-estimate.json");
+    let (f, n) = (j.get("faster_pct").num(), j.get("pcs").num() as u32);
+    (n > 0 && f > 0.0).then_some((f, n))
+}
+
 /// One job as the fixer's scheduler reports it (jobs-status.json).
 #[derive(Clone, Debug, Default)]
 pub struct JobRow {
