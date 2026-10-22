@@ -29,7 +29,7 @@ const BAD: Color32 = Color32::from_rgb(229, 83, 75);
 const BLUE: Color32 = Color32::from_rgb(96, 165, 250);
 
 #[derive(PartialEq, Clone, Copy)]
-enum Page { Overview, Governor, Rules, Performance, Activity, Report, Settings }
+enum Page { Overview, Governor, Rules, Jobs, Performance, Activity, Report, Settings }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Filter { All, Governor, Rules, Fixes, Performance, Learning, Incidents }
@@ -266,6 +266,12 @@ fn bar(ui: &mut egui::Ui, frac: f32, color: Color32) {
     let mut r = rect;
     r.set_width(rect.width() * frac.clamp(0.0, 1.0));
     p.rect_filled(r, CornerRadius::same(4), color);
+}
+
+/// "45s", "12m", "3h 5m": how long something took or has been going.
+fn fmt_ago(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s < 60 { format!("{}s", s) } else if s < 3600 { format!("{}m", s / 60) } else { format!("{}h {}m", s / 3600, (s % 3600) / 60) }
 }
 
 fn local_time(unix: f64, with_date: bool) -> String {
@@ -689,6 +695,7 @@ impl App {
             (Page::Overview, "\u{1F3E0}  Overview".to_string()),
             (Page::Governor, "\u{26A1}  Governor".to_string()),
             (Page::Rules, format!("\u{1F4CB}  App rules  {}", if self.rules.rules.is_empty() { String::new() } else { format!("({})", self.rules.rules.len()) })),
+            (Page::Jobs, "\u{1F552}  Jobs".to_string()),
             (Page::Performance, "\u{1F3AE}  Performance mode".to_string()),
             (Page::Activity, "\u{1F4DC}  Activity".to_string()),
             (Page::Report, "\u{1F4CA}  Report".to_string()),
@@ -895,6 +902,65 @@ impl App {
             if ui.button("Back to defaults").clicked() { let plan = self.tuning.game_plan.clone(); self.tuning = Tuning { game_plan: plan, ..Tuning::default() }; }
             if dirty { ui.label(RichText::new("Unsaved changes").color(WARN)); }
         });
+    }
+
+    /// Your recurring jobs, run by snifrig instead of Windows Task Scheduler.
+    fn jobs_page(&mut self, ui: &mut egui::Ui) {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<(Option<Instant>, Vec<data::JobRow>, Vec<String>)>> = OnceLock::new();
+        let c = CACHE.get_or_init(|| Mutex::new((None, Vec::new(), Vec::new())));
+        let (rows, errs) = {
+            let mut g = c.lock().unwrap();
+            if g.0.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) { let (r, e) = data::load_jobs(&self.dir); *g = (Some(Instant::now()), r, e); }
+            (g.1.clone(), g.2.clone())
+        };
+        ui.ctx().request_repaint_after(Duration::from_secs(2));
+        ui.heading("Jobs");
+        ui.label(RichText::new("Your scheduled jobs, run by snifrig: never a window, never two copies at once, and at a good moment for the PC. Jobs that can wait hold off while you are in a game, or until you step away.").color(MUTED));
+        ui.add_space(8.0);
+        for e in &errs { ui.label(RichText::new(format!("Problem in jobs.txt: {}", e)).color(BAD)); }
+        if rows.is_empty() {
+            card(ui, |ui| {
+                section(ui, "Move your scheduled tasks into snifrig", "snifrig copies your script tasks (PowerShell, Python, batch, WSL and the like), backs each one up, and turns the Windows copy off. Apps' own updaters stay in Windows. You can put everything back with one click.");
+                if ui.add(egui::Button::new(RichText::new("Move my scheduled tasks into snifrig").color(Color32::BLACK)).fill(ACCENT)).clicked() {
+                    self.run("snifrig-fix.exe", vec!["jobs".into(), "import".into()], "Moved. If some tasks belong to an administrator, Windows asks you to confirm.");
+                }
+            });
+            return;
+        }
+        for r in &rows {
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(bold(&r.name, 15.0).color(TEXT));
+                    let (txt, col) = if !r.enabled { ("paused".to_string(), MUTED) }
+                        else if r.running_since > 0.0 { (format!("running for {}", fmt_ago(data::now() - r.running_since)), GOOD) }
+                        else if !r.waiting.is_empty() { (r.waiting.clone(), ACCENT) }
+                        else if r.runs > 0 && r.last_exit != 0 { ("last run failed".to_string(), BAD) }
+                        else { ("ok".to_string(), BLUE) };
+                    chip(ui, &txt, col);
+                });
+                let mut line = format!("{}  ·  runs {}", r.schedule, r.when);
+                if r.last_start > 0.0 { line.push_str(&format!("  ·  last {} ({})", local_time(r.last_start, true), fmt_ago(r.last_secs))); }
+                if r.next > 0.0 && r.running_since == 0.0 { line.push_str(&format!("  ·  next {}", local_time(r.next, true))); }
+                if r.fails > 0 { line.push_str(&format!("  ·  {} failed of {}", r.fails, r.runs)); }
+                ui.label(RichText::new(line).size(12.5).color(MUTED));
+                ui.horizontal(|ui| {
+                    if ui.button("Run now").clicked() { self.run("snifrig-fix.exe", vec!["jobs".into(), "run".into(), r.name.clone()], &format!("{} started.", r.name)); }
+                    let (op, done) = if r.enabled { ("pause", "Paused.") } else { ("resume", "Resumed.") };
+                    if ui.button(if r.enabled { "Pause" } else { "Resume" }).clicked() { self.run("snifrig-fix.exe", vec!["jobs".into(), op.into(), r.name.clone()], done); }
+                    ui.label(RichText::new("Runs:").color(MUTED));
+                    for (w, label) in [("anytime", "Anytime"), ("not-gaming", "Not while gaming"), ("idle", "When I'm away")] {
+                        let sel = r.when.replace(' ', "-") == w;
+                        if ui.selectable_label(sel, label).clicked() && !sel { self.run("snifrig-fix.exe", vec!["jobs".into(), "when".into(), r.name.clone(), w.into()], "Saved."); }
+                    }
+                });
+            });
+            ui.add_space(6.0);
+        }
+        ui.add_space(8.0);
+        if rows.iter().any(|r| !r.from_task.is_empty()) && ui.button("Put the moved jobs back in Windows Task Scheduler").on_hover_text("Turns the Windows copies back on and removes them here.").clicked() {
+            self.run("snifrig-fix.exe", vec!["jobs".into(), "undo-import".into()], "They are back in Windows Task Scheduler.");
+        }
     }
 
     fn rules_page(&mut self, ui: &mut egui::Ui, live: &sys::Live) {
@@ -1412,6 +1478,7 @@ impl eframe::App for App {
                     Page::Overview => self.overview(ui, &live),
                     Page::Governor => self.governor(ui, &live),
                     Page::Rules => self.rules_page(ui, &live),
+                Page::Jobs => self.jobs_page(ui),
                     Page::Performance => self.performance(ui),
                     Page::Activity => self.activity(ui),
                     Page::Report => self.report(ui),

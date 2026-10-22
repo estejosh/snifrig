@@ -122,6 +122,24 @@ pub fn local_offset_secs() -> i64 {
 #[link(name = "shell32", kind = "raw-dylib")]
 extern "system" { fn SHQueryUserNotificationState(state: *mut i32) -> i32; }
 
+#[link(name = "user32", kind = "raw-dylib")]
+extern "system" { fn GetLastInputInfo(lii: *mut [u32; 2]) -> i32; }
+#[link(name = "kernel32", kind = "raw-dylib")]
+extern "system" { fn GetTickCount64() -> u64; }
+
+/// Seconds since your last mouse or key input.
+pub fn idle_secs() -> f64 {
+    let mut lii = [8u32, 0u32];
+    unsafe {
+        if GetLastInputInfo(&mut lii) == 0 { return 0.0; }
+        let now = (GetTickCount64() & 0xFFFF_FFFF) as u32;
+        now.wrapping_sub(lii[1]) as f64 / 1000.0
+    }
+}
+
+/// When Windows started (unix seconds).
+pub fn boot_unix() -> f64 { crate::now_unix() - unsafe { GetTickCount64() } as f64 / 1000.0 }
+
 /// True while a Direct3D app runs exclusive full screen (QUNS_RUNNING_D3D_FULL_SCREEN).
 pub fn fullscreen_d3d() -> bool {
     let mut st = 0i32;

@@ -26,6 +26,7 @@ pub mod inuse;
 pub mod judge;
 pub mod feel;
 pub mod incident;
+pub mod sched;
 
 /// What the fixer can do, mildest first.
 #[derive(Clone, Debug, PartialEq)]

@@ -407,6 +407,129 @@ fn unkeep_cmd(dir: &Path, name: &str) -> Result<String, String> {
     Ok(format!("{} is no longer on the keep-fast list.", n))
 }
 
+// ---- Jobs: your scheduled tasks, run by snifrig (see sched.rs) ----
+
+const JOBS_IMPORT_PS1: &str = include_str!("jobs-import.ps1");
+const JOBS_TOGGLE_PS1: &str = include_str!("jobs-toggle.ps1");
+
+/// Run one of snifrig's PowerShell helpers with no window; output comes back as text.
+fn run_ps(dir: &Path, file: &str, body: &str, args: &[String]) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    let p = dir.join(file);
+    std::fs::write(&p, body).map_err(|e| e.to_string())?;
+    let o = std::process::Command::new("powershell.exe").args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&p).args(args)
+        .creation_flags(0x0800_0000).output().map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+/// Turn Windows tasks off or on (listed in `list`, one per line) as administrator: Windows
+/// shows its own confirmation first.
+fn toggle_elevated(dir: &Path, mode: &str, list: &Path) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    let script = dir.join("jobs-toggle.ps1");
+    std::fs::write(&script, JOBS_TOGGLE_PS1).map_err(|e| e.to_string())?;
+    let out = dir.join("jobs-toggle.out");
+    let _ = std::fs::remove_file(&out);
+    let wrapper = dir.join("jobs-toggle-elevated.ps1");
+    std::fs::write(&wrapper, format!("& '{}' -Mode '{}' -ListFile '{}' *> '{}'\r\n", script.display(), mode, list.display(), out.display())).map_err(|e| e.to_string())?;
+    let st = std::process::Command::new("powershell.exe").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command"])
+        .arg(format!("Start-Process powershell.exe -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'", wrapper.display()))
+        .creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
+    if !st.success() { return Err("the Windows confirmation was cancelled".into()); }
+    Ok(std::fs::read_to_string(&out).unwrap_or_default())
+}
+
+/// `jobs import`: move your script-type scheduled tasks into snifrig (Windows copies backed up
+/// and turned off; undo puts them back).
+fn import_jobs(dir: &Path) -> Result<String, String> {
+    use snifrig_fix::sched;
+    let report = run_ps(dir, "jobs-import.ps1", JOBS_IMPORT_PS1, &["-Dir".into(), dir.display().to_string()])?;
+    let (new, errs) = sched::parse(&std::fs::read_to_string(dir.join("jobs-import.txt")).unwrap_or_default());
+    let (mut jobs, _) = sched::load(dir);
+    let mut added = 0;
+    for j in new { if !jobs.iter().any(|x| x.name.eq_ignore_ascii_case(&j.name)) { jobs.push(j); added += 1; } }
+    sched::save(dir, &jobs);
+    let mut msg = report.trim().to_string();
+    for e in errs { msg.push_str(&format!("\nproblem: {}", e)); }
+    let denied = dir.join("jobs-import-denied.txt");
+    if !std::fs::read_to_string(&denied).unwrap_or_default().trim().is_empty() {
+        msg.push_str("\nSome tasks belong to an administrator; turning their Windows copies off (Windows asks you first):\n");
+        msg.push_str(&toggle_elevated(dir, "disable", &denied).unwrap_or_else(|e| format!("not turned off: {}. They still run from Windows too; snifrig will not start a second copy.", e)));
+    }
+    msg.push_str(&format!("\n{} job{} now run under snifrig. To put them back in Windows: snifrig-fix jobs undo-import", added, if added == 1 { "" } else { "s" }));
+    Ok(msg)
+}
+
+/// `jobs undo-import`: turn the Windows copies back on and remove the imported jobs.
+fn undo_import(dir: &Path) -> Result<String, String> {
+    use snifrig_fix::sched;
+    let (jobs, _) = sched::load(dir);
+    let tasks: Vec<String> = jobs.iter().filter(|j| !j.from_task.is_empty()).map(|j| j.from_task.clone()).collect();
+    if tasks.is_empty() { return Ok("no imported jobs to put back".into()); }
+    let list = dir.join("jobs-undo.txt");
+    std::fs::write(&list, tasks.join("\r\n")).map_err(|e| e.to_string())?;
+    let mut out = run_ps(dir, "jobs-toggle.ps1", JOBS_TOGGLE_PS1, &["-Mode".into(), "enable".into(), "-ListFile".into(), list.display().to_string()])?;
+    let failed: Vec<String> = out.lines().filter_map(|l| l.strip_prefix("failed: ")).map(|l| l.split(" (").next().unwrap_or(l).to_string()).collect();
+    if !failed.is_empty() {
+        let f = dir.join("jobs-undo-elevated.txt");
+        std::fs::write(&f, failed.join("\r\n")).map_err(|e| e.to_string())?;
+        out.push_str(&toggle_elevated(dir, "enable", &f).unwrap_or_else(|e| format!("not turned back on: {}", e)));
+    }
+    let keep: Vec<sched::Job> = jobs.into_iter().filter(|j| j.from_task.is_empty()).collect();
+    sched::save(dir, &keep);
+    Ok(format!("{}\nThe imported jobs are back in Windows Task Scheduler.", out.trim()))
+}
+
+fn jobs_cmd(dir: &Path, a: &[&str]) -> Result<String, String> {
+    use snifrig_fix::sched;
+    let find = |jobs: &[sched::Job], n: &str| jobs.iter().position(|j| j.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no job named '{}' (see: snifrig-fix jobs)", n));
+    match a {
+        [] | ["list"] => {
+            let (jobs, errs) = sched::load(dir);
+            let status = std::fs::read_to_string(dir.join(sched::STATUS_FILE)).unwrap_or_default();
+            let mut out = String::new();
+            for j in &jobs {
+                let w = status.split(&format!("\"name\":\"{}\"", snifrig_fix::json::esc(&j.name))).nth(1)
+                    .and_then(|s| s.split("\"waiting\":\"").nth(1)).and_then(|s| s.split('"').next()).unwrap_or("");
+                out.push_str(&format!("{}{} | {} | {}{}\n", j.name, if j.enabled { "" } else { " (paused)" }, sched::sched_text(&j.sched), sched::when_text(&j.when), if w.is_empty() { String::new() } else { format!(" | {}", w) }));
+            }
+            for e in errs { out.push_str(&format!("problem: {}\n", e)); }
+            if jobs.is_empty() { out.push_str("no jobs yet. snifrig-fix jobs import moves your scheduled tasks into snifrig.\n"); }
+            Ok(out.trim_end().to_string())
+        }
+        ["run", n] => {
+            let _ = std::fs::remove_file(dir.join("job-run-result.txt"));
+            std::fs::write(dir.join("job-run"), n).map_err(|e| e.to_string())?;
+            for _ in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if let Ok(r) = std::fs::read_to_string(dir.join("job-run-result.txt")) { return Ok(r); }
+            }
+            Ok("asked; the fixer starts it within a few seconds".into())
+        }
+        [op @ ("pause" | "resume"), n] => {
+            let (mut jobs, _) = sched::load(dir);
+            let i = find(&jobs, n)?;
+            jobs[i].enabled = *op == "resume";
+            sched::save(dir, &jobs);
+            Ok(format!("{} {}", jobs[i].name, if *op == "resume" { "resumed" } else { "paused" }))
+        }
+        ["when", n, w] => {
+            let (mut jobs, _) = sched::load(dir);
+            let i = find(&jobs, n)?;
+            jobs[i].when = match *w { "anytime" => sched::When::Anytime, "not-gaming" | "not gaming" => sched::When::NotGaming, "idle" => sched::When::Idle, _ => return Err("when is anytime, not-gaming or idle".into()) };
+            sched::save(dir, &jobs);
+            Ok(format!("{} now runs: {}", jobs[i].name, sched::when_text(&jobs[i].when)))
+        }
+        ["import"] => import_jobs(dir),
+        ["preview"] => {
+            let r = run_ps(dir, "jobs-import.ps1", JOBS_IMPORT_PS1, &["-Dir".into(), dir.display().to_string(), "-Preview".into()])?;
+            Ok(format!("{}\n--- the jobs it would add (nothing was changed) ---{}", r.trim(), std::fs::read_to_string(dir.join("jobs-import-preview.txt")).unwrap_or_default()))
+        }
+        ["undo-import"] => undo_import(dir),
+        _ => Err("jobs [list] | run NAME | pause NAME | resume NAME | when NAME anytime|not-gaming|idle | import | undo-import".into()),
+    }
+}
+
 fn dismiss(dir: &Path, id: &str) -> Result<String, String> {
     let mut items = ledger::load_pending(dir);
     let i = items.iter().position(|x| x.id == id).ok_or("no pending fix with that id")?;
@@ -890,6 +1013,10 @@ fn watch(dir: &Path) {
     enf.reapply_secs = t0.reapply_secs;
     let mut tune_mt = tuning_mt(dir);
     let mut dwm_hot = 0.0f64;
+    // Your recurring jobs, run by snifrig: no windows, no pileups, at a good moment for the PC.
+    let mut jobs = snifrig_fix::sched::Scheduler::new(dir);
+    let boot = sys::boot_unix();
+    let offset = sys::local_offset_secs();
     for m in snifrig_fix::governor::recover(&dir.join("demoted.txt")) { note(dir, "gov:recover", "done", &m); }
     let mut slow_apps = snifrig_fix::slowapp::Tracker::default();
     let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
@@ -1036,6 +1163,15 @@ fn watch(dir: &Path) {
         }
         handle_undo(dir, &mut gov, act);
         if dir.join("quick-fix").exists() { let _ = std::fs::remove_file(dir.join("quick-fix")); run_quick(dir, &mut gov, act); }
+        if let Ok(name) = std::fs::read_to_string(dir.join("job-run")) {
+            let _ = std::fs::remove_file(dir.join("job-run"));
+            let r = jobs.run_now(name.trim(), now_unix());
+            let _ = std::fs::write(dir.join("job-run-result.txt"), r.unwrap_or_else(|e| e));
+        }
+        if n % 5 == 2 {
+            let ctx = snifrig_fix::sched::Ctx { now: now_unix(), boot, gaming: gov.game.is_some() || sys::fullscreen_d3d(), cpu_pct: gov.total_pct, idle_secs: sys::idle_secs(), local_offset: offset };
+            for m in jobs.tick(&ctx) { note(dir, "jobs", "failed", &m); }
+        }
         if let Ok(name) = std::fs::read_to_string(dir.join("app-slow")) {
             let _ = std::fs::remove_file(dir.join("app-slow"));
             let name = name.trim().to_string();
@@ -1246,6 +1382,7 @@ fn main() {
         ["approve", id] => out(approve(&dir, id)),
         ["dismiss", id] => out(dismiss(&dir, id)),
         ["keep", name] => out(keep_cmd(&dir, name)),
+        ["jobs", rest @ ..] => out(jobs_cmd(&dir, rest)),
         ["heavy", kind, yn @ ("yes" | "no"), app] => out(heavy_cmd(&dir, kind, *yn == "yes", app)),
         ["unkeep", name] => out(unkeep_cmd(&dir, name)),
         ["license", "install", path] => out(license::install(&dir, Path::new(path))),

@@ -53,6 +53,25 @@ pub fn load_suggestions(dir: &Path) -> Vec<Suggestion> {
     }).collect()
 }
 
+/// One job as the fixer's scheduler reports it (jobs-status.json).
+#[derive(Clone, Debug, Default)]
+pub struct JobRow {
+    pub name: String, pub run: String, pub schedule: String, pub when: String, pub enabled: bool,
+    pub running_since: f64, pub last_start: f64, pub last_secs: f64, pub last_exit: i64,
+    pub runs: u32, pub fails: u32, pub next: f64, pub waiting: String, pub from_task: String,
+}
+
+pub fn load_jobs(dir: &Path) -> (Vec<JobRow>, Vec<String>) {
+    let j = read_json(dir, "jobs-status.json");
+    let rows = j.get("jobs").arr().iter().map(|x| JobRow {
+        name: x.get("name").str().into(), run: x.get("run").str().into(), schedule: x.get("schedule").str().into(), when: x.get("when").str().into(),
+        enabled: x.get("enabled").bool(), running_since: x.get("running_since").num(), last_start: x.get("last_start").num(), last_secs: x.get("last_secs").num(),
+        last_exit: x.get("last_exit").num() as i64, runs: x.get("runs").num() as u32, fails: x.get("fails").num() as u32, next: x.get("next").num(),
+        waiting: x.get("waiting").str().into(), from_task: x.get("from_task").str().into(),
+    }).collect();
+    (rows, j.get("errors").arr().iter().map(|e| e.str().to_string()).collect())
+}
+
 fn esc(s: &str) -> String {
     let mut o = String::new();
     for c in s.chars() { match c { '"' => o.push_str("\\\""), '\\' => o.push_str("\\\\"), c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)), c => o.push(c) } }
