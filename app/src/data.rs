@@ -41,6 +41,7 @@ impl Suggestion {
             "restart_desktop" => "Restart the desktop (dwm is stuck)".into(),
             "shutdown_wsl" => "WSL is using a lot of your CPU".into(),
             "minimize_game" => format!("{} is hidden but still drawing", self.app),
+            "impact_ask" => "Can I run a small test?".into(),
             "popup_guard" => format!("{} takes the screen from you", self.app.trim_start_matches('\\')),
             "jobs_handback" => "Windows needs your OK to run your jobs again".into(),
             "take_over_task" => "Windows needs your OK to hand jobs to snifrig".into(),
@@ -56,20 +57,21 @@ pub fn load_suggestions(dir: &Path) -> Vec<Suggestion> {
     }).collect()
 }
 
-/// What snifrig measured it does for this PC (impact-summary.json and every test in impact.jsonl).
+/// What snifrig measured it does for this PC's overall performance (impact-summary.json).
 #[derive(Clone, Debug, Default)]
-pub struct Impact { pub tests: u32, pub valid: u32, pub slower: f64, pub faster: f64, pub low: f64, pub high: f64, pub text: String, pub rows: Vec<ImpactRow> }
+pub struct Impact { pub ready: bool, pub faster: f64, pub on_slow: f64, pub off_slow: f64, pub on_ms: f64, pub off_ms: f64, pub hours: f64, pub off_minutes: f64, pub text: String, pub days: Vec<ImpactDay> }
 #[derive(Clone, Debug, Default)]
-pub struct ImpactRow { pub start: f64, pub off_ms: f64, pub on_ms: f64, pub off_cpu: f64, pub on_cpu: f64, pub valid: bool }
+pub struct ImpactDay { pub day: i64, pub on_ms: f64, pub on_slow: f64, pub on_min: f64, pub off_ms: f64, pub off_slow: f64, pub off_min: f64 }
 
 pub fn load_impact(dir: &Path) -> Impact {
     let s = read_json(dir, "impact-summary.json");
-    let mut rows: Vec<ImpactRow> = read(dir, "impact.jsonl").lines().filter_map(|l| json::parse(l)).map(|j| ImpactRow {
-        start: j.get("start").num(), off_ms: j.get("off_ms").num(), on_ms: j.get("on_ms").num(), off_cpu: j.get("off_cpu").num(), on_cpu: j.get("on_cpu").num(), valid: j.get("valid").bool(),
+    let mut days: Vec<ImpactDay> = s.get("days").arr().iter().map(|j| ImpactDay {
+        day: j.get("day").num() as i64, on_ms: j.get("on_ms").num(), on_slow: j.get("on_slow").num(), on_min: j.get("on_min").num(),
+        off_ms: j.get("off_ms").num(), off_slow: j.get("off_slow").num(), off_min: j.get("off_min").num(),
     }).collect();
-    rows.reverse();
-    Impact { tests: s.get("tests").num() as u32, valid: s.get("valid").num() as u32, slower: s.get("slower_pct").num(), faster: s.get("faster_pct").num(),
-        low: s.get("low").num(), high: s.get("high").num(), text: s.get("text").str().to_string(), rows }
+    days.reverse();
+    Impact { ready: s.get("ready").bool(), faster: s.get("faster_pct").num(), on_slow: s.get("on_slow").num(), off_slow: s.get("off_slow").num(),
+        on_ms: s.get("on_ms").num(), off_ms: s.get("off_ms").num(), hours: s.get("hours").num(), off_minutes: s.get("off_minutes").num(), text: s.get("text").str().to_string(), days }
 }
 
 /// A measured result from other PCs, shipped with snifrig (impact-estimate.json): faster %, PCs.

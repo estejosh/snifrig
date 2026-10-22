@@ -570,7 +570,7 @@ impl App {
 
     fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
         card(ui, |ui| {
-            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task");
+            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask");
             ui.horizontal(|ui| { chip(ui, if ours { "snifrig noticed" } else { "suggested by your AI assistant" }, BLUE); });
             ui.label(bold(s.summary(), 15.0).color(TEXT));
             ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
@@ -581,6 +581,10 @@ impl App {
                         self.dismiss_suggestion(s);
                     }
                     if ui.button("No").clicked() { self.run("snifrig-fix.exe", vec!["desktop".into(), "no".into()], "Ok, snifrig will not ask about this for a week."); self.dismiss_suggestion(s); }
+                } else if s.kind == "impact_ask" {
+                    if ui.add(egui::Button::new(RichText::new("Yes, run it").color(Color32::BLACK)).fill(ACCENT)).clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "answer".into(), "yes".into()], "Thanks. Measuring for 2 minutes."); self.dismiss_suggestion(s); }
+                    if ui.button("Yes, and it feels slow now").clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "answer".into(), "slow".into()], "Thanks. Measuring, then snifrig works on the slowdown."); self.dismiss_suggestion(s); }
+                    if ui.button("Not now").clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "answer".into(), "no".into()], "Ok, not now."); self.dismiss_suggestion(s); }
                 } else if s.kind == "popup_guard" {
                     if ui.add(egui::Button::new(RichText::new("Yes, make it stop").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("A scheduled task becomes a snifrig job with no window; an app is put back behind what you were doing whenever it grabs the screen.").clicked() {
                         self.run("snifrig-fix.exe", vec!["popup".into(), "yes".into(), s.app.clone()], "Done. It will not take the screen from you again.");
@@ -745,20 +749,21 @@ impl App {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     chip(ui, "measured on this PC", GOOD);
-                    if m.valid >= 3 && m.low > 0.0 { ui.label(bold(format!("{:.0}% faster when your PC is busy", m.faster), 18.0).color(TEXT)); }
+                    if m.ready && m.faster >= 2.0 { ui.label(bold(format!("{:.0}% faster overall, over the last 7 days", m.faster), 18.0).color(TEXT)); }
                 });
-                ui.label(RichText::new(if m.text.is_empty() { "Measuring: 0 of 3 tests done. snifrig tests only while your PC is busy, a few minutes at a time." } else { m.text.as_str() }).color(MUTED));
-                egui::CollapsingHeader::new("How this is measured, and every test").id_salt("impact-how").show(ui, |ui| {
-                    ui.label(RichText::new("While your PC is busy, snifrig runs a short test: 3 minutes where it holds off and 3 where it works, in alternating order, measuring how fast your apps and your mouse respond in each. A test counts only if the load was about the same in both halves. Never during a game, never while you ask for help, at most 4 a day. It is conservative: app rules stay in place while snifrig holds off.").size(12.5).color(MUTED));
+                ui.label(RichText::new(if m.text.is_empty() { "Measuring: snifrig measures your whole day and holds off at random moments, 2 minutes at a time, to compare." } else { m.text.as_str() }).color(MUTED));
+                egui::CollapsingHeader::new("How this is measured, day by day").id_salt("impact-how").show(ui, |ui| {
+                    ui.label(RichText::new("snifrig measures how fast your PC responds all day (windows, messages, your mouse and keys), every 5 seconds. At random moments, about 4% of the time, it holds off for 2 minutes and compares. When you are at the PC it asks you first; when you have stepped away it just measures. Never while a full-screen game or video is in front, never while you ask for help. Because tests lean towards calmer moments and app rules stay in place, the number can only come out lower than the real effect, never higher.").size(12.5).color(MUTED));
                     ui.add_space(4.0);
-                    for r in m.rows.iter().take(8) {
-                        ui.label(RichText::new(format!("{}   without snifrig {:.0} ms   with it {:.0} ms   CPU {:.0}% / {:.0}%{}", local_time(r.start, true), r.off_ms, r.on_ms, r.off_cpu, r.on_cpu, if r.valid { "" } else { "   (not counted: load changed)" })).size(12.0).color(if r.valid { TEXT } else { MUTED }));
+                    for d in m.days.iter() {
+                        ui.label(RichText::new(format!("{}   with snifrig {:.0} ms, sluggish {:.0}% ({:.0} min)   holding off {:.0} ms, sluggish {:.0}% ({:.0} min)",
+                            local_time(d.day as f64 * 86400.0 - sys::local_offset_secs() as f64 + 43200.0, true).split(' ').next().unwrap_or(""), d.on_ms, d.on_slow, d.on_min, d.off_ms, d.off_slow, d.off_min)).size(12.0).color(TEXT));
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Run a test now").on_hover_text("Starts when the PC is busy enough to measure.").clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "test".into()], "A test starts in a few seconds if the PC is busy."); }
-                        if ui.button("Open the test log").clicked() { let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", self.dir.join("impact.jsonl").display())).spawn(); }
+                        if ui.button("Measure now").on_hover_text("snifrig holds off for 2 minutes now, to compare.").clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "test".into()], "snifrig holds off for 2 minutes to compare."); }
+                        if ui.button("Open the measurements").clicked() { let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", self.dir.join("impact-days.txt").display())).spawn(); }
                         let off = self.dir.join("impact-off").exists();
-                        if ui.button(if off { "Turn tests on" } else { "Turn tests off" }).clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), if off { "on" } else { "off" }.into()], if off { "Tests are on." } else { "Tests are off." }); }
+                        if ui.button(if off { "Turn measuring on" } else { "Turn measuring off" }).clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), if off { "on" } else { "off" }.into()], if off { "Measuring is on." } else { "Measuring is off." }); }
                     });
                 });
             });
@@ -766,8 +771,8 @@ impl App {
             card(ui, |ui| {
                 ui.horizontal(|ui| { chip(ui, "snifrig fix", ACCENT); });
                 match data::load_estimate(&self.dir) {
-                    Some((f, n)) => { ui.label(bold(format!("About {:.0}% faster when your PC is busy", f), 18.0).color(TEXT)); ui.label(RichText::new(format!("That is what snifrig fix measured on {} PC{} like yours. With it, snifrig measures it on this PC too, with real tests you can check.", n, if n == 1 { "" } else { "s" })).color(MUTED)); }
-                    None => { ui.label(RichText::new("How much faster would snifrig fix make this PC? It measures it for real, on your PC, with short tests while it is busy, and shows you every test.").color(MUTED)); }
+                    Some((f, n)) => { ui.label(bold(format!("About {:.0}% faster overall", f), 18.0).color(TEXT)); ui.label(RichText::new(format!("That is what snifrig fix measured on {} PC{} like yours. With it, snifrig measures it on this PC too, with real tests you can check.", n, if n == 1 { "" } else { "s" })).color(MUTED)); }
+                    None => { ui.label(RichText::new("How much faster would snifrig fix make this PC? It measures it for real, over your whole day on your PC, and shows you the numbers day by day.").color(MUTED)); }
                 }
                 if ui.button("Get snifrig fix").clicked() { self.page = Page::Settings; self.refresh_license(); }
             });

@@ -1,223 +1,315 @@
-//! Measured impact: "without snifrig, your apps would respond X% slower when the PC is busy",
-//! measured on this PC, not guessed.
+//! Measured impact on overall system performance: "over the last 7 days, your PC responded X%
+//! faster with snifrig", measured on this PC over everything you did, not one moment.
 //!
-//! How: while the PC is busy (and you are not in a game, not asking for help, not in a quick
-//! fix), snifrig runs a short test: two 3-minute blocks back to back, one where it holds off
-//! (nothing eased, no new rules applied) and one where it works as usual, in alternating order.
-//! In both it measures how fast the PC responds (the same feel meter snifrig always uses:
-//! window response, message lag, your own input). A test counts only if the load was similar
-//! in both blocks. At most one test every 3 hours, 4 a day; you can turn tests off.
-//! Every test is kept in impact.jsonl, so the number can be checked line by line.
-//! The comparison is conservative: rules already applied stay in place during the off block.
+//! How: snifrig measures how fast the PC responds all day (the feel meter: window response,
+//! message lag, your own input, sampled every 5 seconds). At random moments, about 4% of the
+//! time, it holds off for 2 minutes (nothing eased, no new rules applied). Because those moments
+//! are picked at random, they see the same mix of your real use as the rest of the day, so
+//! "responsiveness while holding off" vs "the rest of the time" is a fair, whole-system
+//! comparison. Never while a full-screen app (a game, a video) is in front, never while you ask
+//! for help. Every holdout and every day's totals are kept, so the number can be checked.
+//! It asks first: when you are at the PC, a card asks "can we run a small test?" (at most once
+//! every 2 hours); no answer in a minute means it runs only if you have stepped away. When you
+//! have been away for 5 minutes it just measures, since nobody is disturbed. Holdouts therefore
+//! lean towards calmer moments, which can only make the number lower, never higher.
+//! Conservative: rules already applied stay in place while snifrig holds off.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const BLOCK_SECS: f64 = 180.0;
-pub const MIN_GAP_SECS: f64 = 3.0 * 3600.0;
-pub const MAX_PER_DAY: usize = 4;
-pub const BUSY_PCT: f64 = 60.0;
-pub const MAX_CPU_DIFF: f64 = 15.0;
-pub const MIN_SAMPLES: usize = 20;
-pub const LOG: &str = "impact.jsonl";
+pub const HOLD_SECS: f64 = 120.0;
+/// Chance per 2-minute slot that it becomes a holdout (about 4% of the time).
+pub const HOLD_CHANCE: f64 = 0.04;
+pub const MAX_HOLDS_PER_DAY: usize = 48;
+pub const DAYS: i64 = 7;
+pub const MIN_OFF_SAMPLES: u64 = 240; // 20 minutes of holdouts
+pub const MIN_ON_SAMPLES: u64 = 2000;
+pub const HOLDS_LOG: &str = "impact-holdouts.jsonl";
+pub const DAYS_FILE: &str = "impact-days.txt";
 pub const SUMMARY: &str = "impact-summary.json";
 pub const OFF_FILE: &str = "impact-off";
 pub const NOW_FILE: &str = "impact-test-now";
+pub const ANSWER_FILE: &str = "impact-answer";
+pub const AWAY_SECS: f64 = 300.0;
+pub const ASK_GAP_SECS: f64 = 7200.0;
+pub const ASK_TIMEOUT_SECS: f64 = 60.0;
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Block { pub ms: f64, pub p90: f64, pub cpu: f64, pub n: usize }
+/// One day's totals for one mode: samples, sum of response ms, samples that felt sluggish.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tally { pub n: u64, pub sum: f64, pub slow: u64 }
 
-fn block(ms: &[f64], cpu: &[f64]) -> Block {
-    let mut v = ms.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let q = |p: f64| if v.is_empty() { 0.0 } else { v[((v.len() - 1) as f64 * p).round() as usize] };
-    Block { ms: q(0.5), p90: q(0.9), cpu: if cpu.is_empty() { 0.0 } else { cpu.iter().sum::<f64>() / cpu.len() as f64 }, n: v.len() }
+impl Tally {
+    pub fn add(&mut self, ms: f64, slow: bool) { self.n += 1; self.sum += ms; if slow { self.slow += 1; } }
+    pub fn mean(&self) -> f64 { if self.n == 0 { 0.0 } else { self.sum / self.n as f64 } }
+    pub fn slow_pct(&self) -> f64 { if self.n == 0 { 0.0 } else { self.slow as f64 * 100.0 / self.n as f64 } }
+    fn plus(self, o: Tally) -> Tally { Tally { n: self.n + o.n, sum: self.sum + o.sum, slow: self.slow + o.slow } }
 }
 
-/// Pure: is this pair of blocks a fair comparison?
-pub fn valid(off: &Block, on: &Block) -> bool {
-    off.n >= MIN_SAMPLES && on.n >= MIN_SAMPLES && (off.cpu - on.cpu).abs() <= MAX_CPU_DIFF && on.ms > 0.0
+/// Per local day: (with snifrig, snifrig holding off).
+pub type Days = BTreeMap<i64, (Tally, Tally)>;
+
+pub fn parse_days(text: &str) -> Days {
+    let mut d = Days::new();
+    for l in text.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 7 { continue; }
+        let u = |i: usize| f[i].parse::<u64>().unwrap_or(0);
+        let x = |i: usize| f[i].parse::<f64>().unwrap_or(0.0);
+        if let Ok(day) = f[0].parse::<i64>() { d.insert(day, (Tally { n: u(1), sum: x(2), slow: u(3) }, Tally { n: u(4), sum: x(5), slow: u(6) })); }
+    }
+    d
+}
+
+pub fn write_days(d: &Days) -> String {
+    d.iter().map(|(k, (a, b))| format!("{} {} {:.1} {} {} {:.1} {}\n", k, a.n, a.sum, a.slow, b.n, b.sum, b.slow)).collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Summary { pub tests: usize, pub valid: usize, pub slower_pct: f64, pub low: f64, pub high: f64, pub faster_pct: f64 }
+pub struct Summary {
+    pub on: Tally, pub off: Tally, pub ready: bool,
+    /// How much slower the PC responds without snifrig, and how much faster with it (%).
+    pub slower_pct: f64, pub faster_pct: f64,
+    /// Lowest and highest day (days with enough holdout data).
+    pub low: f64, pub high: f64, pub days: usize,
+}
 
-/// Pure: from (off ms, on ms) of the valid tests: the median "slower without snifrig" and the
-/// middle 60% range (20th to 80th percentile of the tests).
-pub fn summarize(pairs: &[(f64, f64)], tests: usize) -> Summary {
-    let mut r: Vec<f64> = pairs.iter().filter(|(_, on)| *on > 0.0).map(|(off, on)| (off / on - 1.0) * 100.0).collect();
-    r.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let q = |p: f64| if r.is_empty() { 0.0 } else { r[((r.len() - 1) as f64 * p).round() as usize] };
-    let slower = q(0.5);
-    Summary { tests, valid: r.len(), slower_pct: slower, low: q(0.2), high: q(0.8), faster_pct: if slower > -100.0 { slower / (100.0 + slower) * 100.0 } else { 0.0 } }
+/// Pure: the last DAYS days ending at `today`, pooled.
+pub fn summarize(d: &Days, today: i64) -> Summary {
+    let recent: Vec<&(Tally, Tally)> = d.range(today - DAYS + 1..=today).map(|(_, v)| v).collect();
+    let (on, off) = recent.iter().fold((Tally::default(), Tally::default()), |(a, b), (x, y)| (a.plus(*x), b.plus(*y)));
+    let ready = off.n >= MIN_OFF_SAMPLES && on.n >= MIN_ON_SAMPLES && on.mean() > 0.0;
+    let slower = if on.mean() > 0.0 { (off.mean() / on.mean() - 1.0) * 100.0 } else { 0.0 };
+    let mut per: Vec<f64> = recent.iter().filter(|(a, b)| b.n >= 60 && a.n >= 600 && a.mean() > 0.0).map(|(a, b)| (b.mean() / a.mean() - 1.0) * 100.0).collect();
+    per.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Summary { on, off, ready, slower_pct: slower, faster_pct: if off.mean() > 0.0 { (1.0 - on.mean() / off.mean()) * 100.0 } else { 0.0 },
+        low: per.first().copied().unwrap_or(slower), high: per.last().copied().unwrap_or(slower), days: recent.len() }
 }
 
 /// Pure: the sentence people see.
 pub fn sentence(s: &Summary) -> String {
-    if s.valid < 3 {
-        return format!("Measuring: {} of 3 tests done. snifrig tests only while your PC is busy, a few minutes at a time.", s.valid);
+    let mins = s.off.n as f64 * 5.0 / 60.0;
+    let hours = s.on.n as f64 * 5.0 / 3600.0;
+    if !s.ready {
+        return format!("Measuring: {:.0} of 20 minutes of comparison collected. snifrig measures your whole day and holds off at random moments, 2 minutes at a time, to compare.", mins.min(19.0));
     }
-    if s.low <= 0.0 {
-        return format!("No clear difference measured yet ({} tests). snifrig keeps testing while your PC is busy.", s.valid);
+    if s.faster_pct < 2.0 {
+        return format!("No clear difference measured over the last {} days ({:.0} hours measured).", s.days.min(DAYS as usize), hours);
     }
-    format!("Measured on this PC: when it is busy, your apps respond {:.0}% slower without snifrig ({} tests, usually {:.0}-{:.0}%).", s.slower_pct, s.valid, s.low, s.high)
+    format!("Over the last {} days your PC responded {:.0}% faster with snifrig. It felt sluggish {:.0}% of the time without snifrig and {:.0}% with it. Measured over {:.0} hours of your normal use, against {:.0} minutes where snifrig held off at random.",
+        s.days.min(DAYS as usize), s.faster_pct, s.off.slow_pct(), s.on.slow_pct(), hours, mins)
 }
 
-#[derive(Debug, Default)]
-enum Phase { #[default] Idle, First { off: bool, since: f64 }, Second { off: bool, since: f64 } }
+/// What the PC is doing, as the meter needs it.
+pub struct Now { pub now: f64, pub local_day: i64, pub sample: Option<(f64, bool)>, pub fullscreen: bool, pub user_wants_help: bool, pub idle_secs: f64 }
 
-/// What the PC is doing, as a test needs it.
-pub struct Now { pub now: f64, pub cpu: f64, pub feel_ms: Option<f64>, pub gaming: bool, pub user_wants_help: bool }
+/// What a tick asks the fixer to do.
+#[derive(Debug, Default, PartialEq)]
+pub struct Out {
+    pub note: Option<String>,
+    /// Some(true): show the "can we run a small test?" card; Some(false): take it away.
+    pub card: Option<bool>,
+    /// You said it feels slow right now.
+    pub felt_slow: bool,
+}
 
-#[derive(Default)]
 pub struct Impact {
-    phase: Phase,
-    ms: Vec<f64>,
-    cpu: Vec<f64>,
-    first: Option<(bool, Block)>,
-    started: f64,
-    last_test: f64,
-    today: Vec<f64>,
-    runs: u64,
+    days: Days,
+    hold_until: f64,
+    slot: i64,
+    holds_today: Vec<f64>,
+    rng: u64,
+    dirty_at: f64,
+    asking: Option<f64>,
+    last_ask: f64,
 }
 
 impl Impact {
     pub fn new(dir: &Path) -> Impact {
-        let mut i = Impact::default();
-        for l in std::fs::read_to_string(dir.join(LOG)).unwrap_or_default().lines() {
-            if let Some(t) = crate::json::num_field(l, "start") { i.last_test = i.last_test.max(t); i.today.push(t); i.runs += 1; }
-        }
-        i
+        let mut seed = [0u8; 8];
+        #[link(name = "advapi32", kind = "raw-dylib")]
+        extern "system" { #[link_name = "SystemFunction036"] fn RtlGenRandom(buf: *mut u8, len: u32) -> u8; }
+        unsafe { RtlGenRandom(seed.as_mut_ptr(), 8); }
+        let holds: Vec<f64> = std::fs::read_to_string(dir.join(HOLDS_LOG)).unwrap_or_default().lines().filter_map(|l| crate::json::num_field(l, "start")).collect();
+        Impact { days: parse_days(&std::fs::read_to_string(dir.join(DAYS_FILE)).unwrap_or_default()), hold_until: 0.0, slot: 0, holds_today: holds, rng: u64::from_le_bytes(seed) | 1, dirty_at: 0.0, asking: None, last_ask: 0.0 }
     }
 
-    /// True while snifrig should hold off (the "without snifrig" block of a test).
-    pub fn holding(&self) -> bool {
-        matches!(self.phase, Phase::First { off: true, .. } | Phase::Second { off: true, .. })
+    fn rand(&mut self) -> f64 { self.rng ^= self.rng << 13; self.rng ^= self.rng >> 7; self.rng ^= self.rng << 17; (self.rng >> 11) as f64 / (1u64 << 53) as f64 }
+
+    /// True while snifrig should hold off (a random holdout).
+    pub fn holding(&self, now: f64) -> bool { now < self.hold_until }
+
+    fn start(&mut self, dir: &Path, now: f64, why: &str, felt_slow: bool) -> String {
+        self.hold_until = now + HOLD_SECS;
+        self.holds_today.push(now);
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(HOLDS_LOG)) {
+            let _ = writeln!(f, "{{\"start\":{:.0},\"secs\":{:.0},\"why\":\"{}\",\"felt_slow\":{}}}", now, HOLD_SECS, why, felt_slow);
+        }
+        format!("measuring: snifrig holds off for 2 minutes to compare ({})", why)
     }
 
-    pub fn testing(&self) -> bool { !matches!(self.phase, Phase::Idle) }
-
-    /// Call once a second. Returns a note when a test starts, stops or finishes.
-    pub fn tick(&mut self, dir: &Path, n: &Now) -> Option<String> {
-        self.today.retain(|t| n.now - t < 86400.0);
-        let interrupted = n.gaming || n.user_wants_help;
-        match self.phase {
-            Phase::Idle => {
-                let asked = dir.join(NOW_FILE).exists();
-                if asked { let _ = std::fs::remove_file(dir.join(NOW_FILE)); }
-                let allowed = !dir.join(OFF_FILE).exists() && !interrupted;
-                let due = n.now - self.last_test >= MIN_GAP_SECS && self.today.len() < MAX_PER_DAY;
-                if allowed && n.cpu >= if asked { 40.0 } else { BUSY_PCT } && (due || asked) {
-                    // Alternate which block comes first, so load drifting one way does not favour either.
-                    let off = self.runs % 2 == 0;
-                    self.phase = Phase::First { off, since: n.now };
-                    self.started = n.now;
-                    self.ms.clear(); self.cpu.clear(); self.first = None;
-                    return Some("impact test started: 3 minutes with snifrig holding off and 3 with it working, to measure what it does for this PC".into());
+    /// Call once a second.
+    pub fn tick(&mut self, dir: &Path, n: &Now) -> Out {
+        let mut out = Out::default();
+        if n.now < self.hold_until && (n.fullscreen || n.user_wants_help) {
+            self.hold_until = 0.0; // you need the PC: stop holding off at once
+        }
+        // Waiting for your answer to "can we run a small test?"
+        if let Some(since) = self.asking {
+            let answer = std::fs::read_to_string(dir.join(ANSWER_FILE)).ok();
+            if answer.is_some() { let _ = std::fs::remove_file(dir.join(ANSWER_FILE)); }
+            let a = answer.as_deref().map(|s| s.trim().to_lowercase());
+            let timed_out = n.now - since >= ASK_TIMEOUT_SECS;
+            if a.is_some() || timed_out || n.fullscreen {
+                self.asking = None;
+                out.card = Some(false);
+                match a.as_deref() {
+                    Some("yes") => out.note = Some(self.start(dir, n.now, "you said yes", false)),
+                    Some("slow") => { out.felt_slow = true; out.note = Some(self.start(dir, n.now, "you said yes, it feels slow", true)); }
+                    Some(_) => out.note = Some("measuring: not now, you said no".into()),
+                    None if !n.fullscreen && n.idle_secs >= ASK_TIMEOUT_SECS => out.note = Some(self.start(dir, n.now, "no answer, you had stepped away", false)),
+                    None => out.note = Some("measuring: no answer and you were busy, so not now".into()),
                 }
-                if asked { return Some(format!("impact test not started: the PC is calm ({:.0}% CPU); snifrig tests while it is busy", n.cpu)); }
-                None
-            }
-            Phase::First { off, since } | Phase::Second { off, since } => {
-                if interrupted {
-                    self.phase = Phase::Idle;
-                    self.last_test = n.now - MIN_GAP_SECS + 1800.0; // try again in half an hour
-                    return Some("impact test stopped: you needed the PC".into());
-                }
-                if let Some(ms) = n.feel_ms { self.ms.push(ms); }
-                self.cpu.push(n.cpu);
-                if n.now - since < BLOCK_SECS { return None; }
-                let b = block(&self.ms, &self.cpu);
-                self.ms.clear(); self.cpu.clear();
-                if matches!(self.phase, Phase::First { .. }) {
-                    self.first = Some((off, b));
-                    self.phase = Phase::Second { off: !off, since: n.now };
-                    return None;
-                }
-                self.phase = Phase::Idle;
-                self.last_test = n.now;
-                self.today.push(self.started);
-                self.runs += 1;
-                let (first_off, fb) = self.first.take().unwrap_or((true, Block::default()));
-                let (offb, onb) = if first_off { (fb, b) } else { (b, fb) };
-                let ok = valid(&offb, &onb);
-                let line = format!("{{\"start\":{:.0},\"off_first\":{},\"off_ms\":{:.1},\"off_p90\":{:.1},\"off_cpu\":{:.1},\"off_n\":{},\"on_ms\":{:.1},\"on_p90\":{:.1},\"on_cpu\":{:.1},\"on_n\":{},\"valid\":{}}}",
-                    self.started, first_off, offb.ms, offb.p90, offb.cpu, offb.n, onb.ms, onb.p90, onb.cpu, onb.n, ok);
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(LOG)) { let _ = writeln!(f, "{}", line); }
-                write_summary(dir);
-                Some(if ok { format!("impact test done: {:.0} ms without snifrig, {:.0} ms with it (CPU {:.0}% and {:.0}%)", offb.ms, onb.ms, offb.cpu, onb.cpu) }
-                     else { format!("impact test not counted: the load changed too much between the blocks (CPU {:.0}% and {:.0}%)", offb.cpu, onb.cpu) })
             }
         }
+        // Every 2-minute slot gets one random draw (the same chance whatever the PC is doing).
+        let slot = (n.now / HOLD_SECS).floor() as i64;
+        let asked = dir.join(NOW_FILE).exists();
+        if asked { let _ = std::fs::remove_file(dir.join(NOW_FILE)); }
+        if (slot != self.slot || asked) && !self.holding(n.now) {
+            self.slot = slot;
+            self.holds_today.retain(|t| n.now - t < 86400.0);
+            let allowed = !dir.join(OFF_FILE).exists() && !n.fullscreen && !n.user_wants_help && self.holds_today.len() < MAX_HOLDS_PER_DAY;
+            let draw = self.rand();
+            if allowed && self.asking.is_none() && (asked || draw < HOLD_CHANCE) {
+                if asked { out.note = Some(self.start(dir, n.now, "you asked", false)); }
+                else if n.idle_secs >= AWAY_SECS { out.note = Some(self.start(dir, n.now, "picked at random, you were away", false)); }
+                else if n.now - self.last_ask >= ASK_GAP_SECS {
+                    // You are at the PC: ask first.
+                    self.asking = Some(n.now);
+                    self.last_ask = n.now;
+                    out.card = Some(true);
+                }
+            }
+        }
+        if let Some((ms, slow)) = n.sample {
+            let held = self.holding(n.now);
+            let e = self.days.entry(n.local_day).or_default();
+            if held { e.1.add(ms, slow) } else { e.0.add(ms, slow) }
+            if n.now - self.dirty_at > 300.0 { self.save(dir, n.local_day); self.dirty_at = n.now; }
+        }
+        out
+    }
+
+    pub fn save(&mut self, dir: &Path, today: i64) {
+        let old: Vec<i64> = self.days.keys().filter(|k| **k < today - 60).copied().collect();
+        for k in old { self.days.remove(&k); }
+        crate::rules::write_atomic(&dir.join(DAYS_FILE), &write_days(&self.days));
+        write_summary_from(dir, &self.days, today);
     }
 }
 
-/// Recompute impact-summary.json from every test in impact.jsonl.
-pub fn write_summary(dir: &Path) -> Summary {
-    use crate::json::{num_field, esc};
-    let text = std::fs::read_to_string(dir.join(LOG)).unwrap_or_default();
-    let mut tests = 0;
-    let mut pairs = Vec::new();
-    let mut last = 0.0f64;
-    for l in text.lines() {
-        tests += 1;
-        last = last.max(num_field(l, "start").unwrap_or(0.0));
-        if l.contains("\"valid\":true") { if let (Some(a), Some(b)) = (num_field(l, "off_ms"), num_field(l, "on_ms")) { pairs.push((a, b)); } }
-    }
-    let s = summarize(&pairs, tests);
-    let body = format!("{{\"tests\":{},\"valid\":{},\"slower_pct\":{:.1},\"low\":{:.1},\"high\":{:.1},\"faster_pct\":{:.1},\"last\":{:.0},\"text\":\"{}\"}}\n",
-        s.tests, s.valid, s.slower_pct, s.low, s.high, s.faster_pct, last, esc(&sentence(&s)));
+fn write_summary_from(dir: &Path, d: &Days, today: i64) -> Summary {
+    use crate::json::esc;
+    let s = summarize(d, today);
+    let rows: Vec<String> = d.range(today - DAYS + 1..=today).map(|(k, (a, b))| format!("{{\"day\":{},\"on_ms\":{:.1},\"on_slow\":{:.1},\"on_min\":{:.0},\"off_ms\":{:.1},\"off_slow\":{:.1},\"off_min\":{:.1}}}",
+        k, a.mean(), a.slow_pct(), a.n as f64 * 5.0 / 60.0, b.mean(), b.slow_pct(), b.n as f64 * 5.0 / 60.0)).collect();
+    let body = format!("{{\"ready\":{},\"faster_pct\":{:.1},\"slower_pct\":{:.1},\"low\":{:.1},\"high\":{:.1},\"on_ms\":{:.1},\"off_ms\":{:.1},\"on_slow\":{:.1},\"off_slow\":{:.1},\"hours\":{:.1},\"off_minutes\":{:.1},\"text\":\"{}\",\"days\":[{}]}}\n",
+        s.ready, s.faster_pct, s.slower_pct, s.low, s.high, s.on.mean(), s.off.mean(), s.on.slow_pct(), s.off.slow_pct(), s.on.n as f64 * 5.0 / 3600.0, s.off.n as f64 * 5.0 / 60.0, esc(&sentence(&s)), rows.join(","));
     crate::rules::write_atomic(&dir.join(SUMMARY), &body);
     s
+}
+
+/// Recompute impact-summary.json from impact-days.txt (CLI and start-up).
+pub fn write_summary(dir: &Path, today: i64) -> Summary {
+    let d = parse_days(&std::fs::read_to_string(dir.join(DAYS_FILE)).unwrap_or_default());
+    write_summary_from(dir, &d, today)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn fair_comparisons_only() {
-        let a = Block { ms: 200.0, p90: 400.0, cpu: 80.0, n: 36 };
-        let b = Block { ms: 100.0, p90: 150.0, cpu: 75.0, n: 36 };
-        assert!(valid(&a, &b));
-        assert!(!valid(&a, &Block { cpu: 50.0, ..b.clone() }), "load changed too much");
-        assert!(!valid(&a, &Block { n: 5, ..b }), "too few samples");
+    fn day(on: (u64, f64, u64), off: (u64, f64, u64)) -> (Tally, Tally) {
+        (Tally { n: on.0, sum: on.1 * on.0 as f64, slow: on.2 }, Tally { n: off.0, sum: off.1 * off.0 as f64, slow: off.2 })
     }
 
     #[test]
-    fn summary_and_sentence() {
-        let s = summarize(&[(200.0, 100.0), (150.0, 100.0), (300.0, 120.0), (110.0, 100.0), (180.0, 100.0)], 6);
-        assert_eq!(s.valid, 5);
-        assert!((s.slower_pct - 80.0).abs() < 0.1, "{}", s.slower_pct);
-        assert!((s.faster_pct - 44.4).abs() < 0.2, "{}", s.faster_pct);
-        assert!(sentence(&s).contains("80% slower without snifrig"));
-        let unclear = summarize(&[(90.0, 100.0), (100.0, 100.0), (130.0, 100.0)], 3);
-        assert!(sentence(&unclear).starts_with("No clear difference"), "an honest answer when it does not help");
-        assert!(sentence(&summarize(&[(200.0, 100.0)], 1)).starts_with("Measuring"));
+    fn pooled_over_the_week() {
+        let mut d = Days::new();
+        d.insert(10, day((5000, 60.0, 250), (200, 100.0, 40)));
+        d.insert(11, day((5000, 80.0, 500), (200, 120.0, 50)));
+        d.insert(2, day((9000, 10.0, 0), (900, 500.0, 900))); // older than 7 days: ignored
+        let s = summarize(&d, 11);
+        assert!(s.ready);
+        assert!((s.on.mean() - 70.0).abs() < 0.01 && (s.off.mean() - 110.0).abs() < 0.01);
+        assert!((s.faster_pct - 36.36).abs() < 0.1, "{}", s.faster_pct);
+        assert!((s.low - 50.0).abs() < 0.1 && (s.high - 66.7).abs() < 0.1, "{} {}", s.low, s.high);
+        let t = sentence(&s);
+        assert!(t.contains("36% faster with snifrig") && t.contains("sluggish 22% of the time without snifrig and 8% with it"), "{}", t);
     }
 
     #[test]
-    fn a_test_runs_two_blocks_and_stops_when_you_need_the_pc() {
-        let d = std::env::temp_dir().join(format!("snif-impact-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&d);
-        let _ = std::fs::remove_file(d.join(LOG));
-        let mut i = Impact::default();
-        let mut t = 100_000.0;
-        let now = |t: f64, ms: f64| Now { now: t, cpu: 80.0, feel_ms: Some(ms), gaming: false, user_wants_help: false };
-        assert!(i.tick(&d, &now(t, 0.0)).unwrap().contains("started"));
-        assert!(i.holding(), "first block holds off (even run)");
-        for _ in 0..181 { t += 1.0; i.tick(&d, &now(t, 200.0)); }
-        assert!(!i.holding(), "second block: snifrig works");
-        let mut done = None;
-        for _ in 0..181 { t += 1.0; if let Some(m) = i.tick(&d, &now(t, 100.0)) { done = Some(m); } }
-        assert!(done.unwrap().contains("200 ms without snifrig, 100 ms with it"));
-        let s = write_summary(&d);
-        assert_eq!((s.tests, s.valid), (1, 1));
-        // a game interrupts a test
-        let mut j = Impact::default();
-        assert!(j.tick(&d, &Now { now: 1e6, cpu: 90.0, feel_ms: None, gaming: false, user_wants_help: false }).is_some());
-        assert!(j.tick(&d, &Now { now: 1e6 + 1.0, cpu: 90.0, feel_ms: None, gaming: true, user_wants_help: false }).unwrap().contains("stopped"));
-        assert!(!j.holding());
-        let _ = std::fs::remove_dir_all(&d);
+    fn honest_when_not_ready_or_no_difference() {
+        let mut d = Days::new();
+        d.insert(1, day((5000, 60.0, 0), (50, 100.0, 0)));
+        assert!(sentence(&summarize(&d, 1)).starts_with("Measuring"));
+        d.insert(1, day((5000, 60.0, 0), (300, 60.5, 0)));
+        assert!(sentence(&summarize(&d, 1)).starts_with("No clear difference"));
+    }
+
+    #[test]
+    fn days_roundtrip() {
+        let mut d = Days::new();
+        d.insert(20000, day((10, 5.0, 1), (2, 9.0, 1)));
+        assert_eq!(parse_days(&write_days(&d)), d);
+    }
+
+    #[test]
+    fn holdouts_are_random_two_minute_blocks_and_stop_for_full_screen() {
+        let dir = std::env::temp_dir().join(format!("snif-impact2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join(HOLDS_LOG));
+        let mut i = Impact::new(&dir);
+        i.holds_today.clear();
+        let mut holds = 0;
+        let mut held_secs = 0;
+        let mut t = 1e9;
+        for _ in 0..(86400 * 2) {
+            t += 1.0;
+            if i.tick(&dir, &Now { now: t, local_day: 1, sample: Some((50.0, false)), fullscreen: false, user_wants_help: false, idle_secs: 900.0 }).note.is_some() { holds += 1; }
+            if i.holding(t) { held_secs += 1; }
+        }
+        let share = held_secs as f64 / (86400.0 * 2.0);
+        assert!(share > 0.02 && share < 0.07, "about 4% of the time held off, got {:.3} ({} holdouts)", share, holds);
+        // a full-screen app ends a holdout at once
+        let _ = std::fs::write(dir.join(NOW_FILE), "1");
+        i.tick(&dir, &Now { now: t + 1.0, local_day: 1, sample: None, fullscreen: false, user_wants_help: false, idle_secs: 0.0 });
+        assert!(i.holding(t + 1.0) || i.holds_today.len() >= MAX_HOLDS_PER_DAY);
+        i.tick(&dir, &Now { now: t + 2.0, local_day: 1, sample: None, fullscreen: true, user_wants_help: false, idle_secs: 0.0 });
+        assert!(!i.holding(t + 2.0));
+        // At the PC: it asks first, and no answer while you keep working means no test.
+        let mut k = Impact::new(&dir);
+        k.holds_today.clear();
+        let mut t = 2e9;
+        let mut asked_at = None;
+        for _ in 0..100_000 {
+            t += 1.0;
+            let o = k.tick(&dir, &Now { now: t, local_day: 2, sample: None, fullscreen: false, user_wants_help: false, idle_secs: 3.0 });
+            assert!(!k.holding(t), "never holds off unasked while you work");
+            if o.card == Some(true) { asked_at = Some(t); break; }
+        }
+        let at = asked_at.expect("it asked");
+        let mut last = Out::default();
+        for s in 1..=61 { last = k.tick(&dir, &Now { now: at + s as f64, local_day: 2, sample: None, fullscreen: false, user_wants_help: false, idle_secs: 3.0 }); if last.card.is_some() { break; } }
+        assert_eq!(last.card, Some(false));
+        assert!(last.note.unwrap().contains("busy"));
+        assert!(!k.holding(at + 62.0));
+        // "yes, it feels slow" starts a test and says so.
+        k.asking = Some(at + 100.0);
+        let _ = std::fs::write(dir.join(ANSWER_FILE), "slow");
+        let o = k.tick(&dir, &Now { now: at + 101.0, local_day: 2, sample: None, fullscreen: false, user_wants_help: false, idle_secs: 1.0 });
+        assert!(o.felt_slow && k.holding(at + 102.0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

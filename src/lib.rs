@@ -848,12 +848,27 @@ fn install(dir: &PathBuf, given: Option<String>) {
 }
 
 fn uninstall(dir: &PathBuf) {
-    // Jobs that snifrig took over go back to Windows Task Scheduler first, so nothing stops running.
+    // Jobs snifrig took over from Windows: ask whether Windows Task Scheduler should run them
+    // again (recommended), so nothing silently stops running when snifrig is gone.
     let fix = dir.join("bin").join("snifrig-fix.exe");
-    if fix.exists() && dir.join("jobs.txt").exists() {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new(&fix).arg("--dir").arg(dir).args(["jobs", "handback"]).creation_flags(0x0800_0000).status();
-        let _ = std::process::Command::new(&fix).arg("--dir").arg(dir).args(["jobs", "handback-admin"]).creation_flags(0x0800_0000).status();
+    let moved: Vec<String> = fs::read_to_string(dir.join("jobs.txt")).unwrap_or_default().lines()
+        .filter_map(|l| l.trim().strip_prefix("from_task =").map(|t| t.trim().trim_start_matches('\\').to_string())).collect();
+    if fix.exists() && !moved.is_empty() && !dir.join("jobs-in-windows").exists() {
+        #[link(name = "user32", kind = "raw-dylib")]
+        extern "system" { fn MessageBoxW(h: isize, text: *const u16, title: *const u16, flags: u32) -> i32; }
+        let shown: Vec<&str> = moved.iter().take(6).map(|s| s.as_str()).collect();
+        let more = if moved.len() > 6 { format!(" and {} more", moved.len() - 6) } else { String::new() };
+        let text = format!("snifrig runs {} of your scheduled tasks ({}{}).\n\nGive them back to Windows Task Scheduler so they keep running after snifrig is gone?\n\nRecommended: Yes.\nNo: they stop running until you turn them back on in Task Scheduler.", moved.len(), shown.join(", "), more);
+        // MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1 | MB_SETFOREGROUND (you started the uninstall)
+        let yes = unsafe { MessageBoxW(0, wide(&text).as_ptr(), wide("Uninstall snifrig").as_ptr(), 0x4 | 0x20 | 0x0 | 0x1_0000) } == 6;
+        if yes {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new(&fix).arg("--dir").arg(dir).args(["jobs", "handback"]).creation_flags(0x0800_0000).status();
+            let _ = std::process::Command::new(&fix).arg("--dir").arg(dir).args(["jobs", "handback-admin"]).creation_flags(0x0800_0000).status();
+            println!("Your scheduled tasks are back in Windows Task Scheduler.");
+        } else {
+            println!("Your scheduled tasks stay off in Windows. Turn them on in Task Scheduler, or run: snifrig-fix jobs undo-import");
+        }
     }
     start_menu_shortcut(&dir.join("bin").join("snifrig-app.exe"), false);
     del_run("Snifrig");

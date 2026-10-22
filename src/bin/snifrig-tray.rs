@@ -236,11 +236,11 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
         LAST_IMPACT_DAY = now / 86400;
         let s = std::fs::read_to_string(dir().join("impact-summary.json")).unwrap_or_default();
         let num = |k: &str| s.split(&format!("\"{}\":", k)).nth(1).and_then(|v| v.split(|c| c == ',' || c == '}').next()).and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(0.0);
-        if num("valid") >= 3.0 && num("low") > 0.0 {
+        if s.contains("\"ready\":true") && num("faster_pct") >= 2.0 {
             LAST_BALLOON = now;
             n.uFlags |= NIF_INFO;
             put(&mut n.szInfoTitle, "What snifrig did for you");
-            put(&mut n.szInfo, &format!("When your PC is busy, your apps respond {:.0}% faster with snifrig. Measured on this PC in {:.0} tests; every test is in the app.", num("faster_pct"), num("valid")));
+            put(&mut n.szInfo, &format!("Over the last 7 days your PC responded {:.0}% faster with snifrig, measured over {:.0} hours of your use. The numbers are in the app.", num("faster_pct"), num("hours")));
             n.dwInfoFlags = 1;
         }
     }
@@ -256,7 +256,7 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
     let seen = &mut *std::ptr::addr_of_mut!(SEEN);
     let mut ids: Vec<(String, String)> = read_pending().into_iter().map(|p| (p.id, format!("Snifrig wants to {} {}.", p.action, p.name))).collect();
     let sug = std::fs::read_to_string(dir().join("ai-suggestions.json")).unwrap_or_default();
-    for part in sug.split("\"id\":\"").skip(1) { if let Some(id) = part.split('"').next() { ids.push((id.to_string(), "Your AI assistant has a suggestion for snifrig.".into())); } }
+    for part in sug.split("\"id\":\"").skip(1) { if let Some(id) = part.split('"').next() { ids.push((id.to_string(), if part.contains("\"source\":\"snifrig\"") { "snifrig has a question for you.".into() } else { "Your AI assistant has a suggestion for snifrig.".into() })); } }
     // In a game or full screen: hold every question (not marked seen) until you are back.
     let busy = user_busy();
     if busy { ids.clear(); }

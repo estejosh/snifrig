@@ -659,6 +659,18 @@ fn start_guard(dir: std::path::PathBuf) {
     });
 }
 
+/// Take a card away again (it was only valid for a moment, like the test question).
+fn remove_card(dir: &Path, rule: &str) {
+    let path = dir.join("ai-suggestions.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let mark = format!("\"rule\":\"{}\"", rule);
+    let Some(at) = text.find(&mark) else { return };
+    let (Some(a), Some(b)) = (text[..at].rfind('{'), text[at..].find('}').map(|i| at + i + 1)) else { return };
+    let mut s = format!("{}{}", &text[..a], &text[b..]);
+    s = s.replace(",,", ",").replace("[,", "[").replace(",]", "]");
+    rules::write_atomic(&path, &s);
+}
+
 fn local_hhmm(t: f64) -> String {
     let l = t as i64 + sys::local_offset_secs();
     format!("{:02}:{:02}", l.rem_euclid(86400) / 3600, l.rem_euclid(3600) / 60)
@@ -1241,9 +1253,11 @@ fn watch(dir: &Path) {
     let mut dwm_hot = 0.0f64;
     // Your recurring jobs, run by snifrig: no windows, no pileups, at a good moment for the PC.
     let mut jobs = snifrig_fix::sched::Scheduler::new(dir);
-    // Measured impact: short tests while the PC is busy (see impact.rs).
+    // Measured impact on overall performance: all-day meter plus random 2-minute holdouts (impact.rs).
     let mut impact = snifrig_fix::impact::Impact::new(dir);
-    snifrig_fix::impact::write_summary(dir);
+    let tz = sys::local_offset_secs();
+    let local_day = || ((now_unix() as i64) + tz).div_euclid(86400);
+    snifrig_fix::impact::write_summary(dir, local_day());
     if dir.join(snifrig_fix::sched::HANDED_BACK).exists() { note(dir, "jobs", "done", &takeover(dir, false)); }
     start_guard(dir.to_path_buf());
     start_task_watch(dir.to_path_buf());
@@ -1357,12 +1371,22 @@ fn watch(dir: &Path) {
         let paused = now_unix() < ledger::paused_until(dir);
         {
             let t = now_unix();
-            let f = (n % 5 == 0).then(|| snifrig_fix::feel::recent(5)).filter(|f| f.samples > 0).map(|f| f.ms());
+            let sample = (n % 5 == 0).then(|| snifrig_fix::feel::recent(5)).filter(|f| f.samples > 0)
+                .map(|f| (f.ms(), snifrig_fix::feel::sluggish_with(&f, gov.dwm_pct)));
             let wants_help = learner.user_feel(t) == Some(true) || t < gov.hold_until;
-            let now = snifrig_fix::impact::Now { now: t, cpu: gov.total_pct, feel_ms: f, gaming: gov.game.is_some() || sys::fullscreen_d3d(), user_wants_help: wants_help };
-            if !paused && mode != Mode::Off { if let Some(m) = impact.tick(dir, &now) { note(dir, "impact", "done", &m); } }
+            let now = snifrig_fix::impact::Now { now: t, local_day: local_day(), sample, fullscreen: sys::fullscreen_d3d(), user_wants_help: wants_help, idle_secs: sys::idle_secs() };
+            if !paused && mode != Mode::Off {
+                let o = impact.tick(dir, &now);
+                if let Some(m) = o.note { note(dir, "impact", "done", &m); }
+                match o.card {
+                    Some(true) => add_card(dir, "impact_ask", "snifrig", "impact_ask", "Can I run a small test to see how your system is performing? For 2 minutes snifrig steps back and measures, then it gets back to work. And is your PC running slow right now? With this test I can optimize it."),
+                    Some(false) => remove_card(dir, "impact_ask"),
+                    None => {}
+                }
+                if o.felt_slow { learn::append_feedback(dir, &Feedback::new("feel_slow", "feel", "", "")); }
+            }
         }
-        let holding = impact.holding();
+        let holding = impact.holding(now_unix());
         let mut act = false;
         if mode == Mode::Off || paused {
             if !gov.demoted.is_empty() { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); }
@@ -1631,11 +1655,14 @@ fn main() {
         ["keep", name] => out(keep_cmd(&dir, name)),
         ["jobs", rest @ ..] => out(jobs_cmd(&dir, rest)),
         ["impact"] => {
-            let s = snifrig_fix::impact::write_summary(&dir);
+            let s = snifrig_fix::impact::write_summary(&dir, ((now_unix() as i64) + sys::local_offset_secs()).div_euclid(86400));
             println!("{}", snifrig_fix::impact::sentence(&s));
-            println!("tests: {} ({} counted). Every test: {}", s.tests, s.valid, dir.join(snifrig_fix::impact::LOG).display());
+            println!("with snifrig: {:.0} ms average, sluggish {:.1}% of the time ({:.1} hours measured)", s.on.mean(), s.on.slow_pct(), s.on.n as f64 * 5.0 / 3600.0);
+            println!("snifrig holding off: {:.0} ms average, sluggish {:.1}% of the time ({:.1} minutes measured)", s.off.mean(), s.off.slow_pct(), s.off.n as f64 * 5.0 / 60.0);
+            println!("days: {}; every holdout: {}", dir.join(snifrig_fix::impact::DAYS_FILE).display(), dir.join(snifrig_fix::impact::HOLDS_LOG).display());
         }
-        ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: a test starts within a few seconds if the PC is busy"); }
+        ["impact", "answer", a @ ("yes" | "slow" | "no")] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::ANSWER_FILE), a); println!("thanks"); }
+        ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: snifrig holds off for 2 minutes now, to compare"); }
         ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }
         ["impact", "on"] => { let _ = std::fs::remove_file(dir.join(snifrig_fix::impact::OFF_FILE)); println!("impact tests are on"); }
         ["popup", yn @ ("yes" | "no"), who @ ..] => out(popup_cmd(&dir, *yn == "yes", &who.join(" "))),
