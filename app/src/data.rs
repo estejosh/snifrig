@@ -42,6 +42,7 @@ impl Suggestion {
             "shutdown_wsl" => "WSL is using a lot of your CPU".into(),
             "minimize_game" => format!("{} is hidden but still drawing", self.app),
             "impact_ask" => "Can I run a small test?".into(),
+            "game_ask" => format!("How did {} run?", self.app),
             "popup_guard" => format!("{} takes the screen from you", self.app.trim_start_matches('\\')),
             "jobs_handback" => "Windows needs your OK to run your jobs again".into(),
             "take_over_task" => "Windows needs your OK to hand jobs to snifrig".into(),

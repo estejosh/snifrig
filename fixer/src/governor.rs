@@ -183,12 +183,17 @@ pub struct Hints {
     /// Apps you said you use and want fast (rule keep=yes): untouched while on a screen,
     /// only a lower priority while hidden.
     pub keep: HashSet<String>,
+    /// Game mode: the game in front (lowercase), while performance mode is on. Everything else
+    /// is turned down at once, without waiting for the PC to get busy.
+    pub game_front: Option<String>,
+    /// Programs that made your games stutter (from your answers): turned down hardest in game mode.
+    pub game_ease: HashSet<String>,
     /// Thresholds in force (the Governor copies its settings in before deciding).
     pub tuning: Tuning,
 }
 
 impl Default for Hints {
-    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new(), keep: HashSet::new(), tuning: Tuning::default() } }
+    fn default() -> Self { Hints { protect: HashSet::new(), blocked: HashSet::new(), prob: HashMap::new(), default_prob: 1.0, boost: HashMap::new(), max_level: HashMap::new(), keep: HashSet::new(), game_front: None, game_ease: HashSet::new(), tuning: Tuning::default() } }
 }
 
 /// Pure policy without learning hints.
@@ -221,21 +226,29 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is in front, so its busy background part is only kept in efficiency mode", d.name) }),
             Some(s) if (s.onscreen || on_names.contains(&s.name.as_str())) && d.level > 1 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 1, reason: format!("{} is showing on a screen, so it is only kept in efficiency mode", d.name) }),
+            // The game is over: everything game mode turned down comes back at once.
+            Some(_) if hints.game_front.is_none() && d.reason.starts_with("game mode") =>
+                out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: 0, reason: "the game is over".into() }),
+            Some(_) if hints.game_front.is_some() && d.reason.starts_with("game mode") => {}
             Some(_) if mood.calm_with(t) && mood.calm_ticks % t.restore_every.max(1) == 0 =>
                 out.push(Step::Restore { key: *k, name: d.name.clone(), to_level: d.level - 1, reason: format!("CPU is calm again ({:.0}%)", total_pct) }),
             _ => {}
         }
     }
-    if !mood.busy_with(t) { return out; }
+    let game = hints.game_front.as_deref();
+    if !mood.busy_with(t) && game.is_none() { return out; }
 
     // Demote the biggest background users, one step each, a couple per tick.
     let mut cands: Vec<&Seen> = seen.iter()
         // The app in front is never touched; its windowless helpers (busy tabs, renderers) may be reined in lightly.
         .filter(|s| !s.protected && !s.foreground && (!fg_names.contains(&s.name.as_str()) || !s.windowed))
-        .filter(|s| s.core_pct >= t.min_core_pct)
+        .filter(|s| s.core_pct >= if game.is_some() { 2.0 } else { t.min_core_pct })
+        .filter(|s| game.map_or(true, |g| !s.name.eq_ignore_ascii_case(g)))
         .filter(|s| { let n = s.name.to_lowercase(); !hints.protect.contains(&n) && !hints.blocked.contains(&n) })
         .filter(|s| {
             let mut cap = hints.max_level.get(&s.name.to_lowercase()).copied().unwrap_or(t.max_level).min(t.max_level);
+            // Game mode: everything else to below normal; what made your games stutter, all the way.
+            if game.is_some() && !hints.game_ease.contains(&s.name.to_lowercase()) { cap = cap.min(2); }
             // Helpers of the app in front, and apps showing on a screen, only get efficiency mode.
             if fg_names.contains(&s.name.as_str()) || on_names.contains(&s.name.as_str()) { cap = cap.min(1); }
             if hints.keep.contains(&s.name.to_lowercase()) {
@@ -248,9 +261,11 @@ pub fn decide_with(total_pct: f64, mood: &Mood, seen: &[Seen], demoted: &HashMap
     let weight = |s: &Seen| { let n = s.name.to_lowercase();
         s.core_pct * hints.prob.get(&n).copied().unwrap_or(hints.default_prob) * hints.boost.get(&n).copied().unwrap_or(1.0) };
     cands.sort_by(|a, b| weight(b).partial_cmp(&weight(a)).unwrap_or(std::cmp::Ordering::Equal));
-    for s in cands.into_iter().take(t.max_per_tick) {
+    for s in cands.into_iter().take(if game.is_some() { t.max_per_tick * 3 } else { t.max_per_tick }) {
         let lvl = demoted.get(&s.key).map_or(0, |d| d.level) + 1;
-        let reason = if fg_names.contains(&s.name.as_str()) {
+        let reason = if let Some(g) = game {
+            format!("game mode: {} is in front, so {} is turned down until you stop playing", g, s.name)
+        } else if fg_names.contains(&s.name.as_str()) {
             format!("CPU at {:.0}% and a background part of {} (a tab or helper, pid {}) was using {:.0}% of a core; the window you are using is untouched", total_pct, s.name, s.key.0, s.core_pct)
         } else {
             format!("CPU at {:.0}% and {} was using {:.0}% of a core in the background", total_pct, s.name, s.core_pct)

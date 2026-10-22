@@ -659,6 +659,23 @@ fn start_guard(dir: std::path::PathBuf) {
     });
 }
 
+/// Your answer to "how did the game run?". Stutters: the programs that were busy during them
+/// are turned down hardest in game mode from now on.
+fn game_answer(dir: &Path, a: &str) -> Result<String, String> {
+    let last = std::fs::read_to_string(dir.join(snifrig_fix::game::LAST)).unwrap_or_default();
+    let mut lines = last.lines();
+    let game = lines.next().unwrap_or("the game").to_string();
+    let busy: Vec<String> = lines.next().unwrap_or("").split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty() && !snifrig_fix::guard::is_system(s)).collect();
+    learn::append_feedback(dir, &Feedback::new(if a == "smooth" { "game_smooth" } else { "game_stutter" }, "game", a, &game.to_lowercase()));
+    if a == "smooth" { return Ok(format!("Good. snifrig keeps game mode as it is for {}.", game)); }
+    if busy.is_empty() { return Ok(format!("Thanks. snifrig did not catch who was busy during {}; next time it turns everything else down a bit harder and keeps watching.", game)); }
+    let have = snifrig_fix::game::load_ease(dir);
+    let add: Vec<&String> = busy.iter().filter(|b| !have.contains(*b)).collect();
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(snifrig_fix::game::EASE_FILE)) { for b in &add { let _ = writeln!(f, "{}", b); } }
+    Ok(format!("Thanks. Next time you play, snifrig turns {} all the way down while the game is in front.", busy.join(" and ")))
+}
+
 /// Take a card away again (it was only valid for a moment, like the test question).
 fn remove_card(dir: &Path, rule: &str) {
     let path = dir.join("ai-suggestions.json");
@@ -1265,6 +1282,9 @@ fn watch(dir: &Path) {
     let offset = sys::local_offset_secs();
     for m in snifrig_fix::governor::recover(&dir.join("demoted.txt")) { note(dir, "gov:recover", "done", &m); }
     let mut slow_apps = snifrig_fix::slowapp::Tracker::default();
+    // The game sniffer and game mode's learned list.
+    let mut session: Option<snifrig_fix::game::Session> = None;
+    let mut game_ease = snifrig_fix::game::load_ease(dir);
     let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
     // The feel gate was turned off while the meter was checked; it comes back on by itself after a day.
     if !t0.feel_gate && !dir.join("feel-gate-on-at").exists() && !dir.join("feel-gate-stays-off").exists() {
@@ -1400,6 +1420,9 @@ fn watch(dir: &Path) {
             gov.acting = act;
             enf.acting = act;
             gov.feels_slow = snifrig_fix::feel::sluggish_with(&snifrig_fix::feel::recent(5), gov.dwm_pct);
+            if n % 30 == 7 { game_ease = snifrig_fix::game::load_ease(dir); }
+            gov.hints.game_front = gov.game.as_ref().filter(|_| gov.tuning.game_mode).map(|g| g.to_lowercase());
+            gov.hints.game_ease = game_ease.clone();
             gov.user_says = learner.user_feel(now_unix());
             if let Some(s) = gov.user_says { gov.feels_slow = s; }
             let changes = gov.tick(now_unix(), act);
@@ -1409,6 +1432,28 @@ fn watch(dir: &Path) {
                 note(dir, "perf:mode", if act { "done" } else { "would" }, &m);
             }
             gov.game = perf.game.as_ref().map(|g| g.2.clone());
+            // Game sniffer: record while you play; ask how it ran when a full-screen game ends.
+            match (&gov.game, session.is_some()) {
+                (Some(g), _) => {
+                    let s = session.get_or_insert_with(|| snifrig_fix::game::Session::new(g, now_unix()));
+                    let (top, top_pct) = gov.top.iter().find(|(nm, _)| !nm.eq_ignore_ascii_case(g) && nm != "system" && nm != "idle").cloned().unwrap_or_default();
+                    let avail = sys::memory_status().map(|m| m.1).unwrap_or(0.0);
+                    s.add(&snifrig_fix::game::Sample { t: now_unix(), game_pct: gov.name_pct(g), total: gov.total_pct, top, top_pct, avail_mb: avail, fullscreen: sys::fullscreen_d3d() });
+                }
+                (None, true) => {
+                    let s = session.take().unwrap();
+                    let c = s.culprits();
+                    let line = format!("{{\"game\":\"{}\",\"start\":{:.0},\"mins\":{:.0},\"full_screen_mins\":{:.0},\"stutters\":{},\"busy\":\"{}\"}}",
+                        snifrig_fix::json::esc(&s.game), s.start, s.secs / 60.0, s.fs_secs / 60.0, s.hitches.len(), snifrig_fix::json::esc(&c.iter().map(|(n, k)| format!("{} {}", n, k)).collect::<Vec<_>>().join(", ")));
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(snifrig_fix::game::SESSIONS)) { let _ = writeln!(f, "{}", line); }
+                    if s.worth_asking() {
+                        let _ = std::fs::write(dir.join(snifrig_fix::game::LAST), format!("{}\n{}\n", s.game, c.iter().take(3).map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",")));
+                        add_card(dir, "game_ask", &s.game, &format!("game:{:.0}", s.start), &s.question());
+                    }
+                }
+                _ => {}
+            }
             if act {
                 let fresh: Vec<&str> = changes.iter().filter(|c| c.result.is_ok() && c.from == 0 && c.to == 1).map(|c| c.name.as_str()).collect();
                 if !fresh.is_empty() {
@@ -1662,6 +1707,7 @@ fn main() {
             println!("days: {}; every holdout: {}", dir.join(snifrig_fix::impact::DAYS_FILE).display(), dir.join(snifrig_fix::impact::HOLDS_LOG).display());
         }
         ["impact", "answer", a @ ("yes" | "slow" | "no")] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::ANSWER_FILE), a); println!("thanks"); }
+        ["game", "answer", a @ ("smooth" | "stutter" | "bad")] => out(game_answer(&dir, a)),
         ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: snifrig holds off for 2 minutes now, to compare"); }
         ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }
         ["impact", "on"] => { let _ = std::fs::remove_file(dir.join(snifrig_fix::impact::OFF_FILE)); println!("impact tests are on"); }

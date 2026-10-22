@@ -570,7 +570,7 @@ impl App {
 
     fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
         card(ui, |ui| {
-            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask");
+            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask" | "game_ask");
             ui.horizontal(|ui| { chip(ui, if ours { "snifrig noticed" } else { "suggested by your AI assistant" }, BLUE); });
             ui.label(bold(s.summary(), 15.0).color(TEXT));
             ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
@@ -581,6 +581,10 @@ impl App {
                         self.dismiss_suggestion(s);
                     }
                     if ui.button("No").clicked() { self.run("snifrig-fix.exe", vec!["desktop".into(), "no".into()], "Ok, snifrig will not ask about this for a week."); self.dismiss_suggestion(s); }
+                } else if s.kind == "game_ask" {
+                    for (a, label, done) in [("smooth", "Smooth", "Good to hear."), ("stutter", "A few stutters", "Thanks. snifrig will turn the culprits down harder next time."), ("bad", "Bad", "Thanks. snifrig will turn the culprits down harder next time.")] {
+                        if ui.button(label).clicked() { self.run("snifrig-fix.exe", vec!["game".into(), "answer".into(), a.into()], done); self.dismiss_suggestion(s); }
+                    }
                 } else if s.kind == "impact_ask" {
                     if ui.add(egui::Button::new(RichText::new("Yes, run it").color(Color32::BLACK)).fill(ACCENT)).clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "answer".into(), "yes".into()], "Thanks. Measuring for 2 minutes."); self.dismiss_suggestion(s); }
                     if ui.button("Yes, and it feels slow now").clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "answer".into(), "slow".into()], "Thanks. Measuring, then snifrig works on the slowdown."); self.dismiss_suggestion(s); }
