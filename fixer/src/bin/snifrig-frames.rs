@@ -47,7 +47,12 @@ fn stats(stamps: &[i64], freq: f64, secs: f64) -> (f64, f64, f64, usize) {
 fn main() {
     let dir = std::env::args().skip_while(|a| a != "--dir").nth(1).map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("snifrig"));
-    let _ = std::fs::remove_file(dir.join("frames-off"));
+    // It runs with administrator rights, so it only reads your folder; what it writes goes next to
+    // it, in C:\Program Files\snifrig\state, where only administrators can write.
+    let out = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.to_path_buf()))
+        .filter(|r| r.to_string_lossy().to_lowercase().contains("program files"))
+        .map(|r| r.join("state")).unwrap_or_else(|| dir.clone());
+    let _ = std::fs::create_dir_all(&out);
     let name = wide("snifrig-frames");
     // EVENT_TRACE_PROPERTIES followed by room for the session name.
     let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024;
@@ -65,7 +70,7 @@ fn main() {
         (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
         let mut session: CONTROLTRACE_HANDLE = std::mem::zeroed();
         let r = StartTraceW(&mut session, name.as_ptr(), props);
-        if r != 0 { let _ = std::fs::write(dir.join("frames-error.txt"), format!("could not start the frame trace (error {}); it needs administrator rights\n", r)); return; }
+        if r != 0 { let _ = std::fs::write(out.join("frames-error.txt"), format!("could not start the frame trace (error {}); it needs administrator rights\n", r)); return; }
         let mut log: EVENT_TRACE_LOGFILEW = std::mem::zeroed();
         log.LoggerName = name.as_ptr() as *mut u16;
         log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
@@ -88,7 +93,7 @@ fn main() {
             } else if want == 0 && enabled {
                 for g in [&DXGI, &D3D9] { EnableTraceEx2(session, g, EVENT_CONTROL_CODE_DISABLE_PROVIDER as u32, 0, 0, 0, 0, std::ptr::null()); }
                 enabled = false;
-                let _ = std::fs::remove_file(dir.join("frames-now.txt"));
+                let _ = std::fs::remove_file(out.join("frames-now.txt"));
             }
             WANT.store(want, Ordering::Relaxed);
             let secs = last.elapsed().as_secs_f64();
@@ -97,7 +102,7 @@ fn main() {
             if want != 0 {
                 let (fps, med, p99, st) = stats(&stamps, freq as f64, secs);
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                let _ = std::fs::write(dir.join("frames-now.txt"), format!("{} {} {:.1} {:.1} {:.1} {}\n", now, want, fps, med, p99, st));
+                let _ = std::fs::write(out.join("frames-now.txt"), format!("{} {} {:.1} {:.1} {:.1} {}\n", now, want, fps, med, p99, st));
             }
         }
         ControlTraceW(session, name.as_ptr(), props, EVENT_TRACE_CONTROL_STOP);

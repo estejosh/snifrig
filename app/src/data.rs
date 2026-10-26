@@ -40,6 +40,8 @@ impl Suggestion {
             "setting" => format!("Governor setting {}", self.setting),
             "restart_desktop" => "Restart the desktop (dwm is stuck)".into(),
             "shutdown_wsl" => "WSL is using a lot of your CPU".into(),
+            "drivers_ready" => "Driver updates from the manufacturers".into(),
+            "drivers_slower" => "Your PC got slower after the driver update".into(),
             "minimize_game" => format!("{} is hidden but still drawing", self.app),
             "impact_ask" => "Can I run a small test?".into(),
             "game_ask" => format!("How did {} run?", self.app),

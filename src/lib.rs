@@ -38,6 +38,9 @@ pub mod junk;
 #[path = "../fixer/src/disk.rs"]
 #[allow(dead_code)]
 pub mod disk;
+#[path = "../fixer/src/drivers.rs"]
+#[allow(dead_code)]
+pub mod drivers;
 const SLOW_CAP: u64 = 512 << 10;
 
 // ---------- raw readers ----------
@@ -676,6 +679,14 @@ pub fn run() {
             println!("Duplicate model files: {} could be freed by keeping one copy per drive.", junk::human(dup));
             println!("Virtual disks (WSL, Docker): {} could be given back.", junk::human(vd));
             println!("Details: {}. snifrig fix links the copies (undo for 7 days) and shrinks the disks when you are away.", dir.join(disk::REPORT).display());
+            return;
+        }
+        Some("drivers") => {
+            // The free scan: devices with problems, and driver updates from the manufacturers.
+            match drivers::scan(&dir) {
+                Ok(s) => { for l in drivers::summary(&s, drivers::gpu_choice(&dir)) { println!("{}", l); } println!("snifrig fix installs the ready updates while you are away: a restore point first, one at a time, and the old driver comes back if a device has problems."); }
+                Err(e) => println!("The driver scan did not work: {}", e),
+            }
             return;
         }
         Some("junk") => {

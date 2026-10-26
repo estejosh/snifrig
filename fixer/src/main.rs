@@ -710,29 +710,183 @@ fn disk_dedupe(dir: &Path, which: &str) -> Result<String, String> {
     Ok(msg)
 }
 
-/// `frames on|off`: real frame-rate measuring in games. Windows lets only an administrator read
-/// a game's present events, so this sets up snifrig-frames as a scheduled task with highest
-/// privileges, once (Windows asks you to confirm). Off removes it again.
-fn frames_cmd(dir: &Path, on: bool) -> Result<String, String> {
+// ---- Administrator helpers: frame measuring and driver installs ----
+
+const HELPERS_SETUP_PS1: &str = include_str!("helpers-setup.ps1");
+const DRIVERS_INSTALL_PS1: &str = include_str!("drivers-install.ps1");
+
+/// C:\Program Files\snifrig: only administrators can change files there, so the scheduled tasks
+/// that run these helpers with full rights cannot be pointed at something else.
+fn admin_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join("snifrig")
+}
+fn admin_state() -> std::path::PathBuf { admin_root().join("state") }
+fn frames_now_file(dir: &Path) -> std::path::PathBuf {
+    if admin_root().join("helpers").join("snifrig-frames.exe").exists() { admin_state().join("frames-now.txt") } else { dir.join("frames-now.txt") }
+}
+fn drivers_helper_on() -> bool { admin_root().join("helpers").join("drivers-install.ps1").exists() }
+
+/// Set up the administrator helpers you want (the rest are removed). Windows asks you first.
+fn helpers_setup(dir: &Path, frames: bool, drivers: bool) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    let exe = dir.join("bin").join("snifrig-frames.exe");
-    if on && !exe.exists() { return Err(format!("{} is missing; install snifrig again", exe.display())); }
-    let script = if on {
-        format!("$a = New-ScheduledTaskAction -Execute '{}' -Argument '--dir \"{}\"'\r\n$t = New-ScheduledTaskTrigger -AtLogOn -User \"$env:USERDOMAIN\\$env:USERNAME\"\r\n$p = New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" -LogonType Interactive -RunLevel Highest\r\n$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries\r\nRegister-ScheduledTask -TaskName 'snifrig frames' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\nStart-ScheduledTask -TaskName 'snifrig frames'\r\n'ok' | Out-File '{}'\r\n",
-            exe.display(), dir.display(), dir.join("frames-setup.out").display())
-    } else {
-        format!("Unregister-ScheduledTask -TaskName 'snifrig frames' -Confirm:$false -ErrorAction SilentlyContinue\r\n'ok' | Out-File '{}'\r\n", dir.join("frames-setup.out").display())
-    };
-    if !on { let _ = std::fs::write(dir.join("frames-off"), "1"); let _ = std::fs::remove_file(dir.join("frames-on")); }
-    let f = dir.join("frames-setup.ps1");
-    std::fs::write(&f, script).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(dir.join("frames-setup.out"));
+    let src = dir.join("helpers-src");
+    std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+    if frames {
+        let exe = dir.join("bin").join("snifrig-frames.exe");
+        if !exe.exists() { return Err(format!("{} is missing; install snifrig again", exe.display())); }
+        std::fs::copy(&exe, src.join("snifrig-frames.exe")).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(src.join("drivers-install.ps1"), DRIVERS_INSTALL_PS1).map_err(|e| e.to_string())?;
+    let script = dir.join("helpers-setup.ps1");
+    std::fs::write(&script, HELPERS_SETUP_PS1).map_err(|e| e.to_string())?;
+    let out = dir.join("helpers-setup.out");
+    let _ = std::fs::remove_file(&out);
+    let want = [frames.then_some("frames"), drivers.then_some("drivers")].into_iter().flatten().collect::<Vec<_>>().join(",");
+    let q = |p: &Path| p.display().to_string().replace('\'', "''");
+    let wrapper = dir.join("helpers-setup-run.ps1");
+    std::fs::write(&wrapper, format!("& '{}' -Src '{}' -Dir '{}' -Want '{}' -Out '{}'\r\n", q(&script), q(&src), q(dir), want, q(&out))).map_err(|e| e.to_string())?;
     let st = std::process::Command::new("powershell.exe").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command"])
-        .arg(format!("Start-Process powershell.exe -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'", f.display()))
+        .arg(format!("Start-Process powershell.exe -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{}\"'", q(&wrapper)))
         .creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
-    if !st.success() || !dir.join("frames-setup.out").exists() { return Err("the Windows confirmation was cancelled".into()); }
-    if on { let _ = std::fs::write(dir.join("frames-on"), "1"); Ok("Frame measuring is on: snifrig now sees real fps and hitches in Direct3D games (Vulkan and OpenGL games still use the CPU-based check).".into()) }
-    else { Ok("Frame measuring is off.".into()) }
+    let r = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&src);
+    if !st.success() || r.is_empty() { return Err("the Windows confirmation was cancelled".into()); }
+    if !r.trim_start_matches('\u{feff}').trim().starts_with("ok") { return Err(r.trim().to_string()); }
+    if drivers { let _ = std::fs::write(dir.join("drivers-helper-on"), "1"); } else { let _ = std::fs::remove_file(dir.join("drivers-helper-on")); }
+    Ok(())
+}
+
+/// `frames on|off`: real frame-rate measuring in games. Windows lets only an administrator read
+/// a game's present events, so snifrig-frames runs from Program Files as a scheduled task with
+/// highest privileges (Windows asks you once). Off removes it again.
+fn frames_cmd(dir: &Path, on: bool) -> Result<String, String> {
+    if on { let _ = std::fs::remove_file(dir.join("frames-off")); } else { let _ = std::fs::write(dir.join("frames-off"), "1"); }
+    helpers_setup(dir, on, drivers_helper_on())?;
+    if on {
+        let _ = std::fs::write(dir.join("frames-on"), "1");
+        Ok("Frame measuring is on: snifrig now sees real fps and hitches in Direct3D games (Vulkan and OpenGL games still use the CPU-based check).".into())
+    } else { let _ = std::fs::remove_file(dir.join("frames-on")); Ok("Frame measuring is off.".into()) }
+}
+
+// ---- Drivers (see drivers.rs for the rules) ----
+
+/// The last scan if it is from today, else a new one.
+fn drivers_fresh(dir: &Path) -> Result<snifrig_fix::drivers::Scan, String> {
+    match snifrig_fix::drivers::load(dir) {
+        Some(s) if now_unix() - (s.unix as f64) < 6.0 * 3600.0 => Ok(s),
+        _ => snifrig_fix::drivers::scan(dir),
+    }
+}
+
+/// `drivers update all|ID..`: the updates that pass the rules go into the plan; snifrig installs
+/// them the next time you are away (or now, with `now`).
+fn drivers_update(dir: &Path, which: &[&str], now: bool) -> Result<String, String> {
+    use snifrig_fix::drivers;
+    let s = drivers_fresh(dir)?;
+    let (ok, held) = drivers::sort(&s, drivers::gpu_choice(dir));
+    let mine = drivers::held_by_you(dir);
+    let pick: Vec<&drivers::Update> = ok.into_iter().filter(|u| (which.contains(&"all") && !mine.contains(&u.id)) || which.iter().any(|w| w.eq_ignore_ascii_case(&u.id))).collect();
+    if pick.is_empty() {
+        let why = held.iter().find(|(u, _)| which.iter().any(|w| w.eq_ignore_ascii_case(&u.id))).map(|(u, w)| format!("{} is held back: {}", u.title, w));
+        return Err(why.unwrap_or_else(|| "no driver updates to install right now".into()));
+    }
+    if !drivers_helper_on() { helpers_setup(dir, dir.join("frames-on").exists(), true)?; }
+    std::fs::write(dir.join("drivers-plan.txt"), pick.iter().map(|u| u.id.as_str()).collect::<Vec<_>>().join("\r\n")).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(dir.join("drivers-plan-titles.txt"), pick.iter().map(|u| u.title.as_str()).collect::<Vec<_>>().join("; "));
+    let list = pick.iter().map(|u| u.title.as_str()).collect::<Vec<_>>().join("; ");
+    if now { return drivers_run(dir); }
+    let (mut jobs, _) = snifrig_fix::sched::load(dir);
+    let exe = dir.join("bin").join("snifrig-fix.exe");
+    let name = "snifrig driver updates";
+    let mut j = snifrig_fix::sched::Job::new(name, &format!("\"{}\" --dir \"{}\" drivers run", exe.display(), dir.display()));
+    j.sched = snifrig_fix::sched::Sched::Once(now_unix() + 60.0);
+    j.when = snifrig_fix::sched::When::Idle;
+    j.latest_secs = 7.0 * 86400.0;
+    j.max_secs = 2.0 * 3600.0;
+    jobs.retain(|x| x.name != name);
+    jobs.push(j);
+    snifrig_fix::sched::save(dir, &jobs);
+    Ok(format!("snifrig installs these the next time you are away, one at a time after a restore point: {}", list))
+}
+
+/// Start the administrator helper on whatever plan or rollback file is waiting, and wait for it.
+fn drivers_helper_run(_dir: &Path) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    if !drivers_helper_on() { return Err("the driver helper is not set up; snifrig-fix drivers update sets it up (Windows asks once)".into()); }
+    let start = now_unix() - 2.0;
+    let st = std::process::Command::new("schtasks.exe").args(["/run", "/tn", "snifrig drivers"]).creation_flags(0x0800_0000).output().map_err(|e| e.to_string())?;
+    if !st.status.success() { return Err(format!("could not start the driver helper: {}", String::from_utf8_lossy(&st.stderr).trim())); }
+    let res = admin_state().join("drivers-result.txt");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let r = std::fs::read_to_string(&res).unwrap_or_default();
+        let r = r.trim_start_matches('\u{feff}').trim();
+        if let Some((t, what)) = r.split_once(' ') { if t.parse::<f64>().map_or(false, |t| t >= start) { return Ok(what.to_string()); } }
+        if now_unix() - start > 2.0 * 3600.0 { return Err("the driver helper did not finish in 2 hours".into()); }
+    }
+}
+
+/// `drivers run`: install the plan now (the scheduler calls this when you are away).
+fn drivers_run(dir: &Path) -> Result<String, String> {
+    let plan = std::fs::read_to_string(dir.join("drivers-plan.txt")).map_err(|_| "nothing planned".to_string())?;
+    let ids: Vec<String> = plan.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let titles = std::fs::read_to_string(dir.join("drivers-plan-titles.txt")).unwrap_or_default();
+    let r = drivers_helper_run(dir);
+    let _ = std::fs::remove_file(dir.join("drivers-plan.txt"));
+    let _ = std::fs::remove_file(dir.join("drivers-plan-titles.txt"));
+    let what = r?;
+    // "installed N rolledback M reboot True"
+    let f: Vec<&str> = what.split_whitespace().collect();
+    let installed: u32 = f.get(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+    let bad: u32 = f.get(3).and_then(|x| x.parse().ok()).unwrap_or(0);
+    let reboot = f.get(5).map_or(false, |x| x.eq_ignore_ascii_case("true"));
+    if installed > 0 { snifrig_fix::drivers::write_watch(dir, &snifrig_fix::drivers::Watch { at: now_unix(), ids, titles: titles.clone(), before: None }); }
+    let _ = snifrig_fix::drivers::scan(dir);
+    let msg = match f.first().copied() {
+        Some("norestore") => "Windows could not make a restore point, so no driver was installed. Turn on System Protection for C: and try again.".to_string(),
+        Some("nothing") => "nothing was planned".to_string(),
+        _ => format!("{} driver update{} installed{}{}.", installed, if installed == 1 { "" } else { "s" },
+            if bad > 0 { format!("; {} put back right away because the device reported a problem", bad) } else { String::new() },
+            if reboot { "; Windows needs a restart to finish (snifrig does not restart for you)" } else { "" }),
+    };
+    drivers_note(dir, &msg);
+    Ok(msg)
+}
+
+/// `drivers rollback ID..|last`: take back driver updates snifrig installed.
+fn drivers_rollback(dir: &Path, which: &[&str]) -> Result<String, String> {
+    let ids: Vec<String> = if which == ["last"] { snifrig_fix::drivers::read_watch(dir).map(|w| w.ids).unwrap_or_default() } else { which.iter().map(|s| s.to_string()).collect() };
+    if ids.is_empty() { return Err("no driver update to take back".into()); }
+    std::fs::write(dir.join("drivers-rollback.txt"), ids.join("\r\n")).map_err(|e| e.to_string())?;
+    let r = drivers_helper_run(dir);
+    let _ = std::fs::remove_file(dir.join("drivers-rollback.txt"));
+    let what = r?;
+    snifrig_fix::drivers::hold(dir, &ids);
+    let n: u32 = what.split_whitespace().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+    let _ = std::fs::remove_file(dir.join(snifrig_fix::drivers::WATCH));
+    remove_card(dir, "drivers_slower");
+    let _ = snifrig_fix::drivers::scan(dir);
+    let msg = format!("took back {} driver update{}; those devices use their previous drivers again", n, if n == 1 { "" } else { "s" });
+    drivers_note(dir, &msg);
+    Ok(msg)
+}
+
+fn drivers_note(dir: &Path, msg: &str) {
+    let alert = snifrig_fix::Alert { t: String::new(), key: "drivers".into(), msg: msg.into() };
+    ledger::record(dir, &alert, &Action::Report, None, "done", msg);
+}
+
+/// The daily check, while you are away: a card when manufacturer updates are ready.
+fn drivers_check(dir: &Path) {
+    use snifrig_fix::drivers;
+    let Ok(s) = drivers::scan(dir) else { return };
+    let held = drivers::held_by_you(dir);
+    let (ok, _) = drivers::sort(&s, drivers::gpu_choice(dir));
+    let ok: Vec<_> = ok.into_iter().filter(|u| !held.contains(&u.id)).collect();
+    if ok.is_empty() || dir.join("drivers-plan.txt").exists() { remove_card(dir, "drivers_ready"); return; }
+    let list = ok.iter().map(|u| u.title.as_str()).collect::<Vec<_>>().join("; ");
+    add_card(dir, "drivers_ready", "snifrig", "drivers_ready", &format!("{} driver update{} from the manufacturer{} for your exact hardware: {}. Install {} the next time you are away? A restore point comes first, one driver at a time, and a device that has problems afterwards gets its old driver back.",
+        ok.len(), if ok.len() == 1 { "" } else { "s" }, if ok.len() == 1 { "" } else { "s" }, list, if ok.len() == 1 { "it" } else { "them" }));
 }
 
 /// Your answer to "how did the game run?". Stutters: the programs that were busy during them
@@ -1372,6 +1526,7 @@ fn watch(dir: &Path) {
     // The game sniffer and game mode's learned list.
     let mut session: Option<snifrig_fix::game::Session> = None;
     let mut want_pid = 0u32;
+    let mut drv_feel = snifrig_fix::drivers::Feel::default();
     let _ = std::fs::remove_file(dir.join("frames-want"));
     let mut game_ease = snifrig_fix::game::load_ease(dir);
     let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
@@ -1483,6 +1638,7 @@ fn watch(dir: &Path) {
             let sample = (n % 5 == 0).then(|| snifrig_fix::feel::recent(5)).filter(|f| f.samples > 0)
                 .map(|f| (f.ms(), snifrig_fix::feel::sluggish_with(&f, gov.dwm_pct)));
             let wants_help = learner.user_feel(t) == Some(true) || t < gov.hold_until;
+            if let Some((_, slow)) = sample { drv_feel.add(t, slow); }
             let now = snifrig_fix::impact::Now { now: t, local_day: local_day(), sample, fullscreen: sys::fullscreen_d3d(), user_wants_help: wants_help, idle_secs: sys::idle_secs() };
             if !paused && mode != Mode::Off {
                 let o = impact.tick(dir, &now);
@@ -1540,7 +1696,7 @@ fn watch(dir: &Path) {
                     let gpid = if gov.hints.game_level >= 2 { sys::foreground_pid().unwrap_or(0) } else { 0 };
                     let frames = if dir.join("frames-on").exists() && gpid != 0 {
                         if want_pid != gpid { let _ = std::fs::write(dir.join("frames-want"), gpid.to_string()); want_pid = gpid; }
-                        std::fs::read_to_string(dir.join("frames-now.txt")).ok().and_then(|l| {
+                        std::fs::read_to_string(frames_now_file(dir)).ok().and_then(|l| {
                             let f: Vec<&str> = l.split_whitespace().collect();
                             let fresh = f.first().and_then(|x| x.parse::<f64>().ok()).map_or(false, |t| now_unix() - t <= 3.0);
                             (f.len() >= 6 && fresh && f[1] == gpid.to_string()).then(|| (f[2].parse().unwrap_or(0.0), f[4].parse().unwrap_or(0.0), f[5].parse().unwrap_or(0)))
@@ -1586,6 +1742,27 @@ fn watch(dir: &Path) {
             let _ = std::fs::remove_file(dir.join("job-run"));
             let r = jobs.run_now(name.trim(), now_unix());
             let _ = std::fs::write(dir.join("job-run-result.txt"), r.unwrap_or_else(|e| e));
+        }
+        if n % 60 == 30 {
+            // After driver updates: did things get slower? Then offer to take them back.
+            if let Some(mut w) = snifrig_fix::drivers::read_watch(dir) {
+                let t = now_unix();
+                match w.before {
+                    None => { w.before = Some(drv_feel.rate(w.at - 86400.0, w.at)); snifrig_fix::drivers::write_watch(dir, &w); }
+                    Some(b) if t - w.at > 86400.0 => {
+                        let after = drv_feel.rate(w.at, t);
+                        if snifrig_fix::drivers::worse(b, after) {
+                            add_card(dir, "drivers_slower", "snifrig", "drivers_slower", &format!("Since the driver update{} ({}), your PC felt slow {:.0}% of the time, up from {:.0}% the day before. Take {} back?",
+                                if w.ids.len() == 1 { "" } else { "s" }, w.titles, after.1 * 100.0, b.1 * 100.0, if w.ids.len() == 1 { "it" } else { "them" }));
+                        } else if t - w.at > 3.0 * 86400.0 { let _ = std::fs::remove_file(dir.join(snifrig_fix::drivers::WATCH)); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if n % 3600 == 2700 && sys::idle_secs() > 600.0 && gov.game.is_none() && !sys::fullscreen_d3d() {
+            let fresh = snifrig_fix::drivers::load(dir).map_or(false, |s| now_unix() - (s.unix as f64) < 20.0 * 3600.0);
+            if !fresh && license::status(dir).licensed { let d = dir.to_path_buf(); std::thread::spawn(move || drivers_check(&d)); }
         }
         if n % 3600 == 900 { let f = snifrig_fix::junk::purge_old(dir); if f > 0 { note(dir, "junk:purge", "done", &format!("emptied {} of cleanups older than 7 days from quarantine", snifrig_fix::junk::human(f))); } }
         if n % 3600 == 1800 && !license::status(dir).licensed {
@@ -1854,6 +2031,16 @@ fn main() {
             out(snifrig_fix::junk::restore(&dir, b).map(|(back, failed)| { let _ = snifrig_fix::junk::scan(&dir); format!("put back {} item{}{}", back, if back == 1 { "" } else { "s" }, if failed > 0 { format!(" ({} could not go back: something is in their place now)", failed) } else { String::new() }) }))
         }
         ["junk", "empty-bin"] => out(if snifrig_fix::junk::empty_recycle_bin() { let _ = snifrig_fix::junk::scan(&dir); Ok("the Recycle Bin is empty".into()) } else { Err("Windows did not empty the Recycle Bin".into()) }),
+        ["drivers"] | ["drivers", "scan"] => out(snifrig_fix::drivers::scan(&dir).map(|s| snifrig_fix::drivers::summary(&s, snifrig_fix::drivers::gpu_choice(&dir)).join("\n"))),
+        ["drivers", "gpu", c @ ("newest" | "stay")] => { let _ = std::fs::write(dir.join(snifrig_fix::drivers::GPU_CHOICE), c); println!("{}", if *c == "stay" { "snifrig keeps your current graphics driver" } else { "snifrig keeps your graphics driver up to date" }); }
+        ["drivers", "update", "now", ids @ ..] if !ids.is_empty() => out(drivers_update(&dir, ids, true)),
+        ["drivers", "update", ids @ ..] if !ids.is_empty() => out(drivers_update(&dir, ids, false)),
+        ["drivers", "run"] => out(drivers_run(&dir)),
+        ["drivers", "rollback", ids @ ..] if !ids.is_empty() => out(drivers_rollback(&dir, ids)),
+        ["drivers", "keep"] => { let _ = std::fs::remove_file(dir.join(snifrig_fix::drivers::WATCH)); println!("ok, the driver updates stay"); }
+        ["drivers", "not-now"] => { let s = snifrig_fix::drivers::load(&dir).unwrap_or_default(); snifrig_fix::drivers::hold(&dir, &s.updates.iter().map(|u| u.id.clone()).collect::<Vec<_>>()); println!("ok, snifrig will not offer these updates again (newer ones are offered)"); }
+        ["drivers", "status"] => { let l = std::fs::read_to_string(admin_state().join("drivers-install.log")).unwrap_or_default(); let v: Vec<&str> = l.lines().collect(); println!("{}", if v.is_empty() { "no driver installs yet".to_string() } else { v[v.len().saturating_sub(15)..].join("\n") }); }
+        ["drivers", "check"] => drivers_check(&dir),
         ["frames"] | ["frames", "status"] => println!("{}", if dir.join("frames-on").exists() { "frame measuring is on (snifrig-frames runs from the scheduled task 'snifrig frames')" } else { "frame measuring is off. snifrig-fix frames on turns it on (Windows asks once)." }),
         ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: snifrig holds off for 2 minutes now, to compare"); }
         ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }

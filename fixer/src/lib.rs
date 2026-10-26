@@ -32,6 +32,7 @@ pub mod impact;
 pub mod game;
 pub mod junk;
 pub mod disk;
+pub mod drivers;
 
 /// What the fixer can do, mildest first.
 #[derive(Clone, Debug, PartialEq)]
