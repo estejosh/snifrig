@@ -6,6 +6,8 @@ What the AI can do:
 
 | Tool | What it does | Needs |
 | --- | --- | --- |
+| `snifrig_install_status` | Is snifrig installed, license accepted, monitor running | free |
+| `snifrig_install` | Opens snifrig's setup window (you accept the license there yourself) | free |
 | `snifrig_status` | Headline, causes, live CPU/RAM, GPU, what the governor is easing | free |
 | `snifrig_why_slow` | snifrig's own diagnosis | free |
 | `snifrig_report` | Slowdown, alert and leak summary for N days | free |
@@ -20,9 +22,20 @@ The AI cannot change anything. There is no tool that applies a fix, approves a p
 
 The server reads `%LOCALAPPDATA%\snifrig` (override with `--dir PATH`) and runs `snifrig.exe` and `snifrig-fix.exe` from its own folder (normally `%LOCALAPPDATA%\snifrig\bin`).
 
+## Install snifrig from your AI app
+
+The Claude Desktop extension carries snifrig itself (`server\snifrig-setup.exe`), so a new user needs only the extension:
+
+1. Double-click `snifrig.mcpb` and click Install in Claude Desktop.
+2. Ask Claude: "install snifrig" (or "why is my PC slow?": Claude sees snifrig is missing and offers).
+3. Claude calls `snifrig_install`, which opens the snifrig setup window. You read the license and type the acceptance line there. Claude cannot accept it for you.
+4. Setup installs for your Windows user only: no administrator rights, no download, nothing sent anywhere. It starts snifrig and adds it to Settings > Apps for uninstalling.
+
+Any other MCP client works the same way if `snifrig-setup.exe` sits next to `snifrig-mcp.exe`.
+
 ## Claude Desktop
 
-Build `snifrig.mcpb` with `claude-desktop\build-extension.ps1` (needs Node.js; it copies `snifrig-mcp.exe` into `server\` and runs `npx -y @anthropic-ai/mcpb pack`). Then double-click `snifrig.mcpb` and click Install.
+Build `snifrig.mcpb` with `claude-desktop\build-extension.ps1` (needs Node.js; build `setup` first so `snifrig-setup.exe` goes in too; it copies `snifrig-mcp.exe` into `server\` and runs `npx -y @anthropic-ai/mcpb pack`). Then double-click `snifrig.mcpb` and click Install.
 
 ## Claude Code
 

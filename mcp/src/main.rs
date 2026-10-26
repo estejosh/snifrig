@@ -14,9 +14,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SUPPORTED: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const INSTRUCTIONS: &str = "snifrig can explain why this PC is slow and suggest changes; the user approves every change in snifrig. \
 There is no tool that applies fixes, approves pending fixes, or edits rules. Start with snifrig_status, then snifrig_why_slow, \
-snifrig_top_processes and snifrig_recent_activity. Use snifrig_suggest to propose a gentle rule (efficiency, background, cap) with a plain-words reason; never propose closing apps the user is using.";
+snifrig_top_processes and snifrig_recent_activity. If snifrig is not installed yet, snifrig_install opens its setup window; \
+the person accepts the license there themselves (never type or click it for them). Use snifrig_suggest to propose a gentle rule (efficiency, background, cap) with a plain-words reason; never propose closing apps the user is using.";
 
 const TOOLS_JSON: &str = r##"[
+{"name":"snifrig_install_status","description":"Is snifrig installed for this Windows user, is its license accepted, is the monitor running, and is a setup program included with this extension. Read-only. Use it first when snifrig_status says snifrig is not installed.","inputSchema":{"type":"object","properties":{}}},
+{"name":"snifrig_install","description":"Install (or update) snifrig on this PC: opens snifrig's setup window on the person's screen. No administrator rights, no download (the setup ships with this extension), installs for this Windows user only. The person must read and accept the license in that window themselves; you cannot accept it for them and must not type or click it for them. Ask the person before calling this.","inputSchema":{"type":"object","properties":{}}},
 {"name":"snifrig_status","description":"Start here. One-screen summary of this Windows PC right now: snifrig's plain-English headline and likely causes, whether the monitor and fixer are running, fixer mode, whether snifrig fix is licensed, live CPU % and RAM, GPU, apps the governor is currently easing, performance-mode game, and how many fixes await the user's OK. Read-only.","inputSchema":{"type":"object","properties":{}}},
 {"name":"snifrig_why_slow","description":"Runs snifrig's own diagnosis (`snifrig why`) and returns its explanation of why the PC is slow or laggy right now, based on its recent measurements (paging, commit, CPU, pool leaks, spawn churn). Read-only.","inputSchema":{"type":"object","properties":{}}},
 {"name":"snifrig_report","description":"Runs `snifrig report` and returns a summary of slowdowns, alerts and leak findings over the last N days. Read-only.","inputSchema":{"type":"object","properties":{"days":{"type":"number","description":"How many days back to cover (default 7, 1-90)."}}}},
@@ -101,6 +104,9 @@ fn call(params: Option<&J>, cx: &Ctx) -> Result<J, (i32, String)> {
     let empty = J::Obj(vec![]);
     let args = p.get("arguments").unwrap_or(&empty);
     let r = match name {
+        "snifrig_install_status" => Ok(install_status(cx)),
+        "snifrig_install" => install(cx),
+        "snifrig_status" if !installed(cx) => Ok("snifrig is not installed on this PC yet. Ask the person whether to install it; snifrig_install opens its setup (free monitor, no administrator rights, no download).".into()),
         "snifrig_status" => Ok(status(cx)),
         "snifrig_why_slow" => run_tool(cx, "snifrig.exe", &["why"]),
         "snifrig_report" => {
@@ -251,6 +257,53 @@ fn run_tool(cx: &Ctx, name: &str, args: &[&str]) -> Result<String, String> {
     } else {
         Err(format!("{name} exited with code {:?}.\n{}", code, text))
     }
+}
+
+
+// ---------- installing snifrig from the AI client ----------
+
+/// The setup program shipped beside this server (in the Claude Desktop extension it sits in
+/// server\). It carries every snifrig program, so installing needs no download.
+fn bundled_setup() -> Option<PathBuf> {
+    exe_dir().map(|d| d.join("snifrig-setup.exe")).filter(|p| p.exists())
+}
+
+fn installed(cx: &Ctx) -> bool { cx.dir.join("bin").join("snifrig.exe").exists() || cx.dir.join("status.json").exists() }
+
+fn install_status(cx: &Ctx) -> String {
+    let mut o = String::new();
+    if installed(cx) {
+        let accepted = read(cx, "license-accepted.json").map_or(false, |s| s.contains("\"license\""));
+        let fresh = fs::metadata(cx.dir.join("status.json")).and_then(|m| m.modified()).ok()
+            .and_then(|m| m.elapsed().ok()).map_or(false, |e| e < Duration::from_secs(300));
+        o += &format!("snifrig is installed for this Windows user ({}).\n", cx.dir.join("bin").display());
+        o += &format!("License accepted: {}.\n", if accepted { "yes" } else { "no (the person accepts it in the setup window)" });
+        o += &format!("Monitor running: {}.\n", if fresh { "yes" } else { "not right now (it starts at login; snifrig_install can start setup again)" });
+        o += "snifrig fix (the paid fixer) is set up separately in the snifrig window.\n";
+    } else {
+        o += "snifrig is not installed for this Windows user yet.\n";
+    }
+    o += &match bundled_setup() {
+        Some(p) => format!("Setup for snifrig {} is included with this extension ({}); snifrig_install opens it.", VERSION, p.display()),
+        None => "No setup program is included here. Download snifrig-setup.exe from https://github.com/estejosh/snifrig/releases and run it.".into(),
+    };
+    o
+}
+
+/// Opens the setup window on the person's screen. The license step is theirs: they read it and
+/// type the acceptance themselves. Nothing here accepts it for them.
+fn install(cx: &Ctx) -> Result<String, String> {
+    let setup = bundled_setup().ok_or("No setup program is included with this extension. The person can download snifrig-setup.exe from https://github.com/estejosh/snifrig/releases and run it.")?;
+    // `start` gives setup its own console window, so the person types in it (this server's
+    // pipes to the AI client are not passed on).
+    let mut cmd = Command::new("cmd.exe");
+    cmd.args(["/d", "/c", "start", "snifrig setup"]).arg(&setup).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x08000000);
+    let st = cmd.status().map_err(|e| format!("could not open snifrig setup: {e}"))?;
+    if !st.success() { return Err("Windows did not open the snifrig setup window.".into()); }
+    Ok(format!("The snifrig {} setup window is now open on the screen{}. Tell the person: it shows the license (Usufruct License 3.7; the monitor is free), and they type the acceptance line in that window themselves. You must not type or click it for them. Setup needs no administrator rights and no download; it installs for this Windows user only, starts snifrig, and adds it to Settings > Apps for uninstalling. When they say it is done, call snifrig_install_status, then snifrig_status.",
+        VERSION, if installed(cx) { " (snifrig is already installed: this updates it)" } else { "" }))
 }
 
 // ---------- tools ----------
@@ -683,7 +736,12 @@ mod tests {
         rpc(&cx, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
         let r = rpc(&cx, r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#);
         let tools = r.get("result").unwrap().get("tools").unwrap().arr().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
+        // Not installed (no bin\snifrig.exe here): status says so and points at snifrig_install.
+        let s = text(&rpc(&cx, r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"snifrig_status"}}"#));
+        assert!(s.contains("not installed") && s.contains("snifrig_install"), "{s}");
+        let s = text(&rpc(&cx, r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"snifrig_install_status"}}"#));
+        assert!(s.contains("not installed"), "{s}");
         let r = rpc(&cx, r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"zzz"}}"#);
         assert!(r.get("error").is_some());
     }

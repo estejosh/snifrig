@@ -24,6 +24,9 @@ try {
   New-Item -ItemType Directory $stage\server | Out-Null
   Copy-Item manifest.json, icon.png $stage
   Copy-Item server\snifrig-mcp.exe $stage\server
+  # snifrig itself, so Claude can install it: snifrig-setup.exe carries every program.
+  $setup = @("$here\..\..\setup\target\release\snifrig-setup.exe", "$here\..\..\target\release\snifrig-setup.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($setup) { Copy-Item $setup $stage\server\snifrig-setup.exe } else { Write-Host 'snifrig-setup.exe not found (build setup first): the extension will not be able to install snifrig' }
   npx -y @anthropic-ai/mcpb pack $stage "$here\snifrig.mcpb"
   if (Test-Path "$here\snifrig.mcpb") { Write-Host "Built $here\snifrig.mcpb" } else { throw 'pack did not produce snifrig.mcpb' }
 } finally { Pop-Location }

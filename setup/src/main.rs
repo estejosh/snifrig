@@ -4,7 +4,7 @@
 //! %LOCALAPPDATA%\\snifrig\\bin, starts them, and adds snifrig to Settings > Apps for uninstalling.
 use std::path::PathBuf;
 
-const FILES: [(&str, &[u8]); 6] = [
+const FILES: [(&str, &[u8]); 7] = [
     ("snifrig.exe", include_bytes!("../../target/release/snifrig.exe")),
     ("snifrigd.exe", include_bytes!("../../target/release/snifrigd.exe")),
     ("snifrig-tray.exe", include_bytes!("../../target/release/snifrig-tray.exe")),
