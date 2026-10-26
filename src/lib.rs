@@ -858,7 +858,9 @@ fn install(dir: &PathBuf, given: Option<String>) {
     // The frame-rate helper (opt-in; only used after `snifrig-fix frames on`).
     let frs = sd.join("snifrig-frames.exe");
     if frs.exists() && frs != bin.join("snifrig-frames.exe") {
-        if let Err(e) = fs::copy(&frs, bin.join("snifrig-frames.exe")) { eprintln!("could not copy snifrig-frames.exe (turn frame measuring off and run install again): {}", e); }
+        // An older frame helper may still be running from here: then the new one waits beside it
+        // and snifrig-fix frames on puts it in place.
+        if fs::copy(&frs, bin.join("snifrig-frames.exe")).is_err() { let _ = fs::copy(&frs, bin.join("snifrig-frames.exe.new")); }
     }
     let msrc = sd.join("snifrig-mcp.exe");
     if msrc.exists() && msrc != bin.join("snifrig-mcp.exe") {

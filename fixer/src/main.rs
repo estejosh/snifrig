@@ -732,7 +732,8 @@ fn helpers_setup(dir: &Path, frames: bool, drivers: bool) -> Result<(), String> 
     let src = dir.join("helpers-src");
     std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
     if frames {
-        let exe = dir.join("bin").join("snifrig-frames.exe");
+        let newer = dir.join("bin").join("snifrig-frames.exe.new");
+        let exe = if newer.exists() { newer } else { dir.join("bin").join("snifrig-frames.exe") };
         if !exe.exists() { return Err(format!("{} is missing; install snifrig again", exe.display())); }
         std::fs::copy(&exe, src.join("snifrig-frames.exe")).map_err(|e| e.to_string())?;
     }
@@ -752,6 +753,7 @@ fn helpers_setup(dir: &Path, frames: bool, drivers: bool) -> Result<(), String> 
     let _ = std::fs::remove_dir_all(&src);
     if !st.success() || r.is_empty() { return Err("the Windows confirmation was cancelled".into()); }
     if !r.trim_start_matches('\u{feff}').trim().starts_with("ok") { return Err(r.trim().to_string()); }
+    let _ = std::fs::remove_file(dir.join("bin").join("snifrig-frames.exe.new"));
     if drivers { let _ = std::fs::write(dir.join("drivers-helper-on"), "1"); } else { let _ = std::fs::remove_file(dir.join("drivers-helper-on")); }
     Ok(())
 }
