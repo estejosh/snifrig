@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "snifrig",
   "display_name": "snifrig",
-  "version": "0.4.0-beta.1",
+  "version": "0.4.0-beta.2",
   "description": "Install snifrig and ask Claude why your Windows PC is slow. snifrig reads its own measurements, explains the cause, and suggests fixes that you approve in snifrig.",
   "long_description": "snifrig watches your PC for memory leaks, runaway apps and Windows slowdowns. This extension includes snifrig itself: if it is not on your PC yet, Claude can open its setup for you (no administrator rights, no download; you accept the license in the setup window yourself). It also lets Claude read what snifrig sees (status, live processes, alerts, recent fixes) and explain why the PC is slow. Claude can suggest a gentle change, such as putting a background app in efficiency mode, but it can never apply one: every suggestion waits for your OK in the snifrig window. Reading is free; suggestions need snifrig fix.",
   "author": {

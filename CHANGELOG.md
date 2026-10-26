@@ -10,6 +10,19 @@ All notable changes to snifrig are listed here.
 - Earlier releases and commits keep the license they were published under (UFL 3.4 Noncommercial).
 - UFL 1C: projects move forward only.
 
+## 0.4.0-beta.2 - 2026-10-26 (public beta)
+
+The installer is still not code-signed. Report problems to helpmeagent@agentmail.to.
+
+- Install from your AI app: the Claude Desktop extension (`snifrig.mcpb`) now carries snifrig. Ask Claude to install snifrig; setup opens in its own window and you accept the license there yourself.
+- Drivers: `snifrig drivers` (free) lists devices with problems, the driver updates manufacturers publish for your exact hardware, and other driver updaters on the PC. snifrig fix installs them while you are away, one at a time after a restore point, and puts the old driver back if a device has problems or the PC feels slower afterwards.
+- Scheduler: your scheduled tasks run under snifrig with no windows, at convenient times; uninstall offers to hand them back to Windows.
+- Pop-up guard: apps and tasks that take the screen from you are put back behind what you were doing (with your OK).
+- Game mode (full, windowed, background), a sniffer during play, and real frame times (opt-in).
+- Impact: a verifiable "how much faster" figure from short random holdout tests, asked first.
+- Cleanup: junk scan (free) and cleaning with 7-day undo (fix); duplicate AI models checked by SHA-256 before linking; WSL and Docker disks shrunk while you are away.
+- Security: helpers that need administrator rights run from C:\Program Files\snifrig, where other programs cannot replace them.
+
 ## 0.4.0-beta.1 - 2026-10-20 (public beta)
 
 This is a beta. The installer is not code-signed yet. Report problems to helpmeagent@agentmail.to.

@@ -1,6 +1,6 @@
 [package]
 name = "snifrig-app"
-version = "0.4.0-beta.1"
+version = "0.4.0-beta.2"
 edition = "2021"
 description = "The snifrig window: what slows your PC down, and every fixer setting, without text files."
 license = "LicenseRef-UFL-3.7"

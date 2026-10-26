@@ -1,7 +1,7 @@
 {
   "name": "snifrig",
   "displayName": "snifrig",
-  "version": "0.4.0-beta.1",
+  "version": "0.4.0-beta.2",
   "description": "Diagnose a slow Windows PC with snifrig: status, live processes, alerts, and suggested fixes that the user approves in snifrig.",
   "author": {
     "name": "estejosh",
