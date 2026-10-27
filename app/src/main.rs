@@ -547,7 +547,7 @@ impl App {
                 let ends = p.action == "terminate" || p.action.starts_with("restart");
                 if ends {
                     if ui.add(egui::Button::new(RichText::new("Rein it in").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("Keep it running, but slower and with less memory").clicked() {
-                        self.run("snifrig-fix.exe", vec!["ease".into(), p.id.clone()], &format!("{} is reined in: efficiency mode, lower priority, memory trimmed.", p.name));
+                        self.run("snifrig-fix.exe", vec!["ease".into(), p.id.clone(), p.name.clone(), p.pid.to_string()], &format!("{} is reined in: efficiency mode, lower priority, memory trimmed.", p.name));
                         self.snoozed.push(p.id.clone());
                     }
                     if ui.button(action_label(&p.action)).clicked() {
@@ -1441,7 +1441,7 @@ impl App {
             egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
                 for e in evs.iter().take(400) {
                     ui.horizontal(|ui| {
-                        let c = match e.status.as_str() { "done" => GOOD, "failed" => BAD, "refused" => WARN, "queued" => ACCENT, _ => MUTED };
+                        let c = match e.status.as_str() { "done" => GOOD, "failed" => BAD, "refused" | "partial" => WARN, "queued" => ACCENT, _ => MUTED };
                         ui.label(RichText::new(local_time(e.unix, true)).size(12.5).color(MUTED).monospace());
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                         ui.painter().circle_filled(r.center(), 4.0, c);

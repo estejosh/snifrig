@@ -215,26 +215,59 @@ fn approve(dir: &Path, id: &str) -> Result<String, String> {
     r
 }
 
+/// Windows' refusal in plain words.
+fn plain_err(e: &str) -> String {
+    if e.ends_with("failed: 5") || e.ends_with("error 5") { "Windows refused: it runs with more rights than snifrig (as administrator, or protected)".into() }
+    else if e.ends_with("failed: 87") || e.ends_with("error 87") { "it had just exited".into() }
+    else { e.to_string() }
+}
+
+/// The process to act on: the same pid if it is still that app, else the busiest copy of the app
+/// (apps such as browsers restart their processes, so the pid in a question goes stale).
+fn find_target(pid: u32, name: &str) -> Option<Target> {
+    proc::target(pid).filter(|t| t.name.eq_ignore_ascii_case(name)).or_else(|| {
+        sys::snapshot(&mut Vec::new()).into_iter().filter(|p| p.name.eq_ignore_ascii_case(name)).filter_map(|p| proc::target(p.pid))
+            .max_by(|a, b| a.private_mb.total_cmp(&b.private_mb))
+    })
+}
+
 /// "Rein it in" instead of ending or restarting: efficiency mode, below-normal priority, memory trimmed.
-fn ease(dir: &Path, id: &str) -> Result<String, String> {
-    if now_unix() < ledger::paused_until(dir) { return Err("fixing is paused".into()); }
+/// Works even when the question was already withdrawn (the window passes the app's name and pid).
+/// If nothing could be changed, the question comes back so you can choose something else; the
+/// failure is recorded with the reason, like every failed command (see `out` in main).
+fn ease(dir: &Path, id: &str, name: Option<&str>, pid: Option<u32>) -> Result<String, String> {
+    if now_unix() < ledger::paused_until(dir) { return Err("could not rein it in: fixing is paused".into()); }
     let mut items = ledger::load_pending(dir);
-    let i = items.iter().position(|x| x.id == id).ok_or("no pending fix with that id")?;
-    let item = items.remove(i);
-    ledger::save_pending(dir, &items);
-    let alert = snifrig_fix::Alert { t: String::new(), key: item.key.clone(), msg: item.msg.clone() };
-    let t = proc::target(item.pid).filter(|t| t.name.eq_ignore_ascii_case(&item.name))
-        .ok_or_else(|| format!("{} (pid {}) is no longer running", item.name, item.pid))?;
-    if let Some(why) = snifrig_fix::policy::denied(&t, &Action::LowerPriority, &ledger::read_list(dir, "fix-deny.txt")) { return Err(why); }
-    let mut done = Vec::new();
-    if sys::set_efficiency(t.pid, true).is_ok() { done.push("efficiency mode"); }
-    if sys::set_priority(t.pid, sys::BELOW_NORMAL).is_ok() { done.push("below-normal priority"); }
-    if actions::run(&Action::Trim, &t).is_ok() { done.push("memory trimmed"); }
-    if done.is_empty() { return Err(format!("could not change {}", t.name)); }
-    let note = format!("reined in at your request instead of {}: {}", item.action, done.join(", "));
-    ledger::record(dir, &alert, &Action::LowerPriority, Some(&t), "done", &note);
-    learn::append_feedback(dir, &Feedback::new("dismiss", "fix", &item.action, &item.name));
-    Ok(format!("{}: {}", t.name, done.join(", ")))
+    let item = match items.iter().position(|x| x.id == id) {
+        Some(i) => { let it = items.remove(i); ledger::save_pending(dir, &items); Some(it) }
+        None => None,
+    };
+    let (name, pid) = match (&item, name) {
+        (Some(it), _) => (it.name.clone(), it.pid),
+        (None, Some(n)) => (n.to_string(), pid.unwrap_or(0)),
+        (None, None) => return Err("could not rein it in: that question was already answered or withdrawn".into()),
+    };
+    let put_back = |dir: &Path| if let Some(it) = &item { let mut v = ledger::load_pending(dir); if !v.iter().any(|x| x.id == it.id) { v.push(it.clone()); ledger::save_pending(dir, &v); } };
+    let Some(t) = find_target(pid, &name) else {
+        let there = sys::snapshot(&mut Vec::new()).iter().any(|p| p.name.eq_ignore_ascii_case(&name));
+        return Err(format!("could not rein in {}: {}", name, if there { "Windows would not let snifrig open it (it runs with more rights than snifrig, or is protected)" } else { "it is no longer running" }));
+    };
+    if let Some(why) = snifrig_fix::policy::denied(&t, &Action::LowerPriority, &ledger::read_list(dir, "fix-deny.txt")) { return Err(format!("could not rein in {}: {}", name, why)); }
+    let (mut done, mut failed) = (Vec::new(), Vec::new());
+    match sys::set_efficiency(t.pid, true) { Ok(_) => done.push("efficiency mode"), Err(e) => failed.push(format!("efficiency mode ({})", plain_err(&e))) }
+    match sys::set_priority(t.pid, sys::BELOW_NORMAL) { Ok(_) => done.push("below-normal priority"), Err(e) => failed.push(format!("priority ({})", plain_err(&e))) }
+    match actions::run(&Action::Trim, &t) { Ok(_) => done.push("memory trimmed"), Err(e) => failed.push(format!("memory trim ({})", plain_err(&e))) }
+    let key = item.as_ref().map(|i| i.key.clone()).unwrap_or_else(|| format!("ease:{}", name));
+    let alert = snifrig_fix::Alert { t: String::new(), key, msg: item.as_ref().map(|i| i.msg.clone()).unwrap_or_default() };
+    if done.is_empty() {
+        put_back(dir);
+        return Err(format!("could not rein in {} (pid {}): {}", t.name, t.pid, failed.join("; ")));
+    }
+    let instead = item.as_ref().map(|i| format!(" instead of {}", i.action)).unwrap_or_default();
+    let note = format!("reined in at your request{}: {}{}", instead, done.join(", "), if failed.is_empty() { String::new() } else { format!("; not done: {}", failed.join("; ")) });
+    ledger::record(dir, &alert, &Action::LowerPriority, Some(&t), if failed.is_empty() { "done" } else { "partial" }, &note);
+    if let Some(i) = &item { learn::append_feedback(dir, &Feedback::new("dismiss", "fix", &i.action, &i.name)); }
+    Ok(format!("{}: {}{}", t.name, done.join(", "), if failed.is_empty() { String::new() } else { format!(" (not done: {})", failed.join("; ")) }))
 }
 
 // ---- Heavy loads the governor cannot turn down ----
@@ -1951,7 +1984,20 @@ fn main() {
             std::process::exit(2);
         }
     }
-    let out = |r: Result<String, String>| match r { Ok(m) => println!("{}", m), Err(e) => { eprintln!("{}", e); std::process::exit(1) } };
+    // Every command that fails is recorded (Activity in the window, fixes.jsonl), not just shown once.
+    // The command's name, without ids or paths ("ease", "drivers update", "jobs run").
+    let what = cmd.iter().take(2).enumerate().filter(|(i, w)| *i == 0 || w.chars().all(|c| c.is_ascii_lowercase() || c == '-')).map(|(_, w)| *w).collect::<Vec<_>>().join(" ");
+    let out = |r: Result<String, String>| match r {
+        Ok(m) => println!("{}", m),
+        Err(e) => {
+            if !what.is_empty() {
+                let alert = snifrig_fix::Alert { t: String::new(), key: format!("cmd:{}", what), msg: e.clone() };
+                ledger::record(&dir, &alert, &Action::Report, None, "failed", &format!("{} failed: {}", what, e));
+            }
+            eprintln!("{}", e);
+            std::process::exit(1)
+        }
+    };
     if help { println!("{}", USAGE); return; }
     match cmd.as_slice() {
         ["brain", name] => {
@@ -1962,7 +2008,8 @@ fn main() {
                 format!("{}: kind {} (confidence {:.2}), importance {:.2} -> weight {:.1}, deepest level {}", name, v.kind, v.confidence, v.importance, w, max)
             }))
         }
-        ["ease", id] => out(ease(&dir, id)),
+        ["ease", id] => out(ease(&dir, id, None, None)),
+        ["ease", id, name, pid] => out(ease(&dir, id, Some(name), pid.parse().ok())),
         ["feel", w @ ("slow" | "fine")] => out(feel_cmd(&dir, *w == "slow")),
         ["desktop", w @ ("restart" | "no")] => out(desktop(&dir, *w == "restart")),
         ["unlearn", name, action] => out(unlearn(&dir, name, action)),
