@@ -337,7 +337,9 @@ impl Enforcer {
             }
             let (pid, created) = key;
             let mut apply = |kind: &'static str, note: String, f: &dyn Fn() -> Result<(), String>| {
-                let result = if !acting { Ok(()) } else if !sys::image_matches(pid, created, &p.name) { Err("pid reused".to_string()) } else { f() };
+                // Gone already (short-lived tools such as git finish in milliseconds): nothing to do, and not a failure.
+                if acting && !sys::image_matches(pid, created, &p.name) { return; }
+                let result = if !acting { Ok(()) } else { f() };
                 out.push(Applied { pid, name: p.name.clone(), kind, note, result });
             };
             for r in matching {
