@@ -1,7 +1,7 @@
 name: build
 on:
   push:
-    branches: [main]
+    branches: [main, linux-port]
   pull_request:
 jobs:
   windows:
@@ -16,3 +16,18 @@ jobs:
             target/release/snifrig.exe
             target/release/snifrigd.exe
             target/release/snifrig-tray.exe
+  linux:
+    # The window (app) needs desktop libraries and comes in a later step; everything else builds
+    # and is tested here on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test -p snifrig-fix -p snifrig -p snifrig-mcp
+      - run: cargo build --release -p snifrig -p snifrig-mcp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snifrig-linux-x86_64
+          path: |
+            target/release/snifrig
+            target/release/snifrigd
+            target/release/snifrig-mcp

@@ -286,6 +286,21 @@ pub fn scan(dir: &Path) -> u64 {
 // ---------------- cleanup (snifrig fix) ----------------
 
 /// Where a file goes when it is cleaned: a quarantine on the same drive, so moving is instant.
+/// Linux: the same filesystem as snifrig's folder uses its quarantine; another filesystem gets
+/// `.snifrig-quarantine` at its own mount point, so a move never copies across disks.
+#[cfg(not(windows))]
+pub fn quarantine_root(dir: &Path, file: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| p.ancestors().find_map(|a| std::fs::symlink_metadata(a).ok()).map(|m| m.dev());
+    let (fd, hd) = (dev(file), dev(dir));
+    if fd.is_none() || fd == hd { return dir.join("quarantine"); }
+    // the top of the file's filesystem: the last ancestor still on the same device
+    let mut top = file.to_path_buf();
+    for a in file.ancestors().skip(1) { if dev(a) == fd { top = a.to_path_buf(); } else { break; } }
+    top.join(".snifrig-quarantine")
+}
+
+#[cfg(windows)]
 pub fn quarantine_root(dir: &Path, file: &Path) -> PathBuf {
     let drive = file.components().next().map(|c| c.as_os_str().to_string_lossy().to_uppercase()).unwrap_or_default();
     let home = dir.components().next().map(|c| c.as_os_str().to_string_lossy().to_uppercase()).unwrap_or_default();
@@ -295,7 +310,7 @@ pub fn quarantine_root(dir: &Path, file: &Path) -> PathBuf {
 /// Pure: where `file` lands inside a batch folder (its full path kept, drive letter as a folder).
 pub fn landing(batch_dir: &Path, file: &Path) -> PathBuf {
     let s = file.display().to_string().replacen(':', "", 1);
-    batch_dir.join(s.trim_start_matches('\\'))
+    batch_dir.join(s.trim_start_matches(['\\', '/']))
 }
 
 /// Move the files of these categories (ids from the report) to quarantine. Returns
@@ -409,6 +424,14 @@ pub fn human(b: u64) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
+    #[test]
+    fn landing_keeps_the_path_linux() {
+        assert_eq!(landing(Path::new("/home/a/.local/state/snifrig/quarantine/123"), Path::new("/home/a/proj/target")),
+            PathBuf::from("/home/a/.local/state/snifrig/quarantine/123/home/a/proj/target"));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn landing_keeps_the_path() {
         let l = landing(Path::new("X:\\.snifrig-quarantine\\123"), Path::new("X:\\proj\\target"));

@@ -229,7 +229,11 @@ pub fn same_bytes(a: &Path, b: &Path) -> bool {
 #[derive(Clone, Debug)]
 pub struct Group { pub size: u64, pub files: Vec<PathBuf>, pub reclaim: u64, pub cross_drive: bool }
 
+#[cfg(windows)]
 fn drive(p: &Path) -> String { p.components().next().map(|c| c.as_os_str().to_string_lossy().to_uppercase()).unwrap_or_default() }
+/// Linux: the filesystem a file lives on (hard links only work within one).
+#[cfg(not(windows))]
+fn drive(p: &Path) -> String { use std::os::unix::fs::MetadataExt; std::fs::metadata(p).map(|m| m.dev().to_string()).unwrap_or_default() }
 
 /// Group model files that are likely the same (size + fingerprint), counting hard-linked
 /// copies once. `reclaim` is what linking same-drive copies would free.
@@ -469,9 +473,9 @@ mod tests {
 
     #[test]
     fn checksum_decides_which_copy_is_right() {
-        let (a, c) = (PathBuf::from("X:\\hone\\m.gguf"), PathBuf::from("X:\\dl\\m.gguf"));
+        let (a, c) = (PathBuf::from("X:/hone/m.gguf"), PathBuf::from("X:/dl/m.gguf"));
         let good = "a".repeat(64);
-        let b = PathBuf::from(format!("X:\\ollama\\models\\blobs\\sha256-{}", good));
+        let b = PathBuf::from(format!("X:/ollama/models/blobs/sha256-{}", good));
         assert_eq!(expected_sha(&b), Some(good.clone()));
         // all the same: the copy proven by its own name is kept even though another is older
         match verdict(&[(a.clone(), good.clone(), None), (b.clone(), good.clone(), Some(good.clone()))]).unwrap() {
@@ -486,7 +490,7 @@ mod tests {
         // they differ and nothing proves either: ask, change nothing
         assert!(matches!(verdict(&[(a.clone(), "b".repeat(64), None), (c.clone(), good.clone(), None)]).unwrap(), Verdict::Unclear(_)));
         // a copy that fails its own checksum is never the one kept
-        let bad = PathBuf::from(format!("X:\\ollama\\models\\blobs\\sha256-{}", "c".repeat(64)));
+        let bad = PathBuf::from(format!("X:/ollama/models/blobs/sha256-{}", "c".repeat(64)));
         match verdict(&[(bad.clone(), good.clone(), Some("c".repeat(64))), (a.clone(), good.clone(), None)]).unwrap() {
             Verdict::Same { keep, .. } => assert_eq!(keep, a),
             v => panic!("{:?}", v),
