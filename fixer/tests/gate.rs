@@ -1,3 +1,5 @@
+// The license gate of the snifrig-fix program (Windows for now; the Linux program comes with the desktop step).
+#![cfg(windows)]
 //! Hard gate: the built snifrig-fix binary must not run without a valid key and a recorded acceptance.
 use std::path::PathBuf;
 use std::process::{Command, Output};
