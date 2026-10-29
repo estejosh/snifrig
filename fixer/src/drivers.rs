@@ -121,7 +121,7 @@ pub fn problem_text(code: u32) -> &'static str {
 
 /// Run the scan (read-only, no administrator rights, low priority) and read what it found.
 pub fn scan(dir: &Path) -> Result<Scan, String> {
-    use std::os::windows::process::CommandExt;
+    use crate::os_ext::CommandExt;
     let script = dir.join("drivers-scan.ps1");
     std::fs::write(&script, SCAN_PS1).map_err(|e| e.to_string())?;
     let out = dir.join(REPORT);

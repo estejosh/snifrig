@@ -2686,6 +2686,7 @@ name = "snifrig"
 version = "0.4.0-beta.2"
 dependencies = [
  "embed-resource",
+ "libc",
  "windows-sys 0.59.0",
 ]
 
@@ -2705,6 +2706,7 @@ version = "0.4.0-beta.2"
 dependencies = [
  "ed25519-compact",
  "embed-resource",
+ "libc",
  "windows-sys 0.59.0",
 ]
 

@@ -107,7 +107,7 @@ pub unsafe fn show(dir: &Path) {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as *mut _, 0);
     {
         let st = std::fs::read_to_string(dir.join("status.json")).unwrap_or_default();
-        let fresh = crate::flyout::now_s().saturating_sub(num(&st, "unix") as u64) < 180;
+        let fresh = super::flyout::now_s().saturating_sub(num(&st, "unix") as u64) < 180;
         let h = if fresh { st.find("\"headline\":\"").map(|i| st[i + 12..].split('"').next().unwrap_or("").to_string()).unwrap_or_default() } else { String::new() };
         let c = if fresh && !h.is_empty() { snifrig::verdict::causes_from_status(&st) } else { Vec::new() };
         let hx = if h.is_empty() { 0 } else { 8 + 36 + 34 * c.len().min(3) as i32 };

@@ -15,6 +15,7 @@ pub mod policy;
 pub mod proc;
 pub mod sha256;
 pub mod sys;
+pub mod os_ext;
 pub mod governor;
 pub mod slowapp;
 pub mod brain;
@@ -27,6 +28,7 @@ pub mod judge;
 pub mod feel;
 pub mod incident;
 pub mod sched;
+#[cfg(windows)]
 pub mod guard;
 pub mod impact;
 pub mod game;

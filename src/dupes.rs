@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::{cmdline, json_num, script_names, Proc};
+use super::{cmdline, json_num, script_names, Proc};
 
 const EVERY_SECS: f64 = 300.0;
 const REALERT_SECS: f64 = 2.0 * 3600.0;
@@ -326,11 +326,11 @@ pub fn vram_message(used_mb: u64, total_mb: u64) -> Option<String> {
 /// Debug entry point for a live dry run: two samples, prints findings, never acts.
 #[cfg(test)]
 pub fn dry_run() -> Vec<String> {
-    use crate::read_procs;
+    use super::read_procs;
     let mut buf = vec![0u8; 1 << 20];
     let mut d = Dupes::new();
     let a = read_procs(&mut buf).unwrap_or_default();
-    let t = crate::now();
+    let t = super::now();
     d.prev_cpu = a.iter().map(|p| (p.pid, p.cpu)).collect();
     std::thread::sleep(std::time::Duration::from_secs(3));
     let b = read_procs(&mut buf).unwrap_or_default();

@@ -35,7 +35,10 @@ fn age_days(m: &std::fs::Metadata, now: f64) -> f64 {
     m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0.0, |d| (now - d.as_secs_f64()) / DAY)
 }
 
+#[cfg(windows)]
 fn is_reparse(m: &std::fs::Metadata) -> bool { use std::os::windows::fs::MetadataExt; m.file_attributes() & 0x400 != 0 }
+#[cfg(not(windows))]
+fn is_reparse(m: &std::fs::Metadata) -> bool { m.file_type().is_symlink() }
 
 /// Every file under `root` (no following of links/junctions), with its size and age in days.
 pub fn walk(root: &Path, mut f: impl FnMut(&Path, u64, f64)) -> bool {
@@ -145,6 +148,12 @@ fn newest_inside(p: &Path, now: f64) -> f64 {
 
 /// Full paths of every running program (lowercase): a build folder or Python environment a
 /// running program lives in is in use, and never offered for cleanup.
+#[cfg(not(windows))]
+pub fn running_paths() -> Vec<String> {
+    std::fs::read_dir("/proc").map(|d| d.flatten().filter_map(|e| std::fs::read_link(e.path().join("exe")).ok()).map(|p| p.display().to_string().to_lowercase()).collect()).unwrap_or_default()
+}
+
+#[cfg(windows)]
 pub fn running_paths() -> Vec<String> {
     #[link(name = "psapi", kind = "raw-dylib")]
     extern "system" { fn EnumProcesses(ids: *mut u32, cb: u32, needed: *mut u32) -> i32; }
@@ -171,8 +180,14 @@ pub fn running_paths() -> Vec<String> {
 }
 
 pub fn find_builds() -> Vec<Build> {
-    let mut roots = vec![env("USERPROFILE")];
-    for l in b'D'..=b'Z' { let r = PathBuf::from(format!("{}:\\", l as char)); if r.is_dir() && drive_fixed(&r) { roots.push(r); } }
+    #[cfg(windows)]
+    let roots = {
+        let mut roots = vec![env("USERPROFILE")];
+        for l in b'D'..=b'Z' { let r = PathBuf::from(format!("{}:\\", l as char)); if r.is_dir() && drive_fixed(&r) { roots.push(r); } }
+        roots
+    };
+    #[cfg(not(windows))]
+    let roots = vec![env("HOME")];
     let skip = ["windows", "program files", "program files (x86)", "programdata", "$recycle.bin", "system volume information", "appdata", ".snifrig-quarantine", "steamlibrary", "steamapps"];
     let t = now();
     let running = running_paths();
@@ -193,7 +208,7 @@ pub fn find_builds() -> Vec<Build> {
                     else { None };
                 if let Some(k) = kind {
                     let age = newest_inside(&p, t);
-                    let inside = format!("{}\\", p.display().to_string().to_lowercase());
+                    let inside = format!("{}{}", p.display().to_string().to_lowercase(), std::path::MAIN_SEPARATOR);
                     if age >= 30.0 && !running.iter().any(|r| r.starts_with(&inside)) { out.push(Build { path: p, kind: k, age_days: age }); }
                     continue; // never look inside a build folder
                 }
@@ -204,6 +219,7 @@ pub fn find_builds() -> Vec<Build> {
     out
 }
 
+#[cfg(windows)]
 fn drive_fixed(root: &Path) -> bool {
     #[link(name = "kernel32", kind = "raw-dylib")]
     extern "system" { fn GetDriveTypeW(root: *const u16) -> u32; }
@@ -211,6 +227,18 @@ fn drive_fixed(root: &Path) -> bool {
     unsafe { GetDriveTypeW(w.as_ptr()) == 3 }
 }
 
+/// The desktop trash (freedesktop.org standard: GNOME, KDE, Xfce and the rest): (bytes, items).
+#[cfg(not(windows))]
+pub fn recycle_bin() -> (u64, u64) {
+    let files = env("HOME").join(".local/share/Trash/files");
+    let (mut bytes, mut items) = (0u64, 0u64);
+    if let Ok(rd) = std::fs::read_dir(&files) {
+        for e in rd.flatten() { items += 1; walk(&e.path(), |_, len, _| bytes += len); if let Ok(m) = e.metadata() { if m.is_file() { bytes += m.len(); } } }
+    }
+    (bytes, items)
+}
+
+#[cfg(windows)]
 pub fn recycle_bin() -> (u64, u64) {
     #[repr(C)] struct Q { cb: u32, size: i64, items: i64 }
     #[link(name = "shell32", kind = "raw-dylib")]
@@ -362,6 +390,10 @@ pub fn purge_old(dir: &Path) -> u64 {
 }
 
 /// Empty the Recycle Bin (no undo; only when you press that button).
+#[cfg(not(windows))]
+pub fn empty_recycle_bin() -> bool { false }
+
+#[cfg(windows)]
 pub fn empty_recycle_bin() -> bool {
     #[link(name = "shell32", kind = "raw-dylib")]
     extern "system" { fn SHEmptyRecycleBinW(h: isize, root: *const u16, flags: u32) -> i32; }

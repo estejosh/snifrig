@@ -60,7 +60,7 @@ impl WslWatch {
         let top: Vec<String> = i.top.iter().map(|(n, g)| format!("[\"{}\",{:.2}]", n.replace('"', ""), g)).collect();
         let line = format!("{{\"t\":\"{}\",\"vm_gb\":{:.2},\"linux_total_gb\":{:.2},\"linux_free_gb\":{:.2},\"cache_gb\":{:.2},\"programs_gb\":{:.2},\"top\":[{}]}}",
             iso(t), vm_gb, i.total_gb, i.free_gb, i.cache_gb, i.anon_gb, top.join(","));
-        crate::append_capped(&dir.join("wsl.jsonl"), &line, CAP);
+        super::append_capped(&dir.join("wsl.jsonl"), &line, CAP);
         if worth && t - self.last_alert >= ALERT_EVERY { self.last_alert = t; return Some(("wsl:mem".into(), msg)); }
         None
     }

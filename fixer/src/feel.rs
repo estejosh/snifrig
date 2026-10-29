@@ -74,7 +74,10 @@ static IN_AT: [AtomicU32; IN_N] = [const { AtomicU32::new(0) }; IN_N];
 static IN_IDX: AtomicUsize = AtomicUsize::new(0);
 static LAST_MOVE: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(windows)]
 fn tick() -> u32 { unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() } }
+#[cfg(not(windows))]
+fn tick() -> u32 { static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new(); T0.get_or_init(Instant::now).elapsed().as_millis() as u32 + 1 }
 
 fn record(event_time: u32) {
     let now = tick();
@@ -103,6 +106,7 @@ fn input_recent(secs: u32) -> (usize, f64) {
     percentile90(d)
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn mouse_hook(code: i32, wp: usize, lp: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, MSLLHOOKSTRUCT, WM_MOUSEMOVE};
     if code >= 0 && lp != 0 {
@@ -117,6 +121,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: usize, lp: isize) -> isize {
     CallNextHookEx(std::ptr::null_mut(), code, wp, lp)
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn key_hook(code: i32, wp: usize, lp: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, KBDLLHOOKSTRUCT};
     // Only the event's timestamp is read. The key itself is never looked at or stored.
@@ -124,7 +129,11 @@ unsafe extern "system" fn key_hook(code: i32, wp: usize, lp: isize) -> isize {
     CallNextHookEx(std::ptr::null_mut(), code, wp, lp)
 }
 
+#[cfg(not(windows))]
+fn start_input() {}
+
 /// A dedicated thread that does nothing but receive input timing, so it never delays input.
+#[cfg(windows)]
 fn start_input() {
     std::thread::Builder::new().name("feel-input".into()).stack_size(64 * 1024).spawn(|| unsafe {
         use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -139,6 +148,7 @@ fn start_input() {
 }
 
 fn sample() -> Sample {
+    #[cfg(windows)]
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsHungAppWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL};
     // Scheduling lag: four 25 ms sleeps, how late on average.
     let mut late = 0.0;
@@ -148,7 +158,9 @@ fn sample() -> Sample {
         late += (t.elapsed().as_secs_f64() * 1000.0 - 25.0).max(0.0);
     }
     let lag_ms = late / 4.0;
+    #[allow(unused_mut)]
     let (mut ping_ms, mut hung) = (0.0, false);
+    #[cfg(windows)]
     unsafe {
         let h = GetForegroundWindow();
         if !h.is_null() {
@@ -169,6 +181,9 @@ static APPS: Mutex<Vec<(u32, f64, bool)>> = Mutex::new(Vec::new());
 /// Every window on a screen, how fast it answered on the latest round: (pid, ms, not responding).
 pub fn apps() -> Vec<(u32, f64, bool)> { APPS.lock().map(|g| g.clone()).unwrap_or_default() }
 
+#[cfg(not(windows))]
+fn ping_window(_h: isize) -> (f64, bool) { (0.0, false) }
+#[cfg(windows)]
 fn ping_window(h: isize) -> (f64, bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsHungAppWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL};
     let h = h as windows_sys::Win32::Foundation::HWND;

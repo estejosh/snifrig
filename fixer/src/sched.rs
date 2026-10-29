@@ -304,11 +304,11 @@ impl Scheduler {
             let done = r.child.try_wait().ok().flatten();
             let over = done.is_none() && max > 0.0 && ctx.now - r.started > max;
             if done.is_none() && !over { continue; }
-            if over { unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(r.job as _, 1); } let _ = r.child.wait(); }
+            if over { end_group(r.job, r.child.id()); let _ = r.child.wait(); }
             let code = if over { -2 } else { done.and_then(|s| s.code()).map(|c| c as i64).unwrap_or(-1) };
             let r = self.running.remove(&n).unwrap();
             // Whatever the run left behind (a server it started on purpose) keeps running.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(r.job as _); }
+            close_group(r.job);
             let secs = ctx.now - r.started;
             let st = self.state.entry(n.clone()).or_default();
             st.last_end = ctx.now; st.last_exit = code; st.runs += 1;
@@ -384,9 +384,10 @@ impl Scheduler {
         Ok(format!("{} started", j.name))
     }
 
+    #[cfg(windows)]
     fn start(&self, j: &Job, now: f64) -> Result<Running, String> {
         use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
+        use crate::os_ext::CommandExt;
         let (prog, args) = split_cmd(&j.run);
         let logs = self.dir.join("jobs");
         let _ = std::fs::create_dir_all(&logs);
@@ -411,6 +412,29 @@ impl Scheduler {
         extern "system" { fn NtResumeProcess(h: isize) -> i32; }
         unsafe { NtResumeProcess(h); }
         Ok(Running { child, job, started: now, log })
+    }
+
+    #[cfg(not(windows))]
+    fn start(&self, j: &Job, now: f64) -> Result<Running, String> {
+        use std::os::unix::process::CommandExt;
+        let logs = self.dir.join("jobs");
+        let _ = std::fs::create_dir_all(&logs);
+        let safe: String = j.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+        let log = logs.join(format!("{}.log", safe));
+        if std::fs::metadata(&log).map(|m| m.len() > 4 << 20).unwrap_or(false) { let _ = std::fs::rename(&log, logs.join(format!("{}.old.log", safe))); }
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(&log).map_err(|e| e.to_string())?;
+        use std::io::Write;
+        let _ = writeln!(&out, "\n=== {} started by snifrig at {:.0} ===", j.name, now);
+        let err = out.try_clone().map_err(|e| e.to_string())?;
+        // The command line as you would type it in a terminal.
+        let mut c = std::process::Command::new("/bin/sh");
+        c.arg("-c").arg(&j.run);
+        if !j.dir.is_empty() && Path::new(&j.dir).is_dir() { c.current_dir(&j.dir); }
+        let nice = if j.normal_priority { 0 } else { 10 };
+        c.process_group(0).stdin(std::process::Stdio::null()).stdout(out).stderr(err);
+        unsafe { c.pre_exec(move || { if nice != 0 { libc::setpriority(libc::PRIO_PROCESS, 0, nice); } Ok(()) }); }
+        let child = c.spawn().map_err(|e| format!("{} (/bin/sh -c {})", e, j.run))?;
+        Ok(Running { job: child.id() as isize, child, started: now, log })
     }
 
     fn history(&self, name: &str, start: f64, end: f64, code: i64, note: &str) {
@@ -560,3 +584,15 @@ mod tests {
         assert_eq!(fmt_secs(7200.0), "2h");
     }
 }
+
+/// End a job that ran past its limit, with everything it started.
+#[cfg(windows)]
+fn end_group(job: isize, _pid: u32) { unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job as _, 1); } }
+#[cfg(not(windows))]
+fn end_group(group: isize, _pid: u32) { if group > 0 { unsafe { libc::kill(-(group as i32), libc::SIGKILL); } } }
+
+/// Let go of the job's handle; whatever it left running on purpose keeps running.
+#[cfg(windows)]
+fn close_group(job: isize) { unsafe { windows_sys::Win32::Foundation::CloseHandle(job as _); } }
+#[cfg(not(windows))]
+fn close_group(_group: isize) {}

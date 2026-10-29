@@ -663,7 +663,13 @@ fn data_dir() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join("snifrig")
+    #[cfg(windows)]
+    return PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join("snifrig");
+    #[cfg(not(windows))]
+    match std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
+        Some(s) => PathBuf::from(s).join("snifrig"),
+        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state/snifrig"),
+    }
 }
 
 fn main() {

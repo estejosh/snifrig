@@ -20,11 +20,7 @@ path = "src/bin/snifrig-frames.rs"
 name = "snifrig-keygen"
 path = "src/bin/snifrig-keygen.rs"
 
-[build-dependencies]
-embed-resource = "3"
-
-[dependencies]
-ed25519-compact = { version = "2", default-features = false, features = ["random"] }
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
     "Win32_System_ProcessStatus", "Win32_System_Services",
@@ -32,3 +28,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Registry", "Win32_System_JobObjects", "Win32_UI_WindowsAndMessaging",
     "Win32_System_SystemInformation", "Win32_System_Time", "Win32_System_LibraryLoader", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Diagnostics_Etw",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+embed-resource = "3"
+
+[dependencies]
+ed25519-compact = { version = "2", default-features = false, features = ["random"] }

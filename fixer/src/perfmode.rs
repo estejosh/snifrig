@@ -52,7 +52,7 @@ pub fn parse_active(list: &str) -> Option<String> {
 }
 
 fn powercfg(args: &[&str]) -> Option<String> {
-    use std::os::windows::process::CommandExt;
+    use crate::os_ext::CommandExt;
     let out = std::process::Command::new("powercfg").args(args).creation_flags(0x0800_0000).output().ok()?;
     if !out.status.success() { return None; }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())

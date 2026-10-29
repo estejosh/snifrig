@@ -40,9 +40,38 @@ pub fn identity(name: &str, cmdline: &str) -> String {
     name.to_string()
 }
 
+#[cfg(windows)]
 #[link(name = "iphlpapi", kind = "raw-dylib")]
 extern "system" { fn GetExtendedTcpTable(t: *mut c_void, size: *mut u32, order: i32, af: u32, class: i32, reserved: u32) -> u32; }
 
+/// Linux: listening sockets from /proc/net/tcp and tcp6 (state 0A), matched to the process that
+/// holds each socket. Only your own processes can be matched without root, which is the point.
+#[cfg(not(windows))]
+fn table(af: u32, _row: usize, _pid_at: usize, _port_at: usize, out: &mut HashMap<u32, u16>) {
+    let file = if af == 2 { "/proc/net/tcp" } else { "/proc/net/tcp6" };
+    let mut by_inode: HashMap<u64, u16> = HashMap::new();
+    for l in std::fs::read_to_string(file).unwrap_or_default().lines().skip(1) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 10 || f[3] != "0A" { continue; }
+        let port = f[1].rsplit(':').next().and_then(|p| u16::from_str_radix(p, 16).ok()).unwrap_or(0);
+        if let Ok(ino) = f[9].parse::<u64>() { if ino != 0 { by_inode.insert(ino, port); } }
+    }
+    if by_inode.is_empty() { return; }
+    let Ok(rd) = std::fs::read_dir("/proc") else { return };
+    for e in rd.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        for fd in fds.flatten() {
+            let Ok(t) = std::fs::read_link(fd.path()) else { continue };
+            let t = t.to_string_lossy();
+            if let Some(ino) = t.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')).and_then(|s| s.parse::<u64>().ok()) {
+                if let Some(p) = by_inode.get(&ino) { out.entry(pid).or_insert(*p); }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 fn table(af: u32, row: usize, pid_at: usize, port_at: usize, out: &mut HashMap<u32, u16>) {
     let mut size = 0u32;
     unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, af, 3, 0); }

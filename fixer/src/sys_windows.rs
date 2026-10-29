@@ -1,0 +1,502 @@
+//! Low-level Windows calls the governor needs.
+//! Contract (every function closes its handles and never panics; failures return Err/None):
+//! - snapshot(): every process via NtQuerySystemInformation(SystemProcessInformation=5) into a
+//!   reusable buffer held by the caller: pid, ppid, image name, create time (FILETIME u64),
+//!   total CPU time (kernel+user, 100 ns units). One syscall, no per-process handles.
+//! - foreground_pid(): GetForegroundWindow + GetWindowThreadProcessId; None if no window.
+//! - get_priority / set_priority: never set above NORMAL.
+//! - set_efficiency: PROCESS_POWER_THROTTLING_EXECUTION_SPEED; off hands control back to Windows.
+//! - set_io_priority: NtSetInformationProcess(ProcessIoPriority = 33), 0 very low, 1 low, 2 normal.
+//! - set_memory_priority: SetProcessInformation(ProcessMemoryPriority), 1 very low .. 5 normal.
+//! - set_affinity / get_affinity (process, system).
+//! - cap_cpu / uncap: job object CPU hard cap, handles kept in a process-wide table by pid.
+//! - image_matches(pid, created, name): pid still has that create time and image name.
+//! - cmdline(pid): NtQueryInformationProcess class 60, "" if unreadable.
+
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::Mutex;
+
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows_sys::Win32::System::JobObjects::*;
+use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+#[derive(Clone, Debug, Default)]
+pub struct Proc { pub pid: u32, pub ppid: u32, pub name: String, pub created: u64, pub cpu: u64 }
+
+pub const IDLE: u32 = 0x40;
+pub const BELOW_NORMAL: u32 = 0x4000;
+pub const NORMAL: u32 = 0x20;
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    fn NtQuerySystemInformation(class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn NtSetInformationProcess(h: HANDLE, class: u32, info: *const c_void, len: u32) -> i32;
+    fn NtQueryInformationProcess(h: HANDLE, class: u32, info: *mut u8, len: u32, ret: *mut u32) -> i32;
+}
+
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+
+struct H(HANDLE);
+impl Drop for H { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
+
+fn open(pid: u32, access: u32) -> Result<H, String> {
+    let h = unsafe { OpenProcess(access, 0, pid) };
+    if h.is_null() { Err(format!("OpenProcess({pid}) failed: {}", unsafe { windows_sys::Win32::Foundation::GetLastError() })) } else { Ok(H(h)) }
+}
+
+fn rd<T: Copy>(b: &[u8], off: usize) -> T {
+    assert!(off + std::mem::size_of::<T>() <= b.len());
+    unsafe { std::ptr::read_unaligned(b.as_ptr().add(off) as *const T) }
+}
+
+pub fn snapshot(buf: &mut Vec<u8>) -> Vec<Proc> {
+    if buf.len() < 1 << 20 { buf.resize(1 << 20, 0); }
+    let mut got: u32 = 0;
+    for _ in 0..8 {
+        let st = unsafe { NtQuerySystemInformation(5, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut got) };
+        if st == STATUS_INFO_LENGTH_MISMATCH {
+            let want = (got as usize).max(buf.len()) + (256 << 10);
+            buf.resize(want, 0);
+            continue;
+        }
+        if st < 0 { return Vec::new(); }
+        let mut out = Vec::with_capacity(512);
+        let mut off = 0usize;
+        loop {
+            if off + 96 > buf.len() { break; }
+            let b = &buf[..];
+            let next: u32 = rd(b, off);
+            let create: i64 = rd(b, off + 32);
+            let user: i64 = rd(b, off + 40);
+            let kern: i64 = rd(b, off + 48);
+            let nlen: u16 = rd(b, off + 56);
+            let nptr: usize = rd(b, off + 64);
+            let pid: usize = rd(b, off + 80);
+            let ppid: usize = rd(b, off + 88);
+            let name = if nptr == 0 || nlen == 0 {
+                if pid == 0 { "Idle".to_string() } else { String::new() }
+            } else {
+                let s = unsafe { std::slice::from_raw_parts(nptr as *const u16, (nlen / 2) as usize) };
+                String::from_utf16_lossy(s)
+            };
+            out.push(Proc {
+                pid: pid as u32, ppid: ppid as u32, name,
+                created: create as u64, cpu: (user as u64).wrapping_add(kern as u64),
+            });
+            if next == 0 { break; }
+            off += next as usize;
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+/// (commit %, available physical MB) from GlobalMemoryStatusEx; None if the call fails.
+pub fn memory_status() -> Option<(f64, f64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    unsafe {
+        let mut m: MEMORYSTATUSEX = std::mem::zeroed();
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut m) == 0 || m.ullTotalPageFile == 0 { return None; }
+        let used = m.ullTotalPageFile.saturating_sub(m.ullAvailPageFile) as f64;
+        Some((used / m.ullTotalPageFile as f64 * 100.0, m.ullAvailPhys as f64 / 1048576.0))
+    }
+}
+
+/// Seconds to add to unix time to get local time (daylight saving included).
+pub fn local_offset_secs() -> i64 {
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    unsafe {
+        let mut z: TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let r = GetTimeZoneInformation(&mut z);
+        if r == 0xFFFF_FFFF { return 0; }
+        let bias = z.Bias + if r == 2 { z.DaylightBias } else { z.StandardBias };
+        -(bias as i64) * 60
+    }
+}
+
+#[link(name = "shell32", kind = "raw-dylib")]
+extern "system" { fn SHQueryUserNotificationState(state: *mut i32) -> i32; }
+
+#[link(name = "user32", kind = "raw-dylib")]
+extern "system" { fn GetLastInputInfo(lii: *mut [u32; 2]) -> i32; }
+#[link(name = "kernel32", kind = "raw-dylib")]
+extern "system" { fn GetTickCount64() -> u64; }
+
+/// Seconds since your last mouse or key input.
+pub fn idle_secs() -> f64 {
+    let mut lii = [8u32, 0u32];
+    unsafe {
+        if GetLastInputInfo(&mut lii) == 0 { return 0.0; }
+        let now = (GetTickCount64() & 0xFFFF_FFFF) as u32;
+        now.wrapping_sub(lii[1]) as f64 / 1000.0
+    }
+}
+
+/// When Windows started (unix seconds).
+pub fn boot_unix() -> f64 { crate::now_unix() - unsafe { GetTickCount64() } as f64 / 1000.0 }
+
+/// True while a Direct3D app runs exclusive full screen (QUNS_RUNNING_D3D_FULL_SCREEN).
+pub fn fullscreen_d3d() -> bool {
+    let mut st = 0i32;
+    if unsafe { SHQueryUserNotificationState(&mut st) } != 0 { return false; }
+    // 3 = exclusive full screen; 2 = busy: a borderless full-screen game shows up this way too,
+    // so check that the window in front really covers its whole monitor.
+    st == 3 || (st == 2 && front_covers_monitor())
+}
+
+/// True if this window covers its whole monitor (a full-screen or borderless full-screen window).
+pub fn covers_monitor(h: isize) -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    unsafe {
+        let h = h as windows_sys::Win32::Foundation::HWND;
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(h, &mut r) == 0 { return false; }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 { return false; }
+        let s = mi.rcMonitor;
+        r.left <= s.left && r.top <= s.top && r.right >= s.right && r.bottom >= s.bottom
+    }
+}
+
+/// Minimize a window without activating anything (the app keeps running).
+pub fn minimize_quietly(h: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindowAsync;
+    unsafe { ShowWindowAsync(h as windows_sys::Win32::Foundation::HWND, 7 /* SW_SHOWMINNOACTIVE */) != 0 }
+}
+
+fn front_covers_monitor() -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.is_null() { return false; }
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(h, &mut r) == 0 { return false; }
+        let m = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(m, &mut mi) == 0 { return false; }
+        let s = mi.rcMonitor;
+        r.left <= s.left && r.top <= s.top && r.right >= s.right && r.bottom >= s.bottom
+    }
+}
+
+/// Pids that own a visible top-level window with a title (what a person would call an open app).
+/// CPU set ids of the efficiency (slow) cores on a hybrid CPU (Intel 12th gen and later, some
+/// ARM). None when every core is the same kind, as on most desktops: then nothing changes.
+pub fn efficiency_cpu_sets() -> Option<&'static [u32]> {
+    static SETS: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    SETS.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
+        let mut len = 0u32;
+        unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut len, std::ptr::null_mut(), 0); }
+        if len == 0 { return None; }
+        let mut buf = vec![0u8; len as usize];
+        if unsafe { GetSystemCpuSetInformation(buf.as_mut_ptr() as *mut _, len, &mut len, std::ptr::null_mut(), 0) } == 0 { return None; }
+        // SYSTEM_CPU_SET_INFORMATION: Size u32 @0, Type u32 @4, Id u32 @8, ..., EfficiencyClass u8 @18.
+        let mut sets: Vec<(u32, u8)> = Vec::new();
+        let mut off = 0usize;
+        while off + 19 <= buf.len() {
+            let size = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+            if size == 0 { break; }
+            let id = u32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+            sets.push((id, buf[off + 18]));
+            off += size;
+        }
+        let lo = sets.iter().map(|s| s.1).min()?;
+        let hi = sets.iter().map(|s| s.1).max()?;
+        (lo != hi).then(|| sets.iter().filter(|s| s.1 == lo).map(|s| s.0).collect())
+    }).as_deref()
+}
+
+/// Keep a process on these CPU sets (empty = any core again).
+pub fn set_cpu_sets(pid: u32, ids: &[u32]) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::SetProcessDefaultCpuSets;
+    let h = open(pid, 0x2000)?; // PROCESS_SET_LIMITED_INFORMATION
+    let ok = unsafe { SetProcessDefaultCpuSets(h.0, if ids.is_empty() { std::ptr::null() } else { ids.as_ptr() }, ids.len() as u32) };
+    if ok == 0 { Err(format!("cpu sets: error {}", unsafe { windows_sys::Win32::Foundation::GetLastError() })) } else { Ok(()) }
+}
+
+/// Windows showing on a screen right now (titled, not minimised, not cloaked): (hwnd, pid), at most 16.
+pub fn visible_windows() -> Vec<(isize, u32)> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, IsIconic, IsWindowVisible};
+    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> i32 {
+        let v = &mut *(lp as *mut Vec<(isize, u32)>);
+        if v.len() < 16 && IsWindowVisible(h) != 0 && IsIconic(h) == 0 && GetWindowTextLengthW(h) > 0 {
+            let mut cloaked = 0u32;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED as _, &mut cloaked as *mut u32 as *mut _, 4);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid != 0 && cloaked == 0 && pid != std::process::id() { v.push((h as isize, pid)); }
+        }
+        1
+    }
+    let mut v: Vec<(isize, u32)> = Vec::new();
+    unsafe { EnumWindows(Some(cb), &mut v as *mut _ as LPARAM); }
+    v
+}
+
+/// Pids that own a real, titled top-level window. Cloaked windows (hidden UWP hosts such as
+/// TextInputHost, windows parked on another virtual desktop) do not count.
+pub fn window_pids() -> std::collections::HashSet<u32> { windows().0 }
+
+/// (pids with a real window, pids with a window actually showing on a monitor: not minimised).
+pub fn windows() -> (std::collections::HashSet<u32>, std::collections::HashSet<u32>) {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, IsIconic, IsWindowVisible};
+    type Sets = (std::collections::HashSet<u32>, std::collections::HashSet<u32>);
+    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> i32 {
+        let sets = &mut *(lp as *mut Sets);
+        if IsWindowVisible(h) != 0 && GetWindowTextLengthW(h) > 0 {
+            let mut cloaked = 0u32;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED as _, &mut cloaked as *mut u32 as *mut _, 4);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid != 0 && cloaked == 0 {
+                sets.0.insert(pid);
+                if IsIconic(h) == 0 { sets.1.insert(pid); }
+            }
+        }
+        1
+    }
+    let mut sets: Sets = Default::default();
+    unsafe { EnumWindows(Some(cb), &mut sets as *mut _ as LPARAM); }
+    sets
+}
+
+pub fn foreground_pid() -> Option<u32> {
+    unsafe {
+        let w = GetForegroundWindow();
+        if w.is_null() { return None; }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(w, &mut pid);
+        if pid == 0 { None } else { Some(pid) }
+    }
+}
+
+pub fn get_priority(pid: u32) -> Option<u32> {
+    let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    let c = unsafe { GetPriorityClass(h.0) };
+    if c == 0 { None } else { Some(c) }
+}
+
+pub fn set_priority(pid: u32, class: u32) -> Result<(), String> {
+    if class != IDLE && class != BELOW_NORMAL && class != NORMAL {
+        return Err(format!("refusing priority class {class:#x}"));
+    }
+    let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION)?;
+    if unsafe { SetPriorityClass(h.0, class) } == 0 { Err("SetPriorityClass failed".into()) } else { Ok(()) }
+}
+
+#[repr(C)]
+struct PowerThrottling { version: u32, control: u32, state: u32 }
+
+pub fn set_efficiency(pid: u32, on: bool) -> Result<(), String> {
+    let h = open(pid, PROCESS_SET_INFORMATION)?;
+    let bit = 1u32; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    let s = PowerThrottling { version: 1, control: if on { bit } else { 0 }, state: if on { bit } else { 0 } };
+    // ProcessPowerThrottling = 4
+    let ok = unsafe { SetProcessInformation(h.0, 4, &s as *const _ as *const c_void, std::mem::size_of::<PowerThrottling>() as u32) };
+    if ok == 0 { Err("SetProcessInformation(power throttling) failed".into()) } else { Ok(()) }
+}
+
+pub fn set_io_priority(pid: u32, prio: u32) -> Result<(), String> {
+    let h = open(pid, PROCESS_SET_INFORMATION)?;
+    let v = prio;
+    let st = unsafe { NtSetInformationProcess(h.0, 33, &v as *const u32 as *const c_void, 4) };
+    if st < 0 { Err(format!("NtSetInformationProcess(io) {st:#x}")) } else { Ok(()) }
+}
+
+pub fn set_memory_priority(pid: u32, prio: u32) -> Result<(), String> {
+    let h = open(pid, PROCESS_SET_INFORMATION)?;
+    let v = prio; // MEMORY_PRIORITY_INFORMATION { MemoryPriority: u32 }
+    // ProcessMemoryPriority = 0
+    let ok = unsafe { SetProcessInformation(h.0, 0, &v as *const u32 as *const c_void, 4) };
+    if ok == 0 { Err("SetProcessInformation(memory priority) failed".into()) } else { Ok(()) }
+}
+
+pub fn get_affinity(pid: u32) -> Option<(u64, u64)> {
+    let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    let (mut p, mut s) = (0usize, 0usize);
+    if unsafe { GetProcessAffinityMask(h.0, &mut p, &mut s) } == 0 { None } else { Some((p as u64, s as u64)) }
+}
+
+pub fn set_affinity(pid: u32, mask: u64) -> Result<(), String> {
+    let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION)?;
+    if unsafe { SetProcessAffinityMask(h.0, mask as usize) } == 0 { Err("SetProcessAffinityMask failed".into()) } else { Ok(()) }
+}
+
+static JOBS: Mutex<Option<HashMap<u32, isize>>> = Mutex::new(None);
+
+#[repr(C)]
+struct CpuRate { flags: u32, rate: u32 }
+
+fn set_rate(job: HANDLE, flags: u32, rate: u32) -> Result<(), String> {
+    let c = CpuRate { flags, rate };
+    // JobObjectCpuRateControlInformation = 15
+    let ok = unsafe { SetInformationJobObject(job, 15, &c as *const _ as *const c_void, std::mem::size_of::<CpuRate>() as u32) };
+    if ok == 0 { Err("SetInformationJobObject(cpu rate) failed".into()) } else { Ok(()) }
+}
+
+fn in_job(proc_h: HANDLE, job: HANDLE) -> bool {
+    let mut r = 0;
+    unsafe { IsProcessInJob(proc_h, job, &mut r) != 0 && r != 0 }
+}
+
+pub fn cap_cpu(pid: u32, percent: u32) -> Result<(), String> {
+    let pct = percent.clamp(1, 100);
+    let h = open(pid, PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut g = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    // prune jobs whose processes are all gone
+    map.retain(|&k, j| {
+        if k == pid { return true; }
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { QueryInformationJobObject(*j as HANDLE, 1, &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32, std::ptr::null_mut()) };
+        let alive = ok != 0 && info.ActiveProcesses > 0;
+        if !alive { unsafe { CloseHandle(*j as HANDLE); } }
+        alive
+    });
+    let flags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+    if let Some(&j) = map.get(&pid) {
+        if in_job(h.0, j as HANDLE) {
+            return set_rate(j as HANDLE, flags, pct * 100);
+        }
+        unsafe { CloseHandle(j as HANDLE); }
+        map.remove(&pid);
+    }
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() { return Err("CreateJobObjectW failed".into()); }
+    let r = set_rate(job, flags, pct * 100).and_then(|_| {
+        if unsafe { AssignProcessToJobObject(job, h.0) } == 0 { Err("AssignProcessToJobObject failed".to_string()) } else { Ok(()) }
+    });
+    match r {
+        Ok(()) => { map.insert(pid, job as isize); Ok(()) }
+        Err(e) => { unsafe { CloseHandle(job); } Err(e) }
+    }
+}
+
+pub fn uncap(pid: u32) -> Result<(), String> {
+    let g = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = g.as_ref() else { return Ok(()) };
+    let Some(&j) = map.get(&pid) else { return Ok(()) };
+    // keep the handle so a later cap_cpu reuses the same job (a process cannot leave a job)
+    set_rate(j as HANDLE, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, 10000)
+}
+
+fn ft(f: FILETIME) -> u64 { ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64 }
+
+pub fn image_matches(pid: u32, created: u64, name: &str) -> bool {
+    let Ok(h) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else { return false };
+    let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+    if unsafe { GetProcessTimes(h.0, &mut c, &mut e, &mut k, &mut u) } == 0 { return false; }
+    if ft(c) != created { return false; }
+    let mut buf = [0u16; 1024];
+    let mut n = buf.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(h.0, 0, buf.as_mut_ptr(), &mut n) } == 0 { return false; }
+    let full = String::from_utf16_lossy(&buf[..n as usize]);
+    let base = full.rsplit(['\\', '/']).next().unwrap_or(&full);
+    base.eq_ignore_ascii_case(name)
+}
+
+pub fn cmdline(pid: u32) -> String {
+    let Ok(h) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else { return String::new() };
+    let mut buf: Vec<u8> = vec![0; 4096];
+    for _ in 0..4 {
+        let mut ret = 0u32;
+        let st = unsafe { NtQueryInformationProcess(h.0, 60, buf.as_mut_ptr(), buf.len() as u32, &mut ret) };
+        if st == STATUS_INFO_LENGTH_MISMATCH || st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL {
+            let n = (ret as usize).max(buf.len() * 2);
+            buf.resize(n, 0);
+            continue;
+        }
+        if st < 0 { return String::new(); }
+        let len: u16 = rd(&buf, 0);
+        let ptr: usize = rd(&buf, 8);
+        if ptr == 0 || len == 0 { return String::new(); }
+        let s = unsafe { std::slice::from_raw_parts(ptr as *const u16, (len / 2) as usize) };
+        return String::from_utf16_lossy(s);
+    }
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn spawn() -> std::process::Child {
+        Command::new("ping").args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().expect("spawn ping")
+    }
+
+    #[test]
+    fn all_ops_on_child() {
+        let mut child = spawn();
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut buf = Vec::new();
+        let snap = snapshot(&mut buf);
+        let me = snap.iter().find(|p| p.pid == pid).cloned();
+        let r = std::panic::catch_unwind(|| {
+            let me = me.expect("child in snapshot");
+            assert!(me.name.eq_ignore_ascii_case("ping.exe"), "name {}", me.name);
+            assert!(image_matches(pid, me.created, "PING.EXE"));
+            assert!(!image_matches(pid, me.created + 1, "ping.exe"));
+            assert!(!image_matches(pid, me.created, "notping.exe"));
+            // the child inherits our class; the test host may run below normal
+            let p0 = get_priority(pid).unwrap();
+            assert!(p0 == NORMAL || p0 == BELOW_NORMAL || p0 == IDLE, "initial class {p0:#x}");
+            for c in [BELOW_NORMAL, IDLE, NORMAL] {
+                set_priority(pid, c).unwrap();
+                assert_eq!(get_priority(pid), Some(c));
+            }
+            set_efficiency(pid, true).unwrap();
+            set_efficiency(pid, false).unwrap();
+            set_io_priority(pid, 1).unwrap();
+            set_io_priority(pid, 2).unwrap();
+            set_memory_priority(pid, 2).unwrap();
+            set_memory_priority(pid, 5).unwrap();
+            let (orig, sys) = get_affinity(pid).unwrap();
+            let first = sys & sys.wrapping_neg();
+            set_affinity(pid, first).unwrap();
+            assert_eq!(get_affinity(pid).unwrap().0, first);
+            set_affinity(pid, orig).unwrap();
+            assert_eq!(get_affinity(pid).unwrap().0, orig);
+            cap_cpu(pid, 20).unwrap();
+            cap_cpu(pid, 30).unwrap();
+            uncap(pid).unwrap();
+            assert!(cmdline(pid).to_lowercase().contains("ping"));
+            let _ = foreground_pid();
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Err(e) = r { std::panic::resume_unwind(e); }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_snapshot() {
+        let mut buf = Vec::new();
+        let _ = snapshot(&mut buf);
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..100 { n = snapshot(&mut buf).len(); }
+        println!("snapshot avg {:?} ({} procs, buf {} KB)", t.elapsed() / 100, n, buf.len() / 1024);
+    }
+}

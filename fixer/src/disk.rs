@@ -23,7 +23,10 @@ pub const MIN_MODEL: u64 = 256 << 20;
 const EXTS: &[&str] = &["safetensors", "ckpt", "pt", "pth", "bin", "gguf", "ggml", "onnx", "h5", "pb", "tflite", "msgpack", "model", "engine", "trt"];
 
 fn now() -> f64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) }
+#[cfg(windows)]
 fn is_reparse(m: &std::fs::Metadata) -> bool { use std::os::windows::fs::MetadataExt; m.file_attributes() & 0x400 != 0 }
+#[cfg(not(windows))]
+fn is_reparse(m: &std::fs::Metadata) -> bool { m.file_type().is_symlink() }
 
 /// Pure: does this look like a model file worth checking?
 pub fn is_model(p: &Path, len: u64) -> bool {
@@ -35,6 +38,19 @@ pub fn is_model(p: &Path, len: u64) -> bool {
     s.contains("\\blobs\\") && (s.contains("ollama") || s.contains("huggingface") || s.contains("lm-studio") || s.contains("lmstudio"))
 }
 
+/// Real disks' mount points (not /proc, /sys, tmpfs, network or snap squashfs mounts).
+#[cfg(not(windows))]
+fn fixed_drives() -> Vec<PathBuf> {
+    let real = ["ext4", "ext3", "xfs", "btrfs", "f2fs", "zfs", "bcachefs", "ntfs", "ntfs3", "exfat", "vfat"];
+    let mut v: Vec<PathBuf> = std::fs::read_to_string("/proc/mounts").unwrap_or_default().lines().filter_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.len() > 2 && real.contains(&f[2]) && !f[1].starts_with("/boot") && !f[1].starts_with("/snap")).then(|| PathBuf::from(f[1].replace("\\040", " ")))
+    }).collect();
+    v.sort(); v.dedup();
+    v
+}
+
+#[cfg(windows)]
 fn fixed_drives() -> Vec<PathBuf> {
     #[link(name = "kernel32", kind = "raw-dylib")]
     extern "system" { fn GetDriveTypeW(root: *const u16) -> u32; }
@@ -77,7 +93,16 @@ pub fn in_sync_folder(p: &Path) -> bool {
     p.ancestors().skip(1).take(10).any(|a| a.join(".stfolder").exists() || a.join(".sync").is_dir() && a.join(".sync").join("ID").exists())
 }
 
+/// Device + inode + link count on Linux: the same id means the same file on disk.
+#[cfg(not(windows))]
+pub fn file_id(p: &Path) -> Option<(u32, u64, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.dev() as u32, m.ino(), m.nlink() as u32))
+}
+
 /// Volume serial + file index + link count: the same id means the same file on disk.
+#[cfg(windows)]
 pub fn file_id(p: &Path) -> Option<(u32, u64, u32)> {
     #[repr(C)] struct Info { attrs: u32, c: [u32; 2], a: [u32; 2], w: [u32; 2], serial: u32, size_hi: u32, size_lo: u32, links: u32, idx_hi: u32, idx_lo: u32 }
     #[link(name = "kernel32", kind = "raw-dylib")]
@@ -101,8 +126,17 @@ pub fn fingerprint(p: &Path, len: u64) -> Option<u64> {
     Some(h)
 }
 
+/// SHA-256 of a whole file, streamed by sha256sum (coreutils, on every Linux). Lowercase hex.
+#[cfg(not(windows))]
+pub fn sha256_file(p: &Path) -> Option<String> {
+    let o = std::process::Command::new("sha256sum").arg("--").arg(p).output().ok()?;
+    let h = String::from_utf8_lossy(&o.stdout).split_whitespace().next()?.trim_start_matches('\\').to_lowercase();
+    (o.status.success() && h.len() == 64).then_some(h)
+}
+
 /// SHA-256 of a whole file, streamed (Windows' own hashing, hardware-accelerated where the CPU
 /// has it). Lowercase hex.
+#[cfg(windows)]
 pub fn sha256_file(p: &Path) -> Option<String> {
     #[link(name = "bcrypt", kind = "raw-dylib")]
     extern "system" {
@@ -226,7 +260,7 @@ pub struct VDisk { pub name: String, pub path: PathBuf, pub bytes: u64, pub used
 
 /// WSL distributions (from the registry), Docker and Podman disks.
 pub fn virtual_disks() -> Vec<VDisk> {
-    use std::os::windows::process::CommandExt;
+    use crate::os_ext::CommandExt;
     let mut out = Vec::new();
     let reg = std::process::Command::new("reg.exe").args(["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss", "/s"]).creation_flags(0x0800_0000).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
     let (mut name, mut base) = (String::new(), String::new());
@@ -337,9 +371,6 @@ pub fn keep_this(dir: &Path, right: &Path, group: &[PathBuf]) -> (u64, u64, u64,
 
 /// Link files[1..] to files[0] (same drive), quarantining each replaced copy.
 fn link_to_first(dir: &Path, files: &[PathBuf], batch: &str) -> (u64, u64, u64, String) {
-    #[link(name = "kernel32", kind = "raw-dylib")]
-    extern "system" { fn CreateHardLinkW(new: *const u16, existing: *const u16, sa: *const u8) -> i32; }
-    let w = |p: &Path| -> Vec<u16> { p.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect() };
     let batch = if batch.is_empty() { format!("{:.0}", now()) } else { batch.to_string() };
     let (mut linked, mut freed, mut skipped) = (0u64, 0u64, 0u64);
     let mut manifest = String::new();
@@ -351,7 +382,7 @@ fn link_to_first(dir: &Path, files: &[PathBuf], batch: &str) -> (u64, u64, u64, 
         let q = crate::junk::landing(&crate::junk::quarantine_root(dir, dup).join(&batch), dup);
         if let Some(p) = q.parent() { let _ = std::fs::create_dir_all(p); }
         if std::fs::rename(dup, &q).is_err() { skipped += 1; continue; }
-        if unsafe { CreateHardLinkW(w(dup).as_ptr(), w(keep).as_ptr(), std::ptr::null()) } == 0 { let _ = std::fs::rename(&q, dup); skipped += 1; continue; }
+        if std::fs::hard_link(keep, dup).is_err() { let _ = std::fs::rename(&q, dup); skipped += 1; continue; }
         linked += 1;
         freed += len;
         manifest.push_str(&format!("link\t{}\t{}\n", dup.display(), q.display()));
@@ -368,9 +399,6 @@ fn link_to_first(dir: &Path, files: &[PathBuf], batch: &str) -> (u64, u64, u64, 
 /// Link the copies of one model to a single file on each drive. The copies go to quarantine
 /// (undo for 7 days). Returns (linked, bytes freed, skipped, batch).
 pub fn dedupe(dir: &Path, files: &[PathBuf]) -> (u64, u64, u64, String) {
-    #[link(name = "kernel32", kind = "raw-dylib")]
-    extern "system" { fn CreateHardLinkW(new: *const u16, existing: *const u16, sa: *const u8) -> i32; }
-    let w = |p: &Path| -> Vec<u16> { p.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect() };
     let batch = format!("{:.0}", now());
     let (mut linked, mut freed, mut skipped) = (0u64, 0u64, 0u64);
     let mut manifest = String::new();
@@ -389,7 +417,7 @@ pub fn dedupe(dir: &Path, files: &[PathBuf]) -> (u64, u64, u64, String) {
             let q = crate::junk::landing(&crate::junk::quarantine_root(dir, dup).join(&batch), dup);
             if let Some(p) = q.parent() { let _ = std::fs::create_dir_all(p); }
             if std::fs::rename(dup, &q).is_err() { skipped += 1; continue; } // in use
-            if unsafe { CreateHardLinkW(w(dup).as_ptr(), w(keep).as_ptr(), std::ptr::null()) } == 0 {
+            if std::fs::hard_link(keep, dup).is_err() {
                 let _ = std::fs::rename(&q, dup); // put it back as it was
                 skipped += 1;
                 continue;
@@ -425,7 +453,7 @@ pub fn undo_links(dir: &Path, batch: &str) -> Result<u64, String> {
 /// WSL: turn on sparse mode (space comes back by itself from then on) and trim now. Stops the
 /// distribution first; run it as a job when you are away.
 pub fn wsl_compact(distro: &str) -> Result<String, String> {
-    use std::os::windows::process::CommandExt;
+    use crate::os_ext::CommandExt;
     let run = |args: &[&str]| std::process::Command::new("wsl.exe").args(args).creation_flags(0x0800_0000).output();
     let _ = run(&["--terminate", distro]);
     let o = run(&["--manage", distro, "--set-sparse", "true"]).map_err(|e| e.to_string())?;

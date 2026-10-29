@@ -126,9 +126,14 @@ pub struct Impact {
 impl Impact {
     pub fn new(dir: &Path) -> Impact {
         let mut seed = [0u8; 8];
-        #[link(name = "advapi32", kind = "raw-dylib")]
-        extern "system" { #[link_name = "SystemFunction036"] fn RtlGenRandom(buf: *mut u8, len: u32) -> u8; }
-        unsafe { RtlGenRandom(seed.as_mut_ptr(), 8); }
+        #[cfg(windows)]
+        {
+            #[link(name = "advapi32", kind = "raw-dylib")]
+            extern "system" { #[link_name = "SystemFunction036"] fn RtlGenRandom(buf: *mut u8, len: u32) -> u8; }
+            unsafe { RtlGenRandom(seed.as_mut_ptr(), 8); }
+        }
+        #[cfg(not(windows))]
+        { use std::io::Read; let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut seed)); }
         let holds: Vec<f64> = std::fs::read_to_string(dir.join(HOLDS_LOG)).unwrap_or_default().lines().filter_map(|l| crate::json::num_field(l, "start")).collect();
         Impact { days: parse_days(&std::fs::read_to_string(dir.join(DAYS_FILE)).unwrap_or_default()), hold_until: 0.0, slot: 0, holds_today: holds, rng: u64::from_le_bytes(seed) | 1, dirty_at: 0.0, asking: None, last_ask: 0.0 }
     }

@@ -49,8 +49,8 @@ fn cpu_causes(i: &VerdictInput) -> Vec<String> {
     let mut h: Vec<&CpuHog> = i.cpu_hogs.iter().collect();
     h.sort_by(|a, b| b.pct.partial_cmp(&a.pct).unwrap_or(std::cmp::Ordering::Equal));
     let mut out: Vec<String> = h.iter().take(3).map(|x| {
-        let act = if crate::cpuhog::auto_restarts(&x.name) { "End it; Windows restarts it." } else { "snifrig fix can rein it in; restart it when it suits you." };
-        format!("{} is using about {:.0}% of a CPU core ({:.0} min, pid {}). {}", cap(&crate::cpuhog::friendly(&x.name)), x.pct, x.minutes, x.pid, act)
+        let act = if super::cpuhog::auto_restarts(&x.name) { "End it; Windows restarts it." } else { "snifrig fix can rein it in; restart it when it suits you." };
+        format!("{} is using about {:.0}% of a CPU core ({:.0} min, pid {}). {}", cap(&super::cpuhog::friendly(&x.name)), x.pct, x.minutes, x.pid, act)
     }).collect();
     if out.is_empty() { out.push("Open Task Manager, sort by CPU, and close what you are not using.".into()); }
     out
@@ -83,7 +83,7 @@ pub fn verdict(i: &VerdictInput) -> Option<Verdict> {
     }
     if i.cpu_pct.map_or(false, |c| c >= 60.0) || !i.cpu_hogs.is_empty() {
         let top = i.cpu_hogs.iter().max_by(|a, b| a.pct.partial_cmp(&b.pct).unwrap_or(std::cmp::Ordering::Equal));
-        let h = match top { Some(t) => format!("Your CPU is busy, mostly with {}.", crate::cpuhog::friendly(&t.name)), None => "Your CPU is busy.".to_string() };
+        let h = match top { Some(t) => format!("Your CPU is busy, mostly with {}.", super::cpuhog::friendly(&t.name)), None => "Your CPU is busy.".to_string() };
         return v(1, &h, cpu_causes(i));
     }
     if has("cpu-throttle") || has("thermal") {

@@ -96,7 +96,7 @@ pub fn run(dir: &Path, days: f64) -> String {
     let mut alerts = std::fs::read_to_string(dir.join("alerts.old")).unwrap_or_default();
     alerts.push_str(&std::fs::read_to_string(dir.join("alerts.jsonl")).unwrap_or_default());
     let fixes = std::fs::read_to_string(dir.join("fixes.jsonl")).unwrap_or_default();
-    let slow = if days >= 1.0 { crate::slowdown::summarize(dir) } else { Vec::new() };
+    let slow = if days >= 1.0 { super::slowdown::summarize(dir) } else { Vec::new() };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     build(&alerts, &fixes, &slow, now, days)
 }

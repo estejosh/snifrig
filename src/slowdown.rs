@@ -36,7 +36,7 @@ pub struct Evidence { pub t: f64, pub kind: &'static str, pub value: f64, pub li
 impl Evidence {
     pub fn json(&self) -> String {
         format!("{{\"t\":\"{}\",\"unix\":{:.0},\"kind\":\"{}\",\"value\":{:.2},\"limit\":{:.2},\"minutes\":{:.1},\"who\":\"{}\",\"detail\":\"{}\"}}",
-            crate::iso(self.t), self.t, self.kind, self.value, self.limit, self.minutes, crate::esc(&self.who), crate::esc(&self.detail))
+            super::iso(self.t), self.t, self.kind, self.value, self.limit, self.minutes, super::esc(&self.who), super::esc(&self.detail))
     }
     pub fn msg(&self) -> String {
         format!("Windows slowdown [{}]: measured {:.1} against limit {:.1} for {:.1} min. {}", self.kind, self.value, self.limit, self.minutes, self.detail)
@@ -147,7 +147,7 @@ impl Slow {
     /// Starts a probe child every 5 min (only if nvml.dll exists) and returns a reading only
     /// once per new gpu.json, so each probe counts as one sample. The probe itself requires
     /// throttling in all 3 of its readings, 2 s apart, before it reports reasons.
-    fn gpu_probe(&mut self, t: f64) -> Option<crate::gpu_throttle::GpuThrottle> {
+    fn gpu_probe(&mut self, t: f64) -> Option<super::gpu_throttle::GpuThrottle> {
         let dir = self.dir.clone()?;
         let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
         if !std::path::Path::new(&sys).join("System32\\nvml.dll").exists() { return None; }
@@ -162,13 +162,13 @@ impl Slow {
             }
         }
         let s = std::fs::read_to_string(dir.join("gpu.json")).ok()?;
-        let u = crate::json_num(&s, "unix") as f64;
+        let u = super::json_num(&s, "unix") as f64;
         if u <= self.gpu_seen || t - u > 360.0 { return None; }
         self.gpu_seen = u;
-        let n = |k: &str| crate::json_num(&s, k) as f64;
-        let reasons: Vec<&'static str> = crate::json_str(&s, "reasons").unwrap_or_default().split(',')
-            .filter_map(|r| crate::gpu_throttle::LABELS.iter().find(|l| **l == r).copied()).collect();
-        Some(crate::gpu_throttle::GpuThrottle { reasons, temp_c: n("temp_c") as u32, power_w: n("power_w"), limit_w: n("limit_w"), sm_mhz: n("sm_mhz") as u32, sm_max_mhz: n("sm_max_mhz") as u32 })
+        let n = |k: &str| super::json_num(&s, k) as f64;
+        let reasons: Vec<&'static str> = super::json_str(&s, "reasons").unwrap_or_default().split(',')
+            .filter_map(|r| super::gpu_throttle::LABELS.iter().find(|l| **l == r).copied()).collect();
+        Some(super::gpu_throttle::GpuThrottle { reasons, temp_c: n("temp_c") as u32, power_w: n("power_w"), limit_w: n("limit_w"), sm_mhz: n("sm_mhz") as u32, sm_max_mhz: n("sm_max_mhz") as u32 })
     }
 
     /// `procs` is (pid, image name, CPU % of the whole machine since the previous cycle).
@@ -334,12 +334,12 @@ fn num(s: &str, key: &str) -> f64 {
 pub fn summarize(dir: &Path) -> Vec<String> {
     let mut txt = std::fs::read_to_string(dir.join("slowdown.old")).unwrap_or_default();
     txt.push_str(&std::fs::read_to_string(dir.join("slowdown.jsonl")).unwrap_or_default());
-    let cut = crate::now() - 86400.0;
+    let cut = super::now() - 86400.0;
     // kind -> (unix, value, limit, minutes, who)
     let mut rows: HashMap<String, Vec<(f64, f64, f64, f64, String)>> = HashMap::new();
     for l in txt.lines() {
-        let (u, k) = (num(l, "unix"), crate::json_str(l, "kind").unwrap_or_default());
-        if u >= cut && !k.is_empty() { rows.entry(k).or_default().push((u, num(l, "value"), num(l, "limit"), num(l, "minutes"), crate::json_str(l, "who").unwrap_or_default())); }
+        let (u, k) = (num(l, "unix"), super::json_str(l, "kind").unwrap_or_default());
+        if u >= cut && !k.is_empty() { rows.entry(k).or_default().push((u, num(l, "value"), num(l, "limit"), num(l, "minutes"), super::json_str(l, "who").unwrap_or_default())); }
     }
     let mut out = Vec::new();
     for kind in KINDS {
