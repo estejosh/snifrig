@@ -10,8 +10,13 @@
 //! for help. Every holdout and every day's totals are kept, so the number can be checked.
 //! It asks first: when you are at the PC, a card asks "can we run a small test?" (at most once
 //! every 2 hours); no answer in a minute means it runs only if you have stepped away. When you
-//! have been away for 5 minutes it just measures, since nobody is disturbed. Holdouts therefore
-//! lean towards calmer moments, which can only make the number lower, never higher.
+//! have been away for 5 minutes it just measures, since nobody is disturbed.
+//! Like with like: most holdouts happen while you are away, when a PC is calm anyway, so
+//! comparing them with your working hours would make snifrig look worse than doing nothing.
+//! Every sample is therefore filed as "you at the PC" or "you away", holdouts are compared
+//! only with normal time in the same state, and the two results are weighted by how much of
+//! your real use each state is. A state without enough holdouts yet is left out, and the
+//! sentence says which states the number covers. A result that is worse is reported as worse.
 //! Conservative: rules already applied stay in place while snifrig holds off.
 
 use std::collections::BTreeMap;
@@ -25,7 +30,12 @@ pub const DAYS: i64 = 7;
 pub const MIN_OFF_SAMPLES: u64 = 240; // 20 minutes of holdouts
 pub const MIN_ON_SAMPLES: u64 = 2000;
 pub const HOLDS_LOG: &str = "impact-holdouts.jsonl";
-pub const DAYS_FILE: &str = "impact-days.txt";
+/// Per day, split by whether you were at the PC (the older impact-days.txt mixed the two).
+pub const DAYS_FILE: &str = "impact-days2.txt";
+/// Enough holdout samples in a state to trust its comparison: 10 minutes at the PC, 20 away.
+pub const MIN_OFF_HERE: u64 = 120;
+pub const MIN_OFF_AWAY: u64 = 240;
+pub const MIN_ON_STATE: u64 = 600;
 pub const SUMMARY: &str = "impact-summary.json";
 pub const OFF_FILE: &str = "impact-off";
 pub const NOW_FILE: &str = "impact-test-now";
@@ -45,44 +55,79 @@ impl Tally {
     fn plus(self, o: Tally) -> Tally { Tally { n: self.n + o.n, sum: self.sum + o.sum, slow: self.slow + o.slow } }
 }
 
-/// Per local day: (with snifrig, snifrig holding off).
-pub type Days = BTreeMap<i64, (Tally, Tally)>;
+/// Per local day: [with snifrig at the PC, held off at the PC, with snifrig away, held off away].
+pub type Days = BTreeMap<i64, [Tally; 4]>;
+pub const HERE_ON: usize = 0;
+pub const HERE_OFF: usize = 1;
+pub const AWAY_ON: usize = 2;
+pub const AWAY_OFF: usize = 3;
 
 pub fn parse_days(text: &str) -> Days {
     let mut d = Days::new();
     for l in text.lines() {
         let f: Vec<&str> = l.split_whitespace().collect();
-        if f.len() < 7 { continue; }
+        if f.len() < 13 { continue; }
         let u = |i: usize| f[i].parse::<u64>().unwrap_or(0);
         let x = |i: usize| f[i].parse::<f64>().unwrap_or(0.0);
-        if let Ok(day) = f[0].parse::<i64>() { d.insert(day, (Tally { n: u(1), sum: x(2), slow: u(3) }, Tally { n: u(4), sum: x(5), slow: u(6) })); }
+        if let Ok(day) = f[0].parse::<i64>() {
+            let t = |k: usize| Tally { n: u(1 + k * 3), sum: x(2 + k * 3), slow: u(3 + k * 3) };
+            d.insert(day, [t(0), t(1), t(2), t(3)]);
+        }
     }
     d
 }
 
 pub fn write_days(d: &Days) -> String {
-    d.iter().map(|(k, (a, b))| format!("{} {} {:.1} {} {} {:.1} {}\n", k, a.n, a.sum, a.slow, b.n, b.sum, b.slow)).collect()
+    d.iter().map(|(k, v)| format!("{} {}\n", k, v.iter().map(|a| format!("{} {:.1} {}", a.n, a.sum, a.slow)).collect::<Vec<_>>().join(" "))).collect()
 }
+
+/// One state's comparison: (normal time, held off, faster %, slow % normal, slow % held off).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Part { pub on: Tally, pub off: Tally, pub faster_pct: f64 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
+    /// All samples (for the hours and minutes measured).
     pub on: Tally, pub off: Tally, pub ready: bool,
-    /// How much slower the PC responds without snifrig, and how much faster with it (%).
+    /// How much slower the PC responds without snifrig, and how much faster with it (%), each
+    /// state compared like with like and weighted by how much of your use it is.
     pub slower_pct: f64, pub faster_pct: f64,
-    /// Lowest and highest day (days with enough holdout data).
+    /// How often it felt sluggish with and without snifrig (%), weighted the same way.
+    pub on_slow: f64, pub off_slow: f64,
+    /// Lowest and highest day (state-matched, days with enough holdout data).
     pub low: f64, pub high: f64, pub days: usize,
+    /// The two states, when each has enough holdouts.
+    pub here: Option<Part>, pub away: Option<Part>,
 }
 
-/// Pure: the last DAYS days ending at `today`, pooled.
+fn part(on: Tally, off: Tally, min_off: u64) -> Option<Part> {
+    (off.n >= min_off && on.n >= MIN_ON_STATE && on.mean() > 0.0 && off.mean() > 0.0)
+        .then(|| Part { on, off, faster_pct: (1.0 - on.mean() / off.mean()) * 100.0 })
+}
+
+/// Pure: the last DAYS days ending at `today`, pooled per state, then weighted by real use.
 pub fn summarize(d: &Days, today: i64) -> Summary {
-    let recent: Vec<&(Tally, Tally)> = d.range(today - DAYS + 1..=today).map(|(_, v)| v).collect();
-    let (on, off) = recent.iter().fold((Tally::default(), Tally::default()), |(a, b), (x, y)| (a.plus(*x), b.plus(*y)));
-    let ready = off.n >= MIN_OFF_SAMPLES && on.n >= MIN_ON_SAMPLES && on.mean() > 0.0;
-    let slower = if on.mean() > 0.0 { (off.mean() / on.mean() - 1.0) * 100.0 } else { 0.0 };
-    let mut per: Vec<f64> = recent.iter().filter(|(a, b)| b.n >= 60 && a.n >= 600 && a.mean() > 0.0).map(|(a, b)| (b.mean() / a.mean() - 1.0) * 100.0).collect();
+    let recent: Vec<&[Tally; 4]> = d.range(today - DAYS + 1..=today).map(|(_, v)| v).collect();
+    let sum = |k: usize| recent.iter().fold(Tally::default(), |a, v| a.plus(v[k]));
+    let here = part(sum(HERE_ON), sum(HERE_OFF), MIN_OFF_HERE);
+    let away = part(sum(AWAY_ON), sum(AWAY_OFF), MIN_OFF_AWAY);
+    let parts: Vec<Part> = [here, away].into_iter().flatten().collect();
+    let w: f64 = parts.iter().map(|p| p.on.n as f64).sum();
+    let avg = |f: &dyn Fn(&Part) -> f64| if w > 0.0 { parts.iter().map(|p| f(p) * p.on.n as f64).sum::<f64>() / w } else { 0.0 };
+    let faster = avg(&|p| p.faster_pct);
+    let slower = avg(&|p| (p.off.mean() / p.on.mean() - 1.0) * 100.0);
+    let mut per: Vec<f64> = Vec::new();
+    for v in &recent {
+        let mut num = 0.0; let mut den = 0.0;
+        for (on, off) in [(v[HERE_ON], v[HERE_OFF]), (v[AWAY_ON], v[AWAY_OFF])] {
+            if off.n >= 60 && on.n >= 300 && on.mean() > 0.0 { num += (off.mean() / on.mean() - 1.0) * 100.0 * on.n as f64; den += on.n as f64; }
+        }
+        if den > 0.0 { per.push(num / den); }
+    }
     per.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Summary { on, off, ready, slower_pct: slower, faster_pct: if off.mean() > 0.0 { (1.0 - on.mean() / off.mean()) * 100.0 } else { 0.0 },
-        low: per.first().copied().unwrap_or(slower), high: per.last().copied().unwrap_or(slower), days: recent.len() }
+    Summary { on: sum(HERE_ON).plus(sum(AWAY_ON)), off: sum(HERE_OFF).plus(sum(AWAY_OFF)), ready: !parts.is_empty(), slower_pct: slower, faster_pct: faster,
+        on_slow: avg(&|p| p.on.slow_pct()), off_slow: avg(&|p| p.off.slow_pct()),
+        low: per.first().copied().unwrap_or(slower), high: per.last().copied().unwrap_or(slower), days: recent.len(), here, away }
 }
 
 /// Pure: the sentence people see.
@@ -90,13 +135,23 @@ pub fn sentence(s: &Summary) -> String {
     let mins = s.off.n as f64 * 5.0 / 60.0;
     let hours = s.on.n as f64 * 5.0 / 3600.0;
     if !s.ready {
-        return format!("Measuring: {:.0} of 20 minutes of comparison collected. snifrig measures your whole day and holds off at random moments, 2 minutes at a time, to compare.", mins.min(19.0));
+        return format!("Measuring: {:.0} minutes of comparison collected so far. snifrig measures your whole day and holds off at random moments, 2 minutes at a time, comparing like with like (you at the PC, or away).", mins);
     }
-    if s.faster_pct < 2.0 {
-        return format!("No clear difference measured over the last {} days ({:.0} hours measured).", s.days.min(DAYS as usize), hours);
+    let scope = match (s.here.is_some(), s.away.is_some()) {
+        (true, true) => String::new(),
+        (false, true) => " Measured while you were away only: not enough tests yet while you were at the PC.".into(),
+        _ => " Measured while you were at the PC only: not enough tests yet while you were away.".into(),
+    };
+    let days = s.days.min(DAYS as usize);
+    if s.faster_pct.abs() < 3.0 {
+        return format!("No clear difference measured over the last {} days ({:.0} hours measured).{}", days, hours, scope);
     }
-    format!("Over the last {} days your PC responded {:.0}% faster with snifrig. It felt sluggish {:.0}% of the time without snifrig and {:.0}% with it. Measured over {:.0} hours of your normal use, against {:.0} minutes where snifrig held off at random.",
-        s.days.min(DAYS as usize), s.faster_pct, s.off.slow_pct(), s.on.slow_pct(), hours, mins)
+    if s.faster_pct < 0.0 {
+        return format!("Over the last {} days your PC responded {:.0}% slower with snifrig than when it held off. It felt sluggish {:.0}% of the time without snifrig and {:.0}% with it. Measured over {:.0} hours, against {:.0} minutes where snifrig held off at random.{}",
+            days, -s.faster_pct, s.off_slow, s.on_slow, hours, mins, scope);
+    }
+    format!("Over the last {} days your PC responded {:.0}% faster with snifrig. It felt sluggish {:.0}% of the time without snifrig and {:.0}% with it. Measured over {:.0} hours of your normal use, against {:.0} minutes where snifrig held off at random.{}",
+        days, s.faster_pct, s.off_slow, s.on_slow, hours, mins, scope)
 }
 
 /// What the PC is doing, as the meter needs it.
@@ -199,8 +254,9 @@ impl Impact {
         }
         if let Some((ms, slow)) = n.sample {
             let held = self.holding(n.now);
+            let away = n.idle_secs >= AWAY_SECS;
             let e = self.days.entry(n.local_day).or_default();
-            if held { e.1.add(ms, slow) } else { e.0.add(ms, slow) }
+            e[match (away, held) { (false, false) => HERE_ON, (false, true) => HERE_OFF, (true, false) => AWAY_ON, (true, true) => AWAY_OFF }].add(ms, slow);
             if n.now - self.dirty_at > 300.0 { self.save(dir, n.local_day); self.dirty_at = n.now; }
         }
         out
@@ -217,10 +273,16 @@ impl Impact {
 fn write_summary_from(dir: &Path, d: &Days, today: i64) -> Summary {
     use crate::json::esc;
     let s = summarize(d, today);
-    let rows: Vec<String> = d.range(today - DAYS + 1..=today).map(|(k, (a, b))| format!("{{\"day\":{},\"on_ms\":{:.1},\"on_slow\":{:.1},\"on_min\":{:.0},\"off_ms\":{:.1},\"off_slow\":{:.1},\"off_min\":{:.1}}}",
-        k, a.mean(), a.slow_pct(), a.n as f64 * 5.0 / 60.0, b.mean(), b.slow_pct(), b.n as f64 * 5.0 / 60.0)).collect();
-    let body = format!("{{\"ready\":{},\"faster_pct\":{:.1},\"slower_pct\":{:.1},\"low\":{:.1},\"high\":{:.1},\"on_ms\":{:.1},\"off_ms\":{:.1},\"on_slow\":{:.1},\"off_slow\":{:.1},\"hours\":{:.1},\"off_minutes\":{:.1},\"text\":\"{}\",\"days\":[{}]}}\n",
-        s.ready, s.faster_pct, s.slower_pct, s.low, s.high, s.on.mean(), s.off.mean(), s.on.slow_pct(), s.off.slow_pct(), s.on.n as f64 * 5.0 / 3600.0, s.off.n as f64 * 5.0 / 60.0, esc(&sentence(&s)), rows.join(","));
+    let rows: Vec<String> = d.range(today - DAYS + 1..=today).map(|(k, v)| {
+        let on = v[HERE_ON].plus(v[AWAY_ON]); let off = v[HERE_OFF].plus(v[AWAY_OFF]);
+        format!("{{\"day\":{},\"on_ms\":{:.1},\"on_slow\":{:.1},\"on_min\":{:.0},\"off_ms\":{:.1},\"off_slow\":{:.1},\"off_min\":{:.1},\"here_on_min\":{:.0},\"here_off_min\":{:.1},\"away_on_min\":{:.0},\"away_off_min\":{:.1}}}",
+            k, on.mean(), on.slow_pct(), on.n as f64 * 5.0 / 60.0, off.mean(), off.slow_pct(), off.n as f64 * 5.0 / 60.0,
+            v[HERE_ON].n as f64 * 5.0 / 60.0, v[HERE_OFF].n as f64 * 5.0 / 60.0, v[AWAY_ON].n as f64 * 5.0 / 60.0, v[AWAY_OFF].n as f64 * 5.0 / 60.0)
+    }).collect();
+    let p = |x: &Option<Part>| x.map(|p| format!("{{\"faster_pct\":{:.1},\"on_ms\":{:.2},\"off_ms\":{:.2},\"on_slow\":{:.1},\"off_slow\":{:.1},\"on_min\":{:.0},\"off_min\":{:.1}}}",
+        p.faster_pct, p.on.mean(), p.off.mean(), p.on.slow_pct(), p.off.slow_pct(), p.on.n as f64 * 5.0 / 60.0, p.off.n as f64 * 5.0 / 60.0)).unwrap_or_else(|| "null".into());
+    let body = format!("{{\"ready\":{},\"faster_pct\":{:.1},\"slower_pct\":{:.1},\"low\":{:.1},\"high\":{:.1},\"on_ms\":{:.1},\"off_ms\":{:.1},\"on_slow\":{:.1},\"off_slow\":{:.1},\"hours\":{:.1},\"off_minutes\":{:.1},\"here\":{},\"away\":{},\"text\":\"{}\",\"days\":[{}]}}\n",
+        s.ready, s.faster_pct, s.slower_pct, s.low, s.high, s.on.mean(), s.off.mean(), s.on_slow, s.off_slow, s.on.n as f64 * 5.0 / 3600.0, s.off.n as f64 * 5.0 / 60.0, p(&s.here), p(&s.away), esc(&sentence(&s)), rows.join(","));
     crate::rules::write_atomic(&dir.join(SUMMARY), &body);
     s
 }
@@ -235,38 +297,47 @@ pub fn write_summary(dir: &Path, today: i64) -> Summary {
 mod tests {
     use super::*;
 
-    fn day(on: (u64, f64, u64), off: (u64, f64, u64)) -> (Tally, Tally) {
-        (Tally { n: on.0, sum: on.1 * on.0 as f64, slow: on.2 }, Tally { n: off.0, sum: off.1 * off.0 as f64, slow: off.2 })
+    fn t(n: u64, mean: f64, slow: u64) -> Tally { Tally { n, sum: mean * n as f64, slow } }
+
+    #[test]
+    fn like_with_like() {
+        // Working hours are slower than away time anyway. Holdouts mostly happen while away.
+        // Pooled, snifrig would look 70% "slower"; matched, it is 20% faster in both states.
+        let mut d = Days::new();
+        d.insert(10, [t(8000, 2.0, 400), t(200, 2.5, 20), t(8000, 0.4, 0), t(2000, 0.5, 0)]);
+        let s = summarize(&d, 10);
+        assert!(s.ready);
+        assert!((s.faster_pct - 20.0).abs() < 0.1, "{}", s.faster_pct);
+        assert!(s.here.is_some() && s.away.is_some());
+        let txt = sentence(&s);
+        assert!(txt.contains("20% faster") && !txt.contains("away only"), "{}", txt);
+        // Not enough holdouts at the PC: the number covers away time only, and says so.
+        d.insert(10, [t(8000, 2.0, 400), t(50, 2.5, 20), t(8000, 0.4, 0), t(2000, 0.5, 0)]);
+        let s = summarize(&d, 10);
+        assert!(s.here.is_none() && sentence(&s).contains("away only"));
     }
 
     #[test]
-    fn pooled_over_the_week() {
+    fn worse_is_reported_as_worse() {
         let mut d = Days::new();
-        d.insert(10, day((5000, 60.0, 250), (200, 100.0, 40)));
-        d.insert(11, day((5000, 80.0, 500), (200, 120.0, 50)));
-        d.insert(2, day((9000, 10.0, 0), (900, 500.0, 900))); // older than 7 days: ignored
-        let s = summarize(&d, 11);
-        assert!(s.ready);
-        assert!((s.on.mean() - 70.0).abs() < 0.01 && (s.off.mean() - 110.0).abs() < 0.01);
-        assert!((s.faster_pct - 36.36).abs() < 0.1, "{}", s.faster_pct);
-        assert!((s.low - 50.0).abs() < 0.1 && (s.high - 66.7).abs() < 0.1, "{} {}", s.low, s.high);
-        let t = sentence(&s);
-        assert!(t.contains("36% faster with snifrig") && t.contains("sluggish 22% of the time without snifrig and 8% with it"), "{}", t);
+        d.insert(1, [t(5000, 3.0, 300), t(300, 2.0, 6), t(0, 0.0, 0), t(0, 0.0, 0)]);
+        let txt = sentence(&summarize(&d, 1));
+        assert!(txt.contains("50% slower with snifrig"), "{}", txt);
     }
 
     #[test]
     fn honest_when_not_ready_or_no_difference() {
         let mut d = Days::new();
-        d.insert(1, day((5000, 60.0, 0), (50, 100.0, 0)));
+        d.insert(1, [t(5000, 60.0, 0), t(50, 100.0, 0), t(0, 0.0, 0), t(0, 0.0, 0)]);
         assert!(sentence(&summarize(&d, 1)).starts_with("Measuring"));
-        d.insert(1, day((5000, 60.0, 0), (300, 60.5, 0)));
+        d.insert(1, [t(5000, 60.0, 0), t(300, 60.5, 0), t(0, 0.0, 0), t(0, 0.0, 0)]);
         assert!(sentence(&summarize(&d, 1)).starts_with("No clear difference"));
     }
 
     #[test]
     fn days_roundtrip() {
         let mut d = Days::new();
-        d.insert(20000, day((10, 5.0, 1), (2, 9.0, 1)));
+        d.insert(20000, [t(10, 5.0, 1), t(2, 9.0, 1), t(3, 1.0, 0), t(4, 2.0, 0)]);
         assert_eq!(parse_days(&write_days(&d)), d);
     }
 

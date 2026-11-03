@@ -2038,8 +2038,12 @@ pub fn main() {
         ["impact"] => {
             let s = snifrig_fix::impact::write_summary(&dir, ((now_unix() as i64) + sys::local_offset_secs()).div_euclid(86400));
             println!("{}", snifrig_fix::impact::sentence(&s));
-            println!("with snifrig: {:.0} ms average, sluggish {:.1}% of the time ({:.1} hours measured)", s.on.mean(), s.on.slow_pct(), s.on.n as f64 * 5.0 / 3600.0);
-            println!("snifrig holding off: {:.0} ms average, sluggish {:.1}% of the time ({:.1} minutes measured)", s.off.mean(), s.off.slow_pct(), s.off.n as f64 * 5.0 / 60.0);
+            for (label, p) in [("at the PC", s.here), ("away", s.away)] {
+                match p {
+                    Some(p) => println!("{}: {:+.0}% (with snifrig {:.2} ms, sluggish {:.1}% over {:.0} min; holding off {:.2} ms, sluggish {:.1}% over {:.0} min)", label, p.faster_pct, p.on.mean(), p.on.slow_pct(), p.on.n as f64 * 5.0 / 60.0, p.off.mean(), p.off.slow_pct(), p.off.n as f64 * 5.0 / 60.0),
+                    None => println!("{}: not enough tests yet", label),
+                }
+            }
             println!("days: {}; every holdout: {}", dir.join(snifrig_fix::impact::DAYS_FILE).display(), dir.join(snifrig_fix::impact::HOLDS_LOG).display());
         }
         ["impact", "answer", a @ ("yes" | "slow" | "no")] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::ANSWER_FILE), a); println!("thanks"); }

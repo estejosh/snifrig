@@ -789,7 +789,7 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Measure now").on_hover_text("snifrig holds off for 2 minutes now, to compare.").clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), "test".into()], "snifrig holds off for 2 minutes to compare."); }
-                        if ui.button("Open the measurements").clicked() { let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", self.dir.join("impact-days.txt").display())).spawn(); }
+                        if ui.button("Open the measurements").clicked() { let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", self.dir.join("impact-days2.txt").display())).spawn(); }
                         let off = self.dir.join("impact-off").exists();
                         if ui.button(if off { "Turn measuring on" } else { "Turn measuring off" }).clicked() { self.run("snifrig-fix.exe", vec!["impact".into(), if off { "on" } else { "off" }.into()], if off { "Measuring is on." } else { "Measuring is off." }); }
                     });
