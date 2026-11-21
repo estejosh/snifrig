@@ -1099,9 +1099,9 @@ fn paused_until(dir: &std::path::Path) -> f64 {
     if u > now_unix() { u } else { 0.0 }
 }
 
-/// Where field reports go. Empty until the endpoint exists; field-report-url.txt in the data
+/// Where field reports go (ferryvps route to grouchly n8n, mailed to helpmeagent); field-report-url.txt in the data
 /// folder overrides it.
-const REPORT_URL: &str = "";
+const REPORT_URL: &str = "https://reports.fu.observer/webhook/snifrig-report";
 
 /// `snifrig send-report [--yes]`: show this PC's field report (made by `snifrig-fix field-report`),
 /// what it is for and whether it is worth sending; send it only with --yes (the app's "Send it"
