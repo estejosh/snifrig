@@ -230,9 +230,38 @@ fn top_n<T, F: Fn(&T) -> f64>(v: &mut Vec<T>, n: usize, key: F) {
 }
 
 // ---------- monitor ----------
+/// The monitor never checks less often than this, even when it backs off (self_guard).
+const MAX_INTERVAL: f64 = 600.0;
+
+/// An issue with no repeat for this long counts as resolved; seen again after that, it is shown again.
+const ISSUE_OPEN_SECS: f64 = 6.0 * 3600.0;
+
+/// "pm:python.exe#123" and "pm:python.exe#456" are one issue: the alert key without its pid.
+fn issue_key(key: &str) -> String {
+    match key.rsplit_once('#') { Some((k, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => k.to_string(), _ => key.to_string() }
+}
+
+/// issues.txt: "key<TAB>first<TAB>last<TAB>count" per line, so a restart does not show them again.
+fn load_issues(dir: &PathBuf) -> HashMap<String, (f64, f64, u32)> {
+    fs::read_to_string(dir.join("issues.txt")).unwrap_or_default().lines().filter_map(|l| {
+        let f: Vec<&str> = l.split('\t').collect();
+        (f.len() == 4).then(|| Some((f[0].to_string(), (f[1].parse().ok()?, f[2].parse().ok()?, f[3].parse().ok()?)))).flatten()
+    }).collect()
+}
+
+fn save_issues(dir: &PathBuf, m: &HashMap<String, (f64, f64, u32)>, t: f64) {
+    let s: String = m.iter().filter(|(_, v)| t - v.1 < 7.0 * 86400.0).map(|(k, v)| format!("{}\t{:.0}\t{:.0}\t{}\n", k, v.0, v.1, v.2)).collect();
+    let tmp = dir.join("issues.txt.tmp");
+    if fs::write(&tmp, s).is_ok() { let _ = fs::rename(&tmp, dir.join("issues.txt")); }
+}
+
 struct Mon {
     dir: PathBuf,
     interval: f64,
+    /// The interval asked for at start; backing off returns here once the PC calms down.
+    base_interval: f64,
+    /// Open issues (alert key without pid): first seen, last seen, times seen.
+    issues: HashMap<String, (f64, f64, u32)>,
     buf: Vec<u8>,
     cycle: u64,
     series: HashMap<String, Series>,
@@ -275,7 +304,7 @@ impl Mon {
 
     fn new_inner(dir: PathBuf, interval: f64, quiet: bool) -> Self {
         Mon {
-            dir, interval, buf: vec![0u8; 1 << 20], cycle: 0, series: HashMap::new(), cool: HashMap::new(),
+            issues: load_issues(&dir), dir, interval, base_interval: interval, buf: vec![0u8; 1 << 20], cycle: 0, series: HashMap::new(), cool: HashMap::new(),
             prev_alloc: HashMap::new(), tag_live: HashMap::new(), young: Vec::new(), top_tags: Vec::new(),
             own_cpu: VecDeque::new(), last_own: None, base: None, base_threads: 0, quiet,
             last_alert_t: 0.0, last_alert_msg: String::new(), alert_times: VecDeque::new(), spawner: String::new(), last_burst: -1e9, rebase: false,
@@ -289,6 +318,22 @@ impl Mon {
     }
 
     fn alert(&mut self, t: f64, key: &str, msg: &str) {
+        // Same problem, same app, any pid: one issue. While it stays unresolved it is shown
+        // once (tray balloon, tip, webhook); repeats are still logged for the fixer, marked
+        // "repeat" with a count. It counts as resolved after ISSUE_OPEN_SECS with no repeat.
+        let id = issue_key(key);
+        let e = self.issues.entry(id).or_insert((t, 0.0, 0));
+        let repeat = e.2 > 0 && t - e.1 < ISSUE_OPEN_SECS;
+        if !repeat { e.0 = t; e.2 = 0; }
+        e.1 = t;
+        e.2 += 1;
+        let count = e.2;
+        save_issues(&self.dir, &self.issues, t);
+        if repeat {
+            let line = format!("{{\"t\":\"{}\",\"key\":\"{}\",\"msg\":\"{}\",\"repeat\":{}}}", iso(t), esc(key), esc(msg), count);
+            append_capped(&self.dir.join("alerts.jsonl"), &line, ALERT_CAP);
+            return;
+        }
         let line = format!("{{\"t\":\"{}\",\"key\":\"{}\",\"msg\":\"{}\"}}", iso(t), esc(key), esc(msg));
         ALERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.last_alert_t = t;
@@ -517,11 +562,31 @@ impl Mon {
             if mb(o.private.saturating_sub(bp)) > 8.0 { why.push(format!("private bytes grew {:.1} MB over 8", mb(o.private.saturating_sub(bp)))); }
             if o.handles > bh + 8 { why.push(format!("handles grew {} over 8", o.handles - bh)); }
         }
+        // CPU over budget is not a leak in snifrig: on a starved PC (paging, a choking disk) every
+        // process's CPU time balloons, snifrig's too. Quitting then (16 Nov: 12:57 and 13:11, right
+        // before the crash) leaves the PC unwatched exactly when it matters, so back off instead:
+        // check half as often, up to every 10 minutes, and come back down once things calm.
+        let mut cpu_over = None;
         if self.interval >= 10.0 && self.own_cpu.len() >= 5 {
             let avg = self.own_cpu.iter().sum::<f64>() / self.own_cpu.len() as f64;
-            if avg > 1.0 { why.push(format!("cpu {:.2}% over 1", avg)); }
+            if avg > 1.0 { cpu_over = Some(avg); }
+            else if avg < 0.3 && self.interval > self.base_interval {
+                self.interval = (self.interval / 2.0).max(self.base_interval);
+                self.own_cpu.clear();
+            }
         }
-        if why.is_empty() { return true; }
+        if why.is_empty() {
+            if let Some(avg) = cpu_over {
+                if self.interval < MAX_INTERVAL {
+                    self.interval = (self.interval * 2.0).min(MAX_INTERVAL);
+                    self.own_cpu.clear();
+                    let m = format!("self-guard: snifrig's own CPU was {:.1}% (budget 1%), probably because the PC is starved; checking every {:.0} s instead of quitting", avg, self.interval);
+                    self.alert(t, "self", &m);
+                }
+            }
+            return true;
+        }
+        if let Some(avg) = cpu_over { why.push(format!("cpu {:.2}% over 1", avg)); }
         let m = format!("self-guard tripped, exiting: {}", why.join("; "));
         self.alert(t, "self", &m);
         false
@@ -674,6 +739,7 @@ pub fn run() {
         Some("pause") => { let m: f64 = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(60.0); let u = now_unix() + m * 60.0; let _ = fs::write(dir.join("mode.json"), format!("{{\"paused_until\":{:.0}}}", u)); println!("fixing paused for {:.0} min. monitoring continues.", m); return; }
         Some("resume") => { let _ = fs::remove_file(dir.join("mode.json")); println!("fixing resumed."); return; }
         Some("webhook") => { match a.get(1) { Some(u) if u.starts_with("http") => { let _ = fs::write(dir.join("webhook.txt"), u); println!("webhook saved. test post: {}", if post_json(u, &format!("{{\"source\":\"snifrig\",\"host\":\"{}\",\"t\":\"{}\",\"key\":\"webhook-test\",\"msg\":\"webhook test: alerts from this PC will arrive here\"}}", esc(&std::env::var("COMPUTERNAME").unwrap_or_default()), iso(now()))) { "ok" } else { "failed" }); } Some(x) if x == "off" => { let _ = fs::remove_file(dir.join("webhook.txt")); println!("webhook removed."); } _ => println!("usage: snifrig webhook URL|off") } return; }
+        Some("send-report") => { send_report(&dir, a.iter().any(|x| x == "--yes")); return; }
         Some("report") => { let days = flag("--days").and_then(|d| d.parse::<f64>().ok()).filter(|d| *d > 0.0).unwrap_or(7.0); print!("{}", report::run(&dir, days)); println!("\nNotice: {}", notice::NOTICE_TEXT); return; }
         Some("slowdown") => { let l = slowdown::summarize(&dir); if l.is_empty() { println!("No Windows slowdowns recorded in the last 24 hours."); } else { for x in l { println!("{}", x); } } return; }
         Some("disk") => {
@@ -745,7 +811,7 @@ pub fn run() {
     let interval: f64 = flag("--interval").and_then(|s| s.parse().ok()).unwrap_or(60.0f64).max(1.0);
     let max_cycles: u64 = flag("--cycles").and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
     let mut m = Mon::new(dir.clone(), interval, false);
-    let start = Instant::now();
+    let mut next_at = Instant::now();
     let mut k: u64 = 0;
     let mut ok = true;
     while k < max_cycles {
@@ -753,7 +819,10 @@ pub fn run() {
         k += 1;
         if k % 30 == 0 { bump_stats(&dir, 30); }
         if !ok { break; }
-        let next = start + Duration::from_secs_f64(interval * k as f64);
+        // m.interval, not the start value: the self-guard backs off on a starved PC instead of quitting.
+        next_at += Duration::from_secs_f64(m.interval);
+        if next_at < Instant::now() { next_at = Instant::now(); }
+        let next = next_at;
         let stop = dir.join("stop");
         while Instant::now() < next && !stop.exists() {
             std::thread::sleep(Duration::from_millis(500).min(next.saturating_duration_since(Instant::now())));
@@ -1028,6 +1097,35 @@ fn now_unix() -> f64 { std::time::SystemTime::now().duration_since(std::time::UN
 fn paused_until(dir: &std::path::Path) -> f64 {
     let u = fs::read_to_string(dir.join("mode.json")).ok().and_then(|s| s.split(':').nth(1).and_then(|v| v.trim_matches(|c: char| !c.is_ascii_digit()).parse::<f64>().ok())).unwrap_or(0.0);
     if u > now_unix() { u } else { 0.0 }
+}
+
+/// Where field reports go. Empty until the endpoint exists; field-report-url.txt in the data
+/// folder overrides it.
+const REPORT_URL: &str = "";
+
+/// `snifrig send-report [--yes]`: show this PC's field report (made by `snifrig-fix field-report`),
+/// what it is for and whether it is worth sending; send it only with --yes (the app's "Send it"
+/// button). Nothing is sent on its own, ever.
+fn send_report(dir: &std::path::Path, yes: bool) {
+    let Ok(body) = fs::read_to_string(dir.join("field-report.json")) else {
+        println!("No field report yet. Make one with: snifrig-fix field-report");
+        return;
+    };
+    let body = body.trim().to_string();
+    println!("What it is for: it tells us which of snifrig's checks work on this kind of PC and which do not, so we can make them work on every setup (a drive snifrig cannot read, a Windows build or a network card it has not seen). It holds no names, files, serial numbers or addresses.\n");
+    println!("{}\n", body);
+    let useful = body.contains("\"useful\":true");
+    let why = json_str(&body, "why").unwrap_or_default();
+    println!("{} {}\n", if useful { "Worth sending:" } else { "No need to send it:" }, why);
+    if !yes { println!("To send it: snifrig send-report --yes"); return; }
+    let url = fs::read_to_string(dir.join("field-report-url.txt")).ok().map(|s| s.trim().to_string()).filter(|s| s.starts_with("http")).unwrap_or_else(|| REPORT_URL.to_string());
+    if url.is_empty() { println!("Not sent: no destination is set up yet. The report stays in {}.", dir.join("field-report.json").display()); return; }
+    if post_json(&url, &body) {
+        let _ = fs::write(dir.join("field-report-sent.txt"), format!("{:.0}\n", now_unix()));
+        println!("Sent. Thank you.");
+    } else {
+        println!("Could not send it (no connection?). It stays in {}; try again later.", dir.join("field-report.json").display());
+    }
 }
 
 fn post_json(url: &str, body: &str) -> bool {

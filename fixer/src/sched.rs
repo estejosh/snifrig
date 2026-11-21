@@ -409,8 +409,8 @@ impl Scheduler {
         let job = unsafe { windows_sys::Win32::System::JobObjects::CreateJobObjectW(std::ptr::null(), std::ptr::null()) } as isize;
         if job != 0 { unsafe { windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(job as _, h as _); } }
         #[link(name = "ntdll", kind = "raw-dylib")]
-        extern "system" { fn NtResumeProcess(h: isize) -> i32; }
-        unsafe { NtResumeProcess(h); }
+        extern "system" { fn NtResumeProcess(h: windows_sys::Win32::Foundation::HANDLE) -> i32; }
+        unsafe { NtResumeProcess(h as _); }
         Ok(Running { child, job, started: now, log })
     }
 

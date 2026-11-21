@@ -209,6 +209,11 @@ fn find_tool(cx: &Ctx, name: &str) -> Option<PathBuf> {
         c.push(d.join(name));
     }
     c.push(cx.dir.join("bin").join(name));
+    // Installs since 29 Oct carry the monitor as snifrigd.exe (windowless); same commands.
+    if name == "snifrig.exe" {
+        if let Some(d) = exe_dir() { c.push(d.join("snifrigd.exe")); }
+        c.push(cx.dir.join("bin").join("snifrigd.exe"));
+    }
     c.into_iter().find(|p| p.exists())
 }
 
@@ -342,7 +347,13 @@ fn status(cx: &Ctx) -> String {
     let cpu = sys::cpu_now();
     let (used, total) = sys::ram();
     o += &format!("CPU now: {:.0}%\nRAM: {:.1} GB used of {:.1} GB\n", cpu, used / 1024.0, total / 1024.0);
-    if let Some(g) = read_json(cx, "gpu.json") {
+    // Only a fresh reading: a stale gpu.json showed the same 77 C / 225 W for 13 days.
+    let gpu = read_json(cx, "gpu.json");
+    let gpu_age = gpu.as_ref().and_then(|g| gn(g, "unix")).map(|u| t - u as i64);
+    if gpu.is_some() && gpu_age.map_or(true, |a| a > 900) {
+        o += &format!("GPU: no fresh reading{}\n", gpu_age.map(|a| format!(" (last one {} h old)", a / 3600)).unwrap_or_default());
+    }
+    if let Some(g) = gpu.filter(|_| gpu_age.map_or(false, |a| a <= 900)) {
         let mut s = String::from("GPU:");
         if let Some(v) = gn(&g, "temp_c") {
             s += &format!(" {v:.0} C");
@@ -674,7 +685,8 @@ fn data_dir() -> PathBuf {
 
 fn main() {
     let cx = Ctx { dir: data_dir() };
-    eprintln!("snifrig-mcp {VERSION} data dir {}", cx.dir.display());
+    // Never eprintln!: if the client closed stderr, that panics and aborts the server.
+    let _ = writeln!(io::stderr(), "snifrig-mcp {VERSION} data dir {}", cx.dir.display());
     let stdin = io::stdin();
     let mut out = io::stdout().lock();
     for line in stdin.lock().lines() {

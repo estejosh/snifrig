@@ -22,8 +22,10 @@ use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+/// `private`: committed private bytes (PagefileUsage), what counts against the commit limit.
 #[derive(Clone, Debug, Default)]
-pub struct Proc { pub pid: u32, pub ppid: u32, pub name: String, pub created: u64, pub cpu: u64 }
+/// `io`: bytes read plus written since it started (for the disk guard).
+pub struct Proc { pub pid: u32, pub ppid: u32, pub name: String, pub created: u64, pub cpu: u64, pub private: u64, pub io: u64, pub threads: u32 }
 
 pub const IDLE: u32 = 0x40;
 pub const BELOW_NORMAL: u32 = 0x4000;
@@ -83,9 +85,13 @@ pub fn snapshot(buf: &mut Vec<u8>) -> Vec<Proc> {
                 let s = unsafe { std::slice::from_raw_parts(nptr as *const u16, (nlen / 2) as usize) };
                 String::from_utf16_lossy(s)
             };
+            // SYSTEM_PROCESS_INFORMATION (x64): PagefileUsage at 184.
+            let private: usize = if off + 192 <= buf.len() { rd(b, off + 184) } else { 0 };
+            // ReadTransferCount at 232, WriteTransferCount at 240: bytes moved since it started.
+            let io: usize = if off + 248 <= buf.len() { rd::<usize>(b, off + 232).wrapping_add(rd::<usize>(b, off + 240)) } else { 0 };
             out.push(Proc {
                 pid: pid as u32, ppid: ppid as u32, name,
-                created: create as u64, cpu: (user as u64).wrapping_add(kern as u64),
+                created: create as u64, cpu: (user as u64).wrapping_add(kern as u64), private: private as u64, io: io as u64, threads: rd::<u32>(b, off + 4),
             });
             if next == 0 { break; }
             off += next as usize;
@@ -93,6 +99,26 @@ pub fn snapshot(buf: &mut Vec<u8>) -> Vec<Proc> {
         return out;
     }
     Vec::new()
+}
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    fn NtSuspendProcess(h: HANDLE) -> i32;
+    fn NtResumeProcess(h: HANDLE) -> i32;
+}
+const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+
+/// Freeze every thread of a process. Nothing is closed and nothing is lost; resume() undoes it.
+pub fn suspend(pid: u32) -> Result<(), String> {
+    let h = open(pid, PROCESS_SUSPEND_RESUME)?;
+    let st = unsafe { NtSuspendProcess(h.0) };
+    if st < 0 { Err(format!("NtSuspendProcess({pid}) failed: 0x{:08x}", st as u32)) } else { Ok(()) }
+}
+
+pub fn resume(pid: u32) -> Result<(), String> {
+    let h = open(pid, PROCESS_SUSPEND_RESUME)?;
+    let st = unsafe { NtResumeProcess(h.0) };
+    if st < 0 { Err(format!("NtResumeProcess({pid}) failed: 0x{:08x}", st as u32)) } else { Ok(()) }
 }
 
 /// (commit %, available physical MB) from GlobalMemoryStatusEx; None if the call fails.
@@ -487,6 +513,19 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         if let Err(e) = r { std::panic::resume_unwind(e); }
+    }
+
+    #[test]
+    fn io_counts_what_we_write() {
+        let me = std::process::id();
+        let io = |buf: &mut Vec<u8>| snapshot(buf).into_iter().find(|p| p.pid == me).map(|p| p.io).unwrap();
+        let mut buf = Vec::new();
+        let before = io(&mut buf);
+        let f = std::env::temp_dir().join(format!("snifrig-io-{}.bin", me));
+        std::fs::write(&f, vec![7u8; 4 << 20]).unwrap();
+        let after = io(&mut buf);
+        let _ = std::fs::remove_file(&f);
+        assert!(after >= before + (4 << 20), "io {} -> {}", before, after);
     }
 
     #[test]

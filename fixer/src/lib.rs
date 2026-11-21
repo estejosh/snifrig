@@ -35,6 +35,9 @@ pub mod game;
 pub mod junk;
 pub mod disk;
 pub mod drivers;
+pub mod crashguard;
+pub mod drivehealth;
+pub mod syswatch;
 
 /// What the fixer can do, mildest first.
 #[derive(Clone, Debug, PartialEq)]

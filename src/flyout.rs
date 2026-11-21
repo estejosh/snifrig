@@ -88,7 +88,9 @@ pub unsafe fn show(dir: &Path) {
     if !FLY.is_null() { DestroyWindow(FLY); FLY = null_mut(); return; }
     *std::ptr::addr_of_mut!(FDIR) = Some(dir.to_path_buf());
     *std::ptr::addr_of_mut!(SNAP) = String::new();
-    if let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("snifrig.exe"))) {
+    // snifrig.exe, or snifrigd.exe on installs since 29 Oct (the snapshot was stale since then).
+    let mon = |d: &Path| if d.join("snifrig.exe").exists() { d.join("snifrig.exe") } else { d.join("snifrigd.exe") };
+    if let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(mon)) {
         use std::os::windows::process::CommandExt;
         use std::process::Stdio;
         let _ = std::process::Command::new(exe).arg("--snapshot").arg("--dir").arg(dir)

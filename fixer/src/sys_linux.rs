@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::fs;
 
 #[derive(Clone, Debug, Default)]
-pub struct Proc { pub pid: u32, pub ppid: u32, pub name: String, pub created: u64, pub cpu: u64 }
+pub struct Proc { pub pid: u32, pub ppid: u32, pub name: String, pub created: u64, pub cpu: u64, pub private: u64, pub io: u64, pub threads: u32 }
 
 pub const IDLE: u32 = 0x40;
 pub const BELOW_NORMAL: u32 = 0x4000;
@@ -64,7 +64,7 @@ pub fn snapshot(_buf: &mut Vec<u8>) -> Vec<Proc> {
     for e in rd.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
         let Some((comm, ppid, start, cpu)) = stat(pid) else { continue };
-        out.push(Proc { pid, ppid, name: name_of(pid, &comm), created: created_of(start, boot, tck), cpu: (cpu as f64 / tck * 1e7) as u64 });
+        out.push(Proc { pid, ppid, name: name_of(pid, &comm), created: created_of(start, boot, tck), cpu: (cpu as f64 / tck * 1e7) as u64, private: 0, io: 0, threads: 0 });
     }
     out
 }
@@ -73,7 +73,7 @@ pub fn snapshot(_buf: &mut Vec<u8>) -> Vec<Proc> {
 pub fn snapshot_one(pid: u32) -> Option<Proc> {
     let (comm, ppid, start, cpu) = stat(pid)?;
     let tck = clk_tck();
-    Some(Proc { pid, ppid, name: name_of(pid, &comm), created: created_of(start, boot_unix(), tck), cpu: (cpu as f64 / tck * 1e7) as u64 })
+    Some(Proc { pid, ppid, name: name_of(pid, &comm), created: created_of(start, boot_unix(), tck), cpu: (cpu as f64 / tck * 1e7) as u64, private: 0, io: 0, threads: 0 })
 }
 
 fn meminfo() -> std::collections::HashMap<String, f64> {
@@ -282,4 +282,21 @@ mod tests {
 
     #[test]
     fn ranges() { assert_eq!(parse_ranges("0-2,5,7-8"), vec![0, 1, 2, 5, 7, 8]); }
+}
+
+/// Private memory (RssAnon + swapped out, bytes): the Linux side of Windows' committed private bytes.
+/// Not filled in by snapshot() (one file per process per second is too much); ask for it per pid.
+pub fn private_bytes(pid: u32) -> u64 {
+    let s = fs::read_to_string(format!("/proc/{}/status", pid)).unwrap_or_default();
+    let kb = |k: &str| s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    (kb("RssAnon:") + kb("VmSwap:")) * 1024
+}
+
+/// Freeze a process (SIGSTOP). Nothing is closed; resume() undoes it.
+pub fn suspend(pid: u32) -> Result<(), String> {
+    if unsafe { libc::kill(pid as i32, libc::SIGSTOP) } == 0 { Ok(()) } else { Err(format!("SIGSTOP {} failed: {}", pid, std::io::Error::last_os_error())) }
+}
+
+pub fn resume(pid: u32) -> Result<(), String> {
+    if unsafe { libc::kill(pid as i32, libc::SIGCONT) } == 0 { Ok(()) } else { Err(format!("SIGCONT {} failed: {}", pid, std::io::Error::last_os_error())) }
 }

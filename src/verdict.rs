@@ -49,7 +49,13 @@ fn cpu_causes(i: &VerdictInput) -> Vec<String> {
     let mut h: Vec<&CpuHog> = i.cpu_hogs.iter().collect();
     h.sort_by(|a, b| b.pct.partial_cmp(&a.pct).unwrap_or(std::cmp::Ordering::Equal));
     let mut out: Vec<String> = h.iter().take(3).map(|x| {
-        let act = if super::cpuhog::auto_restarts(&x.name) { "End it; Windows restarts it." } else { "snifrig fix can rein it in; restart it when it suits you." };
+        // snifrig never slows Defender or WSL's VM (policy::DENY_NAMES), so never promise it.
+        let act = match x.name.to_ascii_lowercase().trim_end_matches(".exe") {
+            "msmpeng" => "That is Windows Defender checking new files, usually from builds or downloads; snifrig never slows it. Fewer builds at once, or a Dev Drive for build folders, cuts it down.",
+            "vmmemwsl" | "vmmem" => "That is WSL; wsl --shutdown stops it, and everything running in WSL.",
+            _ if super::cpuhog::auto_restarts(&x.name) => "End it; Windows restarts it.",
+            _ => "snifrig fix can rein it in; restart it when it suits you.",
+        };
         format!("{} is using about {:.0}% of a CPU core ({:.0} min, pid {}). {}", cap(&super::cpuhog::friendly(&x.name)), x.pct, x.minutes, x.pid, act)
     }).collect();
     if out.is_empty() { out.push("Open Task Manager, sort by CPU, and close what you are not using.".into()); }

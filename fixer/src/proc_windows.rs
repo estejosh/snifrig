@@ -43,6 +43,15 @@ fn image_of(h: &H) -> Option<String> {
 /// Current image base name of pid (e.g. "python.exe"), for identity re-checks right before acting.
 pub fn image_name(pid: u32) -> Option<String> { image_of(&open(pid)?) }
 
+/// Full path of pid's program file ("X:\Python\python.exe").
+pub fn image_path(pid: u32) -> Option<String> {
+    let h = open(pid)?;
+    let mut buf = [0u16; 1024];
+    let mut n = buf.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(h.0, 0, buf.as_mut_ptr(), &mut n) } == 0 { return None; }
+    Some(String::from_utf16_lossy(&buf[..n as usize]))
+}
+
 fn cmdline(h: &H) -> String {
     let mut buf = vec![0u64; 8192]; // 64 KB, 8-byte aligned
     let mut ret = 0u32;

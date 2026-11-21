@@ -49,6 +49,13 @@ impl Suggestion {
             "popup_guard" => format!("{} takes the screen from you", self.app.trim_start_matches('\\')),
             "jobs_handback" => "Windows needs your OK to run your jobs again".into(),
             "take_over_task" => "Windows needs your OK to hand jobs to snifrig".into(),
+            "frozen" => format!("snifrig froze {} so your PC would not crash", self.app),
+            "report" => "Help snifrig work on more PCs like this one".into(),
+            // Notes carry their own news (a failing drive, a crash loop): its first sentence is the title.
+            "note" if !self.reason.is_empty() => {
+                let first = self.reason.split(". ").next().unwrap_or(&self.reason).trim_end_matches('.');
+                if first.chars().count() > 90 { format!("{}...", first.chars().take(87).collect::<String>()) } else { first.to_string() }
+            }
             _ => "A note, nothing to change".into(),
         }
     }

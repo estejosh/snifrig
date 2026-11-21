@@ -16,6 +16,13 @@
 use snifrig_fix::{actions, baseline::Baseline, ledger, learn::{self, Feedback, Learner, Metrics, Trigger}, license, now_unix, plan, policy::Policy, proc, rules, sys, Action, Mode, Subject, Target, Verdict};
 use std::path::{Path, PathBuf};
 
+// The app, the MCP server and the tray run snifrig-fix commands and read what they print. When
+// the caller gives up and closes the pipe first, std's println! panics ("failed printing to
+// stdout"), the panic message fails to print too, and the process aborts (0xc0000409, three crash
+// dumps 15-20 Nov). Printing must never be able to crash snifrig: these write and ignore errors.
+macro_rules! println { ($($t:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stdout(), $($t)*); }} }
+macro_rules! eprintln { ($($t:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stderr(), $($t)*); }} }
+
 fn default_dir() -> PathBuf {
     std::env::var("LOCALAPPDATA").map(|p| PathBuf::from(p).join("snifrig")).unwrap_or_else(|_| PathBuf::from("data"))
 }
@@ -941,6 +948,617 @@ fn game_answer(dir: &Path, a: &str) -> Result<String, String> {
     Ok(format!("Thanks. Next time you play, snifrig turns {} all the way down while the game is in front.", busy.join(" and ")))
 }
 
+/// Carry out one crash-guard step: freeze (a card offers Resume and End), warn, or explain.
+fn crash_step(dir: &Path, crash: &mut snifrig_fix::crashguard::Guard, s: &snifrig_fix::crashguard::Step, act: bool) {
+    use snifrig_fix::crashguard::{say, Entry, State, Step};
+    let msg = say(s);
+    let rec = |key: String, status: &str, note: &str| {
+        let alert = snifrig_fix::Alert { t: String::new(), key, msg: msg.clone() };
+        ledger::record(dir, &alert, &Action::Report, None, status, note);
+    };
+    match s {
+        Step::Freeze { name, pid, created, mb, .. } => {
+            let key = format!("crash:freeze:{}", name.to_lowercase());
+            if !act { rec(key, "would", &msg); return; }
+            match sys::suspend(*pid) {
+                Ok(()) => {
+                    crash.mark_frozen(Entry { state: State::Frozen, pid: *pid, created: *created, unix: now_unix(), mb: *mb, name: name.clone() });
+                    crash.save(dir);
+                    add_card(dir, "frozen", name, &format!("frozen:{}", pid), &msg);
+                    rec(key, "done", &msg);
+                }
+                Err(e) => rec(key, "failed", &format!("could not freeze {}: {}. {}", name, e, msg)),
+            }
+        }
+        Step::Warn { name, .. } => {
+            // One warning card per app per 6 hours, whatever its pid (16-19 Nov: 106 of them).
+            add_card(dir, "note", name, &format!("crashwarn:{}:{:.0}", name.to_lowercase(), (now_unix() / 21600.0).floor()), &msg);
+            rec(format!("crash:warn:{}", name.to_lowercase()), "done", &msg);
+        }
+        Step::NoCulprit { top, .. } => {
+            let bucket = (now_unix() / 1800.0).floor();
+            match top {
+                // The existing "Shut down WSL" card (heavy wsl), so the fix is one click.
+                Some((n, _)) if snifrig_fix::crashguard::is_wsl(n) => add_card(dir, "shutdown_wsl", n, &format!("crashwsl:{:.0}", bucket), &msg),
+                Some((n, _)) => add_card(dir, "note", n, &format!("crashwarn:top:{:.0}", bucket), &msg),
+                None => add_card(dir, "note", "Windows", &format!("crashwarn:kernel:{:.0}", bucket), &msg),
+            }
+            rec("crash:kernel".into(), "done", &msg);
+        }
+    }
+}
+
+/// Drive trouble from Windows' own log in the last 10 minutes: a USB or storage reset (129),
+/// a failed file-system flush (140), disk retries (153), a drive that vanished (157), a paging
+/// error (51). On 16 Nov the X: drive (USB) logged 140 then 129, then the PC died; on 19 Nov it
+/// reset every 16 s for 4 minutes before the hard reboot. Checked every minute on its own thread
+/// (wevtutil can stall when the disk does; the fixer loop must not), at most one card an hour.
+/// What one probe found: drive events (10 min), resets (2 min), free space, and every 5 minutes
+/// the crash loops of the last hour (None in between).
+struct Probe { text: String, resets: usize, vols: Vec<(char, f64, f64)>, floods: Option<Vec<Flood>> }
+static DISK_PROBE: std::sync::Mutex<Option<Probe>> = std::sync::Mutex::new(None);
+static DISK_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Unix time of the last minute that had 3+ resets/timeouts: the disk guard acts for 10 minutes after.
+static DISK_TROUBLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISK_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn wevt(q: &str, max: u32) -> String { wevt_log("System", q, max) }
+
+fn wevt_log(log: &str, q: &str, max: u32) -> String {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("wevtutil").args(["qe", log, &format!("/q:{}", q), &format!("/c:{}", max), "/rd:true", "/f:text"])
+        .stdin(std::process::Stdio::null()).creation_flags(0x0800_0000).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    // The same IDs are reused by the hypervisor and boot loggers (129 and 153 at every boot):
+    // keep only events from storage and file-system sources.
+    out.split("Event[").filter(|e| e.contains("Event ID:"))
+        .filter(|e| !e.lines().any(|l| { let l = l.trim(); l.starts_with("Source:") && (l.contains("Hyper-V") || l.contains("Kernel-Boot")) }))
+        .map(|e| format!("Event[{}", e)).collect()
+}
+
+/// Start a probe unless one is still running (a stuck one just means no new probe).
+fn disk_probe_start(with_floods: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if DISK_RUNNING.swap(true, SeqCst) { return; }
+    std::thread::spawn(move || {
+        let text = wevt("*[System[(EventID=51 or EventID=129 or EventID=140 or EventID=153 or EventID=157) and TimeCreated[timediff(@SystemTime) <= 600000]]]", 10);
+        let resets = wevt("*[System[(EventID=129 or EventID=140 or EventID=153) and TimeCreated[timediff(@SystemTime) <= 120000]]]", 10).matches("Event ID:").count();
+        let vols = snifrig_fix::drivehealth::volumes();
+        let floods = with_floods.then(error_floods);
+        if let Ok(mut g) = DISK_PROBE.lock() { *g = Some(Probe { text, resets, vols, floods }); }
+        DISK_RUNNING.store(false, SeqCst);
+    });
+}
+
+/// Crash loops in the last hour, from Windows' own logs: an app crashing (Application 1000) or
+/// hanging (1002), a service dying (System 7031/7034). Returns (kind, who, count) over the bar:
+/// 5 crashes, 3 hangs, 3 service deaths. One app crash-looping keeps Windows Error Reporting busy
+/// writing dumps and can take a PC over as surely as a memory leak.
+fn error_floods() -> Vec<Flood> {
+    let app = wevt_log("Application", "*[System[(EventID=1000 or EventID=1002) and TimeCreated[timediff(@SystemTime) <= 3600000]]]", 300);
+    let sys = wevt_log("System", "*[System[(EventID=7031 or EventID=7034) and TimeCreated[timediff(@SystemTime) <= 3600000]]]", 100);
+    // Hardware: the graphics driver resetting (Display 4101) and errors the CPU, RAM or PCIe
+    // reported (WHEA 17/19/47 corrected, 18/1 fatal). These come before freezes and blue screens.
+    let gpu = wevt_log("System", "*[System[Provider[@Name='Display'] and EventID=4101 and TimeCreated[timediff(@SystemTime) <= 3600000]]]", 50);
+    let whea = wevt_log("System", "*[System[Provider[@Name='Microsoft-Windows-WHEA-Logger'] and TimeCreated[timediff(@SystemTime) <= 3600000]]]", 50);
+    count_floods(&format!("{}{}{}{}", app, sys, gpu, whea)).into_iter().map(|(k, w, n)| { let task = if k == "crash" || k == "hang" { task_running(&w) } else { None }; (k, w, n, task) }).collect()
+}
+
+/// Pure part of error_floods (tested): parse wevtutil text events and count per app.
+fn count_floods(text: &str) -> Vec<(String, String, usize)> {
+    let between = |s: &str, a: &str, b: &str| s.find(a).map(|i| &s[i + a.len()..]).and_then(|r| r.find(b).map(|j| r[..j].trim().to_string()));
+    let mut n: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    for ev in text.split("Event[").filter(|e| e.contains("Event ID:")) {
+        let id = ev.lines().find_map(|l| l.trim().strip_prefix("Event ID:").map(|v| v.trim().to_string())).unwrap_or_default();
+        let hit = match id.as_str() {
+            "1000" => between(ev, "Faulting application name: ", ",").map(|w| ("crash", w)),
+            "1002" => between(ev, "The program ", " version").map(|w| ("hang", w)),
+            "7031" | "7034" => between(ev, "The ", " service terminated").map(|w| ("service", w)),
+            "4101" => Some(("gpu-reset", "the graphics driver".to_string())),
+            "17" | "19" | "47" if ev.contains("WHEA") => Some(("hw-corrected", "hardware".to_string())),
+            "18" | "1" if ev.contains("WHEA") => Some(("hw-fatal", "hardware".to_string())),
+            _ => None,
+        };
+        if let Some((k, w)) = hit.filter(|(_, w)| !w.is_empty()) { *n.entry((k.to_string(), w)).or_default() += 1; }
+    }
+    let bar = |k: &str| match k { "crash" => 5, "hw-fatal" => 1, "gpu-reset" => 2, _ => 3 };
+    let mut out: Vec<(String, String, usize)> = n.into_iter().filter(|((k, _), c)| *c >= bar(k)).map(|((k, w), c)| (k, w, c)).collect();
+    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out
+}
+
+fn flood_rule(kind: &str, who: &str) -> String { format!("errors:{}:{}:{:.0}", kind, who.to_lowercase(), (now_unix() / 21600.0).floor()) }
+
+fn flood_card(dir: &Path, kind: &str, who: &str, n: usize, extra: &str) -> (String, String) {
+    let rule = flood_rule(kind, who);
+    let base = match kind {
+        "crash" => format!("{} crashed {} times in the last hour. Each crash makes Windows write an error report, and an app that keeps restarting and crashing can hold the disk and CPU as hard as a leak. Update or reinstall it; if something keeps relaunching it (a scheduled task, a service, a script), stop that until it is fixed.", who, n),
+        "hang" => format!("{} stopped responding {} times in the last hour. Look at what it was doing (a big file, a network drive, a stuck plug-in); updating it often fixes this.", who, n),
+        "gpu-reset" => format!("The graphics driver crashed and restarted {} times in the last hour (the screen goes black or freezes for a moment). Usual causes: an overheating or overclocked graphics card, a driver bug, or not enough power. Update the graphics driver, undo any overclock, and check the card's temperature.", n),
+        "hw-corrected" => format!("The CPU, memory or a PCIe device reported {} hardware errors it corrected in the last hour. Corrected errors come before crashes: check for overclocking (XMP/EXPO memory profiles included), heat, and loose cards; run Windows Memory Diagnostic.", n),
+        "hw-fatal" => format!("Windows logged {} fatal hardware error{} in the last hour (this is what forces a blue screen or reboot). Undo any overclock (memory profiles included), check temperatures and power, and run Windows Memory Diagnostic.", n, if n == 1 { "" } else { "s" }),
+        _ => format!("The {} service died {} times in the last hour and Windows keeps restarting it. Check that service (Services app, or its program's logs); a broken driver or update is the usual cause.", who, n),
+    };
+    let msg = format!("{}{}", base, extra);
+    add_card(dir, "note", who, &rule, &msg);
+    (rule, msg)
+}
+
+/// (kind, who, count, the scheduled task that starts it, if one does).
+type Flood = (String, String, usize, Option<String>);
+
+/// The scheduled task whose action runs `exe`, if any (`schtasks /query /fo csv /v`, no admin).
+fn task_running(exe: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let o = std::process::Command::new("schtasks").args(["/query", "/fo", "csv", "/v"]).stdin(std::process::Stdio::null()).creation_flags(0x0800_0000).output().ok()?;
+    let text = String::from_utf8_lossy(&o.stdout);
+    let want = exe.to_lowercase();
+    let (mut ni, mut ri) = (None, None);
+    for line in text.lines() {
+        let f: Vec<&str> = line.trim().trim_matches('"').split("\",\"").collect();
+        if let (Some(a), Some(b)) = (f.iter().position(|x| *x == "TaskName"), f.iter().position(|x| *x == "Task To Run")) { ni = Some(a); ri = Some(b); continue; }
+        if let (Some(a), Some(b)) = (ni, ri) {
+            if f.get(b).map_or(false, |r| snifrig_fix::syswatch::exe_of(r) == want) { return f.get(a).map(|s| s.to_string()); }
+        }
+    }
+    None
+}
+
+/// Hourly drive scan on its own thread (a sick drive can stall the query): drives, page file
+/// letters, and for USB drives the programs running from them.
+struct DriveReport { drives: Vec<snifrig_fix::drivehealth::Drive>, pagefile: Vec<char>, pagefile_entries: Option<Vec<String>>, running: std::collections::HashMap<char, Vec<String>> }
+static DRIVE_PROBE: std::sync::Mutex<Option<DriveReport>> = std::sync::Mutex::new(None);
+static DRIVE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn drive_probe_start() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if DRIVE_RUNNING.swap(true, SeqCst) { return; }
+    std::thread::spawn(|| {
+        let drives = snifrig_fix::drivehealth::scan();
+        let pagefile = snifrig_fix::drivehealth::pagefile_letters();
+        let usb: Vec<char> = drives.iter().filter(|d| d.usb).flat_map(|d| d.letters.clone()).collect();
+        let mut running: std::collections::HashMap<char, Vec<String>> = std::collections::HashMap::new();
+        if !usb.is_empty() {
+            for p in sys::snapshot(&mut Vec::new()) {
+                let Some(path) = proc::image_path(p.pid) else { continue };
+                let Some(l) = path.chars().next().map(|c| c.to_ascii_uppercase()).filter(|c| usb.contains(c) && path.get(1..2) == Some(":")) else { continue };
+                let v = running.entry(l).or_default();
+                if !v.contains(&p.name) { v.push(p.name.clone()); }
+            }
+        }
+        let pagefile_entries = snifrig_fix::drivehealth::pagefile_entries();
+        if let Ok(mut g) = DRIVE_PROBE.lock() { *g = Some(DriveReport { drives, pagefile, pagefile_entries, running }); }
+        DRIVE_RUNNING.store(false, SeqCst);
+    });
+}
+
+/// Judge a finished drive scan: cards for what changed, and drives-status.json for the app.
+fn drive_report(dir: &Path, r: DriveReport, said: &mut std::collections::HashSet<String>) {
+    use snifrig_fix::drivehealth as dh;
+    let now = now_unix();
+    let mut seen = dh::load(dir);
+    let mut status = Vec::new();
+    for d in &r.drives {
+        let mut uses = Vec::new();
+        if d.usb {
+            if d.letters.iter().any(|l| r.pagefile.contains(l)) { uses.push("the Windows page file".to_string()); }
+            let names: Vec<String> = d.letters.iter().flat_map(|l| r.running.get(l).cloned().unwrap_or_default()).collect();
+            if !names.is_empty() { uses.push(format!("programs you are running ({}{})", names.iter().take(4).cloned().collect::<Vec<_>>().join(", "), if names.len() > 4 { ", ..." } else { "" })); }
+        }
+        let (found, next) = dh::judge(d, seen.get(&d.key()), now, &uses);
+        if let Some(s) = next { seen.insert(d.key(), s); }
+        for f in found {
+            if !said.insert(f.rule.clone()) { continue; }
+            add_card(dir, "note", &d.label(), &f.rule, &f.msg);
+            let key = f.rule.split(':').take(2).collect::<Vec<_>>().join(":");
+            let alert = snifrig_fix::Alert { t: String::new(), key, msg: f.msg.clone() };
+            ledger::record(dir, &alert, &Action::Report, None, "done", &f.msg);
+        }
+        use snifrig_fix::json::esc;
+        status.push(match &d.health {
+            Some(h) => format!("{{\"drive\":\"{}\",\"probe\":\"{}\",\"usb\":{},\"temp_c\":{:.0},\"warn_c\":{:.0},\"used_pct\":{},\"spare\":{},\"written_tb\":{:.1},\"hours\":{},\"unsafe\":{},\"media_errors\":{},\"critical\":{}}}",
+                esc(&d.label()), esc(&d.probe), d.usb, h.temp_c, h.warn_c, h.used_pct, h.spare, h.written_tb, h.hours, h.unsafe_shutdowns, h.media_errors, h.critical),
+            None => format!("{{\"drive\":\"{}\",\"probe\":\"{}\",\"usb\":{},\"health\":null}}", esc(&d.label()), esc(&d.probe), d.usb),
+        });
+    }
+    dh::save(dir, &seen);
+    // Page file sized below RAM (or none): caps how much memory programs may commit.
+    if let Some(msg) = r.pagefile_entries.as_ref().and_then(|e| snifrig_fix::syswatch::pagefile_problem(e, snifrig_fix::syswatch::ram_mb())) {
+        let rule = format!("pagefile:{:.0}", (now / 604800.0).floor());
+        if said.insert(rule.clone()) {
+            add_card(dir, "note", "page file", &rule, &msg);
+            let alert = snifrig_fix::Alert { t: String::new(), key: "pagefile".into(), msg: msg.clone() };
+            ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
+        }
+    }
+    rules::write_atomic(&dir.join("drives-status.json"), &format!("{{\"unix\":{:.0},\"pagefile\":\"{}\",\"drives\":[{}]}}\n", now, r.pagefile.iter().collect::<String>(), status.join(",")));
+}
+
+/// The fixer keeps the monitor and the tray alive, as the tray does for them: if one is gone (its
+/// lock is free) and you did not stop it, it is started again. At most 3 restarts an hour.
+#[derive(Default)]
+struct KeepAlive { tray_seen: bool, tray_gone: u32, tray_hung: u32, restarts: Vec<f64> }
+
+/// True when the tray's window does not answer a no-op message within 5 s (its UI thread is stuck).
+fn tray_hung() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK};
+    let cls: Vec<u16> = "SnifrigTray".encode_utf16().chain(Some(0)).collect();
+    let h = unsafe { FindWindowW(cls.as_ptr(), std::ptr::null()) };
+    if h.is_null() { return false; }
+    let mut r = 0usize;
+    unsafe { SendMessageTimeoutW(h, 0, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, &mut r) == 0 }
+}
+
+fn mutex_held(name: &str) -> bool {
+    let w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let h = unsafe { windows_sys::Win32::System::Threading::OpenMutexW(0x0010_0000, 0, w.as_ptr()) };
+    if h.is_null() { return false; }
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(h); }
+    true
+}
+
+fn keep_alive(dir: &Path, k: &mut KeepAlive) {
+    if !dir.eq(&default_dir()) { return; }
+    let Some(bin) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) else { return };
+    let now = now_unix();
+    k.restarts.retain(|t| now - t < 3600.0);
+    let start = |exe: &Path, args: &[&std::ffi::OsStr], what: &str, k: &mut KeepAlive| {
+        if k.restarts.len() >= 3 || !exe.exists() { return; }
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        let ok = std::process::Command::new(exe).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0000_0008).spawn().is_ok();
+        k.restarts.push(now);
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("watchdog-log.txt")) {
+            let _ = writeln!(f, "{:.0} the fixer restarted {} ({})", now, what, if ok { "ok" } else { "failed" });
+        }
+    };
+    let age = std::fs::read_to_string(dir.join("status.json")).ok().and_then(|s| snifrig_fix::json::num_field(&s, "unix")).map_or(f64::MAX, |u| now - u);
+    if !dir.join("stop").exists() && !mutex_held("Global\\snifrig-monitor") && age > 180.0 {
+        start(&bin.join("snifrigd.exe"), &["--dir".as_ref(), dir.as_os_str()], "the monitor", k);
+    }
+    if mutex_held("Global\\snifrig-tray") {
+        k.tray_seen = true;
+        k.tray_gone = 0;
+        // Running but frozen: two minutes of no answer, then end it; the next check starts a fresh one.
+        if tray_hung() { k.tray_hung += 1; } else { k.tray_hung = 0; }
+        if k.tray_hung >= 2 && k.restarts.len() < 3 {
+            k.tray_hung = 0;
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "snifrig-tray.exe"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).creation_flags(0x0800_0000).status();
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("watchdog-log.txt")) {
+                let _ = writeln!(f, "{:.0} the tray icon had stopped answering; the fixer ended it", now);
+            }
+            k.tray_gone = 1;
+        }
+    }
+    else if k.tray_seen && !dir.join("stop-tray").exists() && !dir.join("tray-off").exists() {
+        k.tray_gone += 1;
+        if k.tray_gone >= 2 { k.tray_gone = 0; start(&bin.join("snifrig-tray.exe"), &[], "the tray icon", k); }
+    }
+}
+
+/// State for the rest of the PC (syswatch.rs): GPU fairness, network, thread leaks, startup.
+#[derive(Default)]
+struct Watch {
+    gpu: Option<snifrig_fix::syswatch::GpuPdh>,
+    fair: snifrig_fix::syswatch::GpuFair,
+    gpu_failed: std::collections::HashSet<u32>,
+    net: snifrig_fix::syswatch::Net,
+    conn_top: Vec<(String, usize)>,
+    threads: snifrig_fix::syswatch::Threads,
+    startup_done: bool,
+}
+
+/// Network, graphics card, thread leaks and startup, every tick (each part on its own cadence).
+fn whole_system(dir: &Path, n: u64, act: bool, procs: &[sys::Proc], w: &mut Watch, said: &mut std::collections::HashSet<String>, note: &dyn Fn(&Path, &str, &str, &str)) {
+    use snifrig_fix::syswatch as sw;
+    use std::collections::HashMap;
+    let now = now_unix();
+    let name_of = |pid: u32| procs.iter().find(|p| p.pid == pid).map(|p| p.name.clone()).unwrap_or_else(|| format!("pid {}", pid));
+    let card = |said: &mut std::collections::HashSet<String>, rule: String, app: &str, key: &str, msg: &str| {
+        if said.insert(rule.clone()) { add_card(dir, "note", app, &rule, msg); note(dir, key, "done", msg); }
+    };
+    // Graphics card: the app in front first.
+    if n % 5 == 0 {
+        if let Some(g) = w.gpu.as_mut() {
+            let u = g.sample();
+            let fg = sys::foreground_pid();
+            let failed = w.gpu_failed.clone();
+            let skip = |pid: u32| {
+                let nm = name_of(pid).to_lowercase();
+                failed.contains(&pid) || snifrig_fix::crashguard::protected(&nm) || ["dwm.exe", "csrss.exe", "system", "explorer.exe"].contains(&nm.as_str())
+            };
+            for st in w.fair.tick(&u, fg, &skip) {
+                match st {
+                    sw::GpuStep::Lower { pid, pct } if act => match sw::set_gpu_priority(pid, 1) {
+                        Ok(()) => {
+                            let nm = name_of(pid);
+                            note(dir, "gpu:fair", "done", &format!("{} was using {:.0}% of the graphics card in the background while you used {}; it now gets the card after the app in front, until you stop using it", nm, pct, fg.map(name_of).unwrap_or_default()));
+                            w.fair.lowered.push((pid, nm));
+                        }
+                        Err(_) => { w.gpu_failed.insert(pid); }
+                    },
+                    sw::GpuStep::Lower { .. } => {}
+                    sw::GpuStep::Restore { pids } => {
+                        let names: Vec<String> = pids.iter().map(|&p| { let _ = sw::set_gpu_priority(p, 2); name_of(p) }).collect();
+                        note(dir, "gpu:fair", "done", &format!("back to normal graphics-card priority: {}", names.join(", ")));
+                    }
+                }
+            }
+        }
+    }
+    // Network link running flat out.
+    if n % 10 == 7 {
+        let full = w.net.tick(now, &sw::adapters());
+        // Busy: ask the admin helper to count bytes per program (it stops 2 minutes after the last ask).
+        if w.net.busy { let _ = std::fs::write(dir.join("net-want"), format!("{:.0}", now)); }
+        for f in full {
+            let rule = format!("net:full:{}:{}:{:.0}", f.name, if f.download { "down" } else { "up" }, (now / 3600.0).floor());
+            let per = net_users(f.download);
+            let who = if !per.is_empty() {
+                format!(" Using it most: {}.", per.iter().take(3).map(|(p, mbps)| format!("{} ({:.0} Mbit/s)", name_of(*p), mbps)).collect::<Vec<_>>().join(", "))
+            } else if w.conn_top.is_empty() { String::new() } else { format!(" Programs with the most connections: {}.", w.conn_top.iter().take(3).map(|(n, c)| format!("{} ({})", n, c)).collect::<Vec<_>>().join(", ")) };
+            let msg = format!("Your network ({}) has been running flat out for 2 minutes, {} at {:.0} Mbit/s, about all it can do ({:.0} Mbit/s). Everything else online (calls, games, browsing) waits behind it.{} A big {} (backup, sync, cloud upload, game or model download) is the usual cause; pause or schedule it.",
+                f.name, if f.download { "downloading" } else { "uploading" }, f.mbps, f.limit_mbps, who, if f.download { "download" } else { "upload" });
+            card(said, rule, &f.name, "net:full", &msg);
+        }
+    }
+    // Connections: floods and running out of ports.
+    if n % 60 == 40 {
+        let conns = sw::conns();
+        let mut per: HashMap<String, usize> = HashMap::new();
+        for &(pid, _, lo) in &conns { if pid != 0 && !lo { *per.entry(name_of(pid)).or_default() += 1; } }
+        let mut top: Vec<(String, usize)> = per.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        w.conn_top = top.into_iter().take(5).collect();
+        for st in sw::judge_conns(&conns) {
+            match st {
+                sw::ConnStep::Flood { pid, count } => {
+                    let nm = name_of(pid);
+                    card(said, format!("net:flood:{}:{:.0}", nm.to_lowercase(), (now / 21600.0).floor()), &nm, "net:flood",
+                        &format!("{} has {} network connections open. A program that keeps opening connections without closing them slows the network for everything and can use up the PC's ports, after which no app can connect. Restart it; if it comes back, update it or check what it connects to.", nm, count));
+                }
+                sw::ConnStep::Ports { total, time_wait, top } => {
+                    let who = top.iter().map(|&(p, c)| format!("{} ({})", name_of(p), c)).collect::<Vec<_>>().join(", ");
+                    card(said, format!("net:ports:{:.0}", (now / 21600.0).floor()), "network", "net:ports",
+                        &format!("This PC has {} network connections ({} of them closing), close to the limit of about 16,000 ports; past it, apps cannot connect at all. Most connections: {}. Restart the top one.", total, time_wait, who));
+                }
+            }
+        }
+    }
+    // Thread leaks.
+    if n % 60 == 50 {
+        let list: Vec<(u32, u64, u32)> = procs.iter().map(|p| (p.pid, p.created, p.threads)).collect();
+        for (pid, _, t, added) in w.threads.tick(now, &list) {
+            let nm = name_of(pid);
+            card(said, format!("threads:{}:{:.0}", nm.to_lowercase(), (now / 21600.0).floor()), &nm, "threads",
+                &format!("{} has {} threads and added {} in the last 30 minutes. Programs normally use tens to a few hundred; one that keeps adding them is leaking, and every thread costs memory and kernel resources until the PC slows down or runs out. Restart it when you can; if it happens again, update it.", nm, t, added));
+        }
+    }
+    // Field report: five minutes after start, once per snifrig version. Only when this PC would
+    // teach us something is the person asked to send it; otherwise nothing is shown.
+    if n == 300 {
+        let asked = std::fs::read_to_string(dir.join("field-report-asked.txt")).unwrap_or_default();
+        if asked.trim() != env!("CARGO_PKG_VERSION") && !dir.join("field-report-sent.txt").exists() {
+            let _ = field_report(dir);
+            let rep = std::fs::read_to_string(dir.join("field-report.json")).unwrap_or_default();
+            if rep.contains("\"useful\":true") {
+                let why = snifrig_fix::json::str_field(&rep, "why").unwrap_or_default();
+                add_card(dir, "report", "snifrig", &format!("fieldreport:{}", env!("CARGO_PKG_VERSION")),
+                    &format!("This PC can help snifrig work on more PCs: {}. The report lists which of snifrig's checks work here; it holds no names, files, serial numbers or addresses, and it is sent only if you press Send. See it first with: snifrig send-report", why));
+            }
+            let _ = std::fs::write(dir.join("field-report-asked.txt"), env!("CARGO_PKG_VERSION"));
+        }
+    }
+    // Startup: ten minutes after boot, what started at login and what it has cost since.
+    if !w.startup_done && sw::uptime() >= 600.0 {
+        w.startup_done = true;
+        let ft = |unix: f64| (unix + 11_644_473_600.0) * 1e7;
+        let login = procs.iter().filter(|p| p.name.eq_ignore_ascii_case("explorer.exe")).map(|p| p.created as f64).fold(f64::MAX, f64::min);
+        let start = if login < f64::MAX { login } else { ft(now - sw::uptime()) };
+        let mut cost: HashMap<String, (f64, f64)> = HashMap::new();
+        for p in procs.iter().filter(|p| (p.created as f64) >= start - 10e7 && (p.created as f64) <= start + 180e7) {
+            let e = cost.entry(p.name.to_lowercase()).or_default();
+            e.0 += p.cpu as f64 / 1e7;
+            e.1 += p.io as f64 / 1048576.0;
+        }
+        let items = sw::startup_items();
+        let lines: String = items.iter().map(|i| {
+            let (c, m) = cost.get(&sw::exe_of(&i.command)).copied().unwrap_or((0.0, 0.0));
+            format!("{}|{}|{}|{}|{:.0}|{:.0}\n", i.name.replace('|', "/"), i.place, if i.enabled { "on" } else { "off" }, sw::exe_of(&i.command), c, m)
+        }).collect();
+        rules::write_atomic(&dir.join("startup.txt"), &lines);
+        let heavy = sw::heavy_startup(&items, &cost);
+        if !heavy.is_empty() {
+            let list = heavy.iter().take(5).map(|(n, c, m)| format!("{} ({:.0} s of CPU, {:.0} MB of disk)", n, c, m)).collect::<Vec<_>>().join(", ");
+            card(said, format!("startup:{:.0}", ((now - sw::uptime()) / 3600.0).floor()), "startup", "startup",
+                &format!("These start when you log in and were the heaviest since: {}. Each one slows every login and keeps running in the background. Turn off the ones you don't need at login: Task Manager > Startup apps (see them all with: snifrig-fix startup).", list));
+        }
+    }
+}
+
+/// Programs moving the most data, from the admin helper's net-now.txt (fresh within 10 s):
+/// (pid, Mbit/s) in the asked direction, busiest first. Empty without the helper.
+fn net_users(download: bool) -> Vec<(u32, f64)> {
+    let t = std::fs::read_to_string(admin_state().join("net-now.txt")).unwrap_or_default();
+    let mut lines = t.lines();
+    let Some((unix, secs)) = lines.next().and_then(|h| { let mut f = h.split_whitespace(); Some((f.next()?.parse::<f64>().ok()?, f.next()?.parse::<f64>().ok()?)) }) else { return Vec::new() };
+    if now_unix() - unix > 10.0 || secs <= 0.0 { return Vec::new(); }
+    let mut v: Vec<(u32, f64)> = lines.filter_map(|l| {
+        let f: Vec<u64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        (f.len() == 3).then(|| (f[0] as u32, (if download { f[1] } else { f[2] }) as f64 * 8.0 / secs / 1e6))
+    }).filter(|x| x.1 >= 1.0).collect();
+    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
+/// `snifrig-fix field-report`: which of snifrig's checks work on this PC and which cannot (and
+/// why), as one JSON object. Nothing personal: no file names, user names, serials or addresses;
+/// drives by bus and model, apps not at all. Written to field-report.json; it leaves the PC only
+/// if the person chooses to send it.
+fn field_report(dir: &Path) -> Result<String, String> {
+    use snifrig_fix::json::esc;
+    use snifrig_fix::syswatch as sw;
+    let os = std::process::Command::new("cmd").args(["/c", "ver"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let scanned = snifrig_fix::drivehealth::scan();
+    let drives: Vec<String> = scanned.iter().map(|d| format!("{{\"model\":\"{}\",\"usb\":{},\"probe\":\"{}\",\"health\":{}}}", esc(&d.model), d.usb, esc(&d.probe), d.health.is_some())).collect();
+    let gpu = sw::GpuPdh::open().map(|mut g| { std::thread::sleep(std::time::Duration::from_millis(300)); !g.sample().is_empty() }).unwrap_or(false);
+    let adapters = sw::adapters();
+    let conns = sw::conns();
+    let pf = snifrig_fix::drivehealth::pagefile_entries();
+    let startup = sw::startup_items();
+    let gpu_lower = sw::set_gpu_priority(std::process::id(), 2).is_ok();
+    let snap = sys::snapshot(&mut Vec::new());
+    let (io, threads) = (snap.iter().any(|p| p.io > 0), snap.iter().any(|p| p.threads > 0));
+    let checks = [("graphics card per program", gpu), ("graphics card priority", gpu_lower), ("network adapter", !adapters.is_empty()), ("network connections", !conns.is_empty()),
+        ("page file", pf.is_some()), ("disk use per program", io), ("threads per program", threads)];
+    let why = sw::report_why(&os, &scanned.iter().map(|d| (d.usb, d.probe.clone(), d.health.is_some())).collect::<Vec<_>>(), &checks);
+    let verdict = if why.is_empty() { "every check works on this PC and it is a setup snifrig is already tested on, so it would tell us nothing new".to_string() } else { why.join("; ") };
+    let json = format!("{{\"unix\":{:.0},\"snifrig_fix\":\"{}\",\"os\":\"{}\",\"ram_gb\":{:.0},\"cpus\":{},\"drives\":[{}],\"gpu_per_process\":{},\"gpu_priority\":{},\"adapters\":{},\"link_mbps\":[{}],\"tcp_table\":{},\"pagefile_read\":{},\"startup_items\":{},\"io_counters\":{},\"threads\":{},\"useful\":{},\"why\":\"{}\"}}",
+        now_unix(), env!("CARGO_PKG_VERSION"), esc(&os), sw::ram_mb() / 1024.0, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        drives.join(","), gpu, gpu_lower, adapters.len(), adapters.iter().map(|a| format!("{}", a.rx_bps / 1_000_000)).collect::<Vec<_>>().join(","),
+        !conns.is_empty(), pf.is_some(), startup.len(), io, threads, !why.is_empty(), esc(&verdict));
+    rules::write_atomic(&dir.join("field-report.json"), &format!("{}\n", json));
+    Ok(format!("{}\n\n{} {}", json, if why.is_empty() { "No need to send it:" } else { "Worth sending:" }, verdict))
+}
+
+/// `snifrig-fix startup`: what starts at login, on or off, and what it cost after the last boot.
+fn startup_cmd(dir: &Path) -> Result<String, String> {
+    use snifrig_fix::syswatch as sw;
+    let measured: std::collections::HashMap<String, (String, String)> = std::fs::read_to_string(dir.join("startup.txt")).unwrap_or_default().lines().filter_map(|l| {
+        let f: Vec<&str> = l.split('|').collect();
+        (f.len() >= 6).then(|| (f[3].to_string(), (f[4].to_string(), f[5].to_string())))
+    }).collect();
+    let items = sw::startup_items();
+    if items.is_empty() { return Ok("nothing starts at login from the Run keys or Startup folders".into()); }
+    Ok(items.iter().map(|i| {
+        let exe = sw::exe_of(&i.command);
+        let cost = measured.get(&exe).map(|(c, m)| format!(" | after the last login: {} s CPU, {} MB disk", c, m)).unwrap_or_default();
+        format!("{} [{}] {} ({}){}", i.name, if i.enabled { "on" } else { "off" }, exe, i.place, cost)
+    }).collect::<Vec<_>>().join("\n"))
+}
+
+/// Unix time the monitor last said the disk is maxed out (slow-now.json, refreshed every 10 s here).
+static DISK_SAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn read_saturation(dir: &Path) {
+    let s = std::fs::read_to_string(dir.join("slow-now.json")).unwrap_or_default();
+    let u = snifrig_fix::json::num_field(&s, "unix").unwrap_or(0.0);
+    if s.contains("\"disk-saturated\"") && now_unix() - u < 180.0 { DISK_SAT.store(u as u64, std::sync::atomic::Ordering::SeqCst); }
+}
+
+/// Why the disk guard is acting now, if it is: a drive resetting (10 minutes after the last burst)
+/// or the disk maxed out (5 minutes after the monitor last saw it).
+fn disk_reason(now: f64) -> Option<&'static str> {
+    use std::sync::atomic::Ordering::SeqCst;
+    if now - (DISK_TROUBLE.load(SeqCst) as f64) < 600.0 { Some("a drive keeps resetting") }
+    else if now - (DISK_SAT.load(SeqCst) as f64) < 300.0 { Some("the disk is maxed out") }
+    else { None }
+}
+
+/// Disk guard: while a drive keeps resetting, the background apps moving the most data get very
+/// low I/O priority, so the failing drive has less to choke on and the desktop keeps answering.
+/// Not the app in front, not snifrig or Windows. Back to normal 10 minutes after it calms down.
+#[derive(Default)]
+struct DiskGuard {
+    last: std::collections::HashMap<u32, u64>,
+    last_t: f64,
+    slowed: Vec<(u32, u64, String)>,
+    /// The busiest programs on disk at the last tick: (pid, created, name, MB/s, private MB).
+    top: Vec<(u32, u64, String, f64, f64)>,
+}
+
+impl DiskGuard {
+    fn tick(&mut self, now: f64, procs: &[sys::Proc], fg: Option<u32>, act: bool) -> Vec<String> {
+        let dt = now - self.last_t;
+        let mut rates: Vec<(f64, &sys::Proc)> = if self.last_t > 0.0 && dt > 0.5 {
+            procs.iter().filter_map(|p| self.last.get(&p.pid).filter(|&&b| p.io >= b).map(|&b| ((p.io - b) as f64 / dt / 1048576.0, p))).collect()
+        } else { Vec::new() };
+        self.last = procs.iter().map(|p| (p.pid, p.io)).collect();
+        self.last_t = now;
+        rates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        if !rates.is_empty() {
+            self.top = rates.iter().take(5).filter(|r| r.0 >= 1.0).map(|(mbs, p)| (p.pid, p.created, p.name.clone(), *mbs, p.private as f64 / 1048576.0)).collect();
+        }
+        let mut out = Vec::new();
+        if let Some(why) = disk_reason(now) {
+            if !act { return out; }
+            for (mbs, p) in rates.into_iter().take(3) {
+                if mbs < 5.0 || self.slowed.len() >= 5 || Some(p.pid) == fg || snifrig_fix::crashguard::protected(&p.name)
+                    || snifrig_fix::crashguard::is_wsl(&p.name) || self.slowed.iter().any(|s| s.0 == p.pid) { continue; }
+                if sys::set_io_priority(p.pid, 0).is_ok() {
+                    self.slowed.push((p.pid, p.created, p.name.clone()));
+                    out.push(format!("{}, so {} ({:.0} MB/s of disk traffic) now gets the disk last; it goes back to normal once the disk calms down", why, p.name, mbs));
+                }
+            }
+        } else if !self.slowed.is_empty() {
+            let back: Vec<String> = self.slowed.drain(..)
+                .filter(|(pid, created, name)| sys::image_matches(*pid, *created, name) && sys::set_io_priority(*pid, 2).is_ok())
+                .map(|s| s.2).collect();
+            if !back.is_empty() { out.push(format!("the disk has calmed down: {} back to normal disk priority", back.join(", "))); }
+        }
+        out
+    }
+}
+
+/// Read a finished probe: mark trouble, and at most once an hour a card plus an activity line.
+/// Returns the probe's free space and crash loops for the caller (the space guard needs the loop's state).
+fn disk_check(dir: &Path) -> Option<(Vec<(char, f64, f64)>, Option<Vec<Flood>>)> {
+    let Probe { text, resets, vols, floods } = DISK_PROBE.lock().ok().and_then(|mut g| g.take())?;
+    disk_events(dir, &text, resets);
+    Some((vols, floods))
+}
+
+fn disk_events(dir: &Path, text: &str, resets: usize) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if resets >= 3 { DISK_TROUBLE.store(now_unix() as u64, SeqCst); }
+    let n = text.matches("Event ID:").count();
+    if n == 0 { return; }
+    let now = now_unix() as u64;
+    if now.saturating_sub(DISK_LOGGED.load(SeqCst)) < 3600 && resets < 3 { return; }
+    if now.saturating_sub(DISK_LOGGED.load(SeqCst)) < 600 { return; }
+    DISK_LOGGED.store(now, SeqCst);
+    let field = |k: &str| text.lines().find_map(|l| l.trim().strip_prefix(k).map(|v| v.trim().to_string())).unwrap_or_default();
+    let desc = text.lines().skip_while(|l| !l.trim().starts_with("Description:")).nth(1).map(|l| l.trim().chars().take(200).collect::<String>()).unwrap_or_default();
+    let msg = format!("Windows logged {} drive problem{} in the last 10 minutes (newest: {} event {}: {}). A drive that resets or stops answering freezes every app using it, and can take the whole PC down. Copy anything important off it, then plug it straight into a USB port on the motherboard (not a hub) and let it cool if it is hot.",
+        n, if n == 1 { "" } else { "s" }, field("Source:"), field("Event ID:"), desc);
+    add_card(dir, "note", "drive", &format!("diskwarn:{:.0}", (now_unix() / 3600.0).floor()), &msg);
+    let alert = snifrig_fix::Alert { t: String::new(), key: "crash:disk".into(), msg: msg.clone() };
+    ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
+}
+
+/// `frozen resume|end PID|NAME|all`: undo or finish what the crash guard did.
+fn frozen_cmd(dir: &Path, what: &str, who: &str) -> Result<String, String> {
+    use snifrig_fix::crashguard::{Guard, State};
+    let mut g = Guard::load(dir);
+    let hit = |e: &snifrig_fix::crashguard::Entry| e.state == State::Frozen && (who == "all" || who.parse::<u32>().ok() == Some(e.pid) || e.name.eq_ignore_ascii_case(who));
+    let picked: Vec<usize> = g.entries.iter().enumerate().filter(|(_, e)| hit(e)).map(|(i, _)| i).collect();
+    if picked.is_empty() { return Err(format!("{} is not frozen", who)); }
+    let mut done = Vec::new();
+    for i in picked {
+        let e = g.entries[i].clone();
+        remove_card(dir, &format!("frozen:{}", e.pid));
+        if !sys::image_matches(e.pid, e.created, &e.name) { done.push(format!("{} is already gone", e.name)); continue; }
+        if what == "resume" {
+            sys::resume(e.pid)?;
+            g.entries[i].state = State::Resumed;
+            g.entries[i].unix = now_unix();
+            done.push(format!("{} is running again; snifrig leaves it alone for 30 minutes", e.name));
+        } else {
+            let t = proc::target(e.pid).ok_or_else(|| format!("{} is gone", e.name))?;
+            actions::run(&Action::Terminate, &t)?;
+            done.push(format!("{} was closed, freeing about {:.1} GB", e.name, e.mb / 1024.0));
+        }
+    }
+    g.save(dir);
+    let msg = done.join("; ");
+    let alert = snifrig_fix::Alert { t: String::new(), key: format!("crash:{}", what), msg: msg.clone() };
+    ledger::record(dir, &alert, &Action::Report, None, "done", &msg);
+    Ok(msg)
+}
+
 /// Take a card away again (it was only valid for a moment, like the test question).
 fn remove_card(dir: &Path, rule: &str) {
     let path = dir.join("ai-suggestions.json");
@@ -1257,15 +1875,7 @@ fn launch_sync(dir: &Path) -> Result<String, String> {
 /// Snifrig's own parts give way first: the local brain (OpenJev) is stopped when the graphics
 /// card has been nearly full for two GPU readings in a row (about 5 minutes). Command in
 /// brain-stop.txt (one line, run with cmd /c), default: podman stop open-jev in WSL Ubuntu.
-fn stop_brain(dir: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    let custom = std::fs::read_to_string(dir.join("brain-stop.txt")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let st = match custom {
-        Some(c) => std::process::Command::new("cmd.exe").args(["/c", &c]).creation_flags(0x0800_0000).status(),
-        None => std::process::Command::new("wsl.exe").args(["-d", "Ubuntu", "--exec", "podman", "stop", "open-jev"]).creation_flags(0x0800_0000).status(),
-    }.map_err(|e| e.to_string())?;
-    if st.success() { Ok(()) } else { Err(format!("stop command exited with {}", st)) }
-}
+fn stop_brain(dir: &Path) -> Result<(), String> { snifrig_fix::brain::stop_server(dir) }
 
 /// One round of "which app feels slow": measure every window on a screen, judge, announce new ones.
 fn check_apps(dir: &Path, gov: &mut snifrig_fix::governor::Governor, rules: &[rules::Rule], tracker: &mut snifrig_fix::slowapp::Tracker) {
@@ -1530,6 +2140,16 @@ fn watch(dir: &Path) {
     snifrig_fix::feel::start();
     phone_serve(dir.to_path_buf());
     let mut incidents = snifrig_fix::incident::Tracker::new();
+    // Crash guard (crashguard.rs): freezes the app that is about to run the PC out of memory.
+    let mut crash = snifrig_fix::crashguard::Guard::load(dir);
+    let mut disk = DiskGuard::default();
+    let mut space = snifrig_fix::drivehealth::Space::default();
+    let mut alive = KeepAlive::default();
+    let mut watch = Watch { gpu: snifrig_fix::syswatch::GpuPdh::open(), startup_done: snifrig_fix::syswatch::uptime() > 3600.0, ..Default::default() };
+    // Card rules already reported this run (drive health, space, crash loops): one activity line each.
+    let mut drive_said: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let crash_mt = |dir: &Path| std::fs::metadata(dir.join(snifrig_fix::crashguard::FILE)).and_then(|m| m.modified()).ok();
+    let mut crash_seen = crash_mt(dir);
     let note = |dir: &Path, key: &str, status: &str, msg: &str| {
         let alert = snifrig_fix::Alert { t: String::new(), key: key.into(), msg: msg.into() };
         ledger::record(dir, &alert, &Action::Report, None, status, msg);
@@ -1668,6 +2288,93 @@ fn watch(dir: &Path) {
         }
         let mode = ledger::read_mode(dir);
         let paused = now_unix() < ledger::paused_until(dir);
+        // Crash guard: every 2 s, in every mode but off and paused, even during an impact test.
+        // It acts in ask and auto (freezing is undone with one click); dry run only logs.
+        if n % 2 == 0 && mode != Mode::Off && !paused {
+            if crash_mt(dir) != crash_seen { crash.reload(dir); crash_seen = crash_mt(dir); }
+            let (pct, _) = sys::memory_status().unwrap_or((0.0, 0.0));
+            let seen: Vec<snifrig_fix::crashguard::Seen> = gov.procs().iter()
+                .map(|p| snifrig_fix::crashguard::Seen { pid: p.pid, created: p.created, name: p.name.clone(), private_mb: p.private as f64 / 1048576.0 }).collect();
+            let doit = matches!(mode, Mode::Ask | Mode::Auto);
+            let steps = crash.tick(now_unix(), pct, &seen, sys::foreground_pid());
+            for s in &steps { crash_step(dir, &mut crash, s, doit); }
+            // A frozen app that ended (closed by its parent, by you): its card goes too.
+            let gone = std::mem::take(&mut crash.gone);
+            for e in &gone {
+                remove_card(dir, &format!("frozen:{}", e.pid));
+                note(dir, "crash:gone", "done", &format!("{} ended while frozen", e.name));
+            }
+            if !gone.is_empty() { crash.save(dir); }
+            if !steps.is_empty() || !gone.is_empty() { crash_seen = crash_mt(dir); }
+        }
+        if n % 60 == 30 && mode != Mode::Off { disk_probe_start(n % 300 == 30); }
+        if (n == 20 || n % 3600 == 20) && mode != Mode::Off { drive_probe_start(); }
+        if n % 60 == 45 { keep_alive(dir, &mut alive); }
+        let act_now = matches!(mode, Mode::Ask | Mode::Auto) && !paused;
+        if let Some(r) = DRIVE_PROBE.lock().ok().and_then(|mut g| g.take()) { drive_report(dir, r, &mut drive_said); }
+        if let Some((vols, floods)) = disk_check(dir) {
+            for (kind, who, count, task) in floods.unwrap_or_default() {
+                if drive_said.contains(&flood_rule(&kind, &who)) { continue; }
+                // Stop the relauncher: a snifrig job is paused (snifrig owns it; one command
+                // resumes it); a Windows scheduled task is named with the command to pause it.
+                let mut extra = String::new();
+                if (kind == "crash" || kind == "hang") && act_now {
+                    let (mut jobs, _) = snifrig_fix::sched::load(dir);
+                    if let Some(j) = jobs.iter_mut().find(|j| j.enabled && snifrig_fix::syswatch::exe_of(&j.run) == who.to_lowercase()) {
+                        j.enabled = false;
+                        extra = format!(" snifrig paused its job \"{}\", which keeps starting it; resume it when fixed: snifrig-fix jobs resume \"{}\"", j.name, j.name);
+                        snifrig_fix::sched::save(dir, &jobs);
+                    }
+                }
+                if extra.is_empty() {
+                    if let Some(t) = &task { extra = format!(" The scheduled task \"{}\" starts it; to stop the restarts until it is fixed: schtasks /change /tn \"{}\" /disable", t, t); }
+                }
+                let (rule, msg) = flood_card(dir, &kind, &who, count, &extra);
+                drive_said.insert(rule);
+                note(dir, &format!("errors:{}", kind), "done", &msg);
+            }
+            // Space guard: a volume running out, or about to. With minutes left, the busiest
+            // background program on disk is frozen (one click to resume) so the PC keeps working.
+            let sysdrive = std::env::var("SystemDrive").ok().and_then(|s| s.chars().next()).unwrap_or('C').to_ascii_uppercase();
+            let busiest = disk.top.iter().take(3).map(|t| format!("{} ({:.0} MB/s)", t.2, t.3)).collect::<Vec<_>>().join(", ");
+            for st in space.tick(now_unix(), &vols) {
+                use snifrig_fix::drivehealth::SpaceStep;
+                let sys_note = |l: char| if l == sysdrive { " This is the Windows drive: with no room for the page file, apps crash and the PC can freeze." } else { "" };
+                match st {
+                    SpaceStep::Low { letter, free_gb, total_gb } => {
+                        let rule = format!("space:low:{}:{:.0}", letter, (now_unix() / 21600.0).floor());
+                        let msg = format!("{}: has {:.1} GB free of {:.0} GB.{} Open snifrig's clean-up (junk scan) to see what can go, or move big folders (models, outputs, builds) to another drive.", letter, free_gb, total_gb, sys_note(letter));
+                        if drive_said.insert(rule.clone()) { add_card(dir, "note", &format!("{}:", letter), &rule, &msg); note(dir, "space:low", "done", &msg); }
+                    }
+                    SpaceStep::Filling { letter, free_gb, gb_per_min, mins_left } => {
+                        let rule = format!("space:fill:{}:{:.0}", letter, (now_unix() / 3600.0).floor());
+                        let msg = format!("{}: is filling at {:.1} GB a minute and will be full in about {:.0} minutes ({:.1} GB left).{} Busiest on disk right now: {}.", letter, gb_per_min, mins_left, free_gb, sys_note(letter), if busiest.is_empty() { "nothing stands out".to_string() } else { busiest.clone() });
+                        if drive_said.insert(rule.clone()) { add_card(dir, "note", &format!("{}:", letter), &rule, &msg); note(dir, "space:fill", "done", &msg); }
+                        if mins_left < 10.0 && free_gb < 5.0 && act_now {
+                            let fg = sys::foreground_pid();
+                            if let Some(t) = disk.top.iter().find(|t| t.3 >= 20.0 && Some(t.0) != fg && !snifrig_fix::crashguard::protected(&t.2) && !snifrig_fix::crashguard::is_wsl(&t.2) && crash.frozen().all(|e| e.pid != t.0)).cloned() {
+                                let why = format!("{}: was about to fill up ({:.1} GB left, {:.0} minutes at {:.1} GB a minute), so snifrig froze {}, the busiest program on disk ({:.0} MB/s). Free some space, then resume it; or end it.", letter, free_gb, mins_left, gb_per_min, t.2, t.3);
+                                match sys::suspend(t.0) {
+                                    Ok(()) => {
+                                        crash.mark_frozen(snifrig_fix::crashguard::Entry { state: snifrig_fix::crashguard::State::Frozen, pid: t.0, created: t.1, unix: now_unix(), mb: t.4, name: t.2.clone() });
+                                        crash.save(dir);
+                                        crash_seen = crash_mt(dir);
+                                        add_card(dir, "frozen", &t.2, &format!("frozen:{}", t.0), &why);
+                                        note(dir, "space:freeze", "done", &why);
+                                    }
+                                    Err(e) => note(dir, "space:freeze", "failed", &format!("could not freeze {}: {}", t.2, e)),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if n % 10 == 5 { read_saturation(dir); }
+        if n % 2 == 0 && mode != Mode::Off {
+            for m in disk.tick(now_unix(), gov.procs(), sys::foreground_pid(), act_now) { note(dir, "disk:guard", "done", &m); }
+        }
+        if mode != Mode::Off { whole_system(dir, n, act_now, gov.procs(), &mut watch, &mut drive_said, &note); }
         {
             let t = now_unix();
             let sample = (n % 5 == 0).then(|| snifrig_fix::feel::recent(5)).filter(|f| f.samples > 0)
@@ -1898,6 +2605,8 @@ fn watch(dir: &Path) {
         std::thread::sleep(std::time::Duration::from_millis(1000));
     }
     { let a = gov.acting; log_gov(dir, gov.restore_all(a), a); for m in perf.stop(a) { note(dir, "perf:mode", "done", &m); } }
+    for (pid, created, name) in disk.slowed.drain(..) { if sys::image_matches(pid, created, &name) { let _ = sys::set_io_priority(pid, 2); } }
+    for (pid, _) in watch.fair.lowered.drain(..) { let _ = snifrig_fix::syswatch::set_gpu_priority(pid, 2); }
     base.save(dir, now_unix());
     let _ = std::fs::remove_file(dir.join("governor.json"));
 }
@@ -1967,6 +2676,9 @@ pub fn main() {
     let flag = |n: &str| a.iter().position(|x| x == n).and_then(|i| a.get(i + 1)).cloned();
     let dir = flag("--dir").map(PathBuf::from).unwrap_or_else(default_dir);
     let _ = std::fs::create_dir_all(&dir);
+    // Every command, not just the watch loop: a panic goes to crash.log instead of a stderr that
+    // may already be closed.
+    crash_log(&dir);
     let mut cmd: Vec<&str> = Vec::new();
     let mut skip = false;
     for s in a.iter().map(|s| s.as_str()) {
@@ -2034,7 +2746,15 @@ pub fn main() {
         ["approve", id] => out(approve(&dir, id)),
         ["dismiss", id] => out(dismiss(&dir, id)),
         ["keep", name] => out(keep_cmd(&dir, name)),
+        ["frozen"] | ["frozen", "list"] => {
+            let g = snifrig_fix::crashguard::Guard::load(&dir);
+            if g.entries.is_empty() { println!("nothing is frozen"); }
+            for e in &g.entries { println!("{} {}#{} {:.1} GB", if e.state == snifrig_fix::crashguard::State::Frozen { "frozen " } else { "resumed" }, e.name, e.pid, e.mb / 1024.0); }
+        }
+        ["frozen", w @ ("resume" | "end"), who] => out(frozen_cmd(&dir, w, who)),
         ["jobs", rest @ ..] => out(jobs_cmd(&dir, rest)),
+        ["startup"] => out(startup_cmd(&dir)),
+        ["field-report"] => out(field_report(&dir)),
         ["impact"] => {
             let s = snifrig_fix::impact::write_summary(&dir, ((now_unix() as i64) + sys::local_offset_secs()).div_euclid(86400));
             println!("{}", snifrig_fix::impact::sentence(&s));
@@ -2147,5 +2867,31 @@ pub fn main() {
             Ok(n) => out(rules::remove(&dir, n).map(|l| format!("removed rule: {}", l))),
             Err(_) => out(Err("usage: snifrig-fix rule remove N (numbers from `rule list`)".into())),
         },        _ => out(Err(USAGE.into())),
+    }
+}
+
+#[cfg(test)]
+mod floods_tests {
+    #[test]
+    fn crash_loops_are_counted_per_app_over_the_bar() {
+        let crash = |app: &str| format!("Event[0]:\n  Log Name: Application\n  Source: Application Error\n  Event ID: 1000\n  Description: \nFaulting application name: {}, version: 1.0.0.0, time stamp: 0x0\n", app);
+        let hang = "Event[1]:\n  Source: Application Hang\n  Event ID: 1002\n  Description: \nThe program Code.exe version 1.95.0.0 stopped interacting with Windows and was closed.\n";
+        let svc = "Event[2]:\n  Source: Service Control Manager\n  Event ID: 7031\n  Description: \nThe Foo Updater service terminated unexpectedly.  It has done this 3 time(s).\n";
+        let mut text = String::new();
+        for _ in 0..6 { text.push_str(&crash("python.exe")); }
+        for _ in 0..4 { text.push_str(&crash("notepad.exe")); }
+        for _ in 0..3 { text.push_str(hang); text.push_str(svc); }
+        let out = super::count_floods(&text);
+        assert!(out.contains(&("crash".into(), "python.exe".into(), 6)));
+        assert!(!out.iter().any(|o| o.1 == "notepad.exe"), "4 crashes is under the bar");
+        assert!(out.contains(&("hang".into(), "Code.exe".into(), 3)));
+        assert!(out.contains(&("service".into(), "Foo Updater".into(), 3)));
+        let tdr = "Event[3]:\n  Source: Display\n  Event ID: 4101\n  Description: \nDisplay driver nvlddmkm stopped responding and has successfully recovered.\n";
+        let fatal = "Event[4]:\n  Source: Microsoft-Windows-WHEA-Logger\n  Event ID: 18\n  Description: \nA fatal hardware error has occurred.\n";
+        let other17 = "Event[5]:\n  Source: SomethingElse\n  Event ID: 17\n  Description: \nnot hardware\n";
+        let out = super::count_floods(&format!("{}{}{}{}", tdr, tdr, fatal, other17.repeat(4)));
+        assert!(out.contains(&("gpu-reset".into(), "the graphics driver".into(), 2)));
+        assert!(out.contains(&("hw-fatal".into(), "hardware".into(), 1)));
+        assert!(!out.iter().any(|o| o.0 == "hw-corrected"), "event 17 from another source is not a hardware error");
     }
 }

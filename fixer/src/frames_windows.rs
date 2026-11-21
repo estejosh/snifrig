@@ -7,6 +7,12 @@
 //! frames-now.txt once a second: unix pid fps median_ms p99_ms stutters. Nothing else is read,
 //! nothing leaves the PC. Vulkan and OpenGL games are not covered; snifrig then falls back to
 //! its CPU-based stutter detection. frames-off makes it stop and exit.
+//!
+//! Network per program (same reason: only an administrator may read kernel network events):
+//! while net-want holds a recent time (the fixer writes it when the network is busy), the helper
+//! counts bytes sent and received per process id from the Kernel-Network provider and writes
+//! net-now.txt every second: "unix secs" then "pid bytes_in bytes_out" for the busiest 15.
+//! Only byte counts per process id; no addresses, ports or contents.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,6 +23,8 @@ use windows_sys::Win32::System::Diagnostics::Etw::*;
 const DXGI: GUID = GUID::from_u128(0xCA11C036_0102_4A2D_A6AD_F03CFED5D3C9);
 const D3D9: GUID = GUID::from_u128(0x783ACA0A_790E_4D7F_8451_AA850511C6B9);
 static WANT: AtomicU32 = AtomicU32::new(0);
+const KNET: GUID = GUID::from_u128(0x7DD42A49_5329_4832_8DFD_43D979153A88);
+static NET: Mutex<Option<std::collections::HashMap<u32, (u64, u64)>>> = Mutex::new(None);
 static STAMPS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
@@ -24,11 +32,39 @@ fn same(a: &GUID, b: &GUID) -> bool { a.data1 == b.data1 && a.data2 == b.data2 &
 
 unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
     let h = &(*rec).EventHeader;
+    if same(&h.ProviderId, &KNET) {
+        // TCP/UDP send and receive, IPv4 and IPv6: payload starts with PID (u32), size (u32).
+        let id = h.EventDescriptor.Id;
+        let out = matches!(id, 10 | 26 | 42 | 58);
+        if !(out || matches!(id, 11 | 27 | 43 | 59)) || (*rec).UserDataLength < 8 { return; }
+        let d = (*rec).UserData as *const u8;
+        let pid = u32::from_le_bytes([*d, *d.add(1), *d.add(2), *d.add(3)]);
+        let size = u32::from_le_bytes([*d.add(4), *d.add(5), *d.add(6), *d.add(7)]) as u64;
+        // Then daddr, saddr: traffic inside this PC (127.x.x.x, ::1) never touches the network.
+        let v6 = matches!(id, 26 | 27 | 58 | 59);
+        let len = (*rec).UserDataLength as usize;
+        let lo = if v6 { len >= 24 && (0..15).all(|k| *d.add(8 + k) == 0) && *d.add(23) == 1 } else { len >= 12 && *d.add(8) == 127 };
+        if lo { return; }
+        if let Ok(mut g) = NET.lock() {
+            let e = g.get_or_insert_with(Default::default).entry(pid).or_default();
+            if out { e.1 += size; } else { e.0 += size; }
+        }
+        return;
+    }
     let pid = WANT.load(Ordering::Relaxed);
     if pid == 0 || h.ProcessId != pid { return; }
     let id = h.EventDescriptor.Id;
     let present = (same(&h.ProviderId, &DXGI) && (id == 42 || id == 55)) || (same(&h.ProviderId, &D3D9) && id == 1);
     if present { if let Ok(mut v) = STAMPS.lock() { v.push(h.TimeStamp); } }
+}
+
+/// Pure: net-now.txt from one window of byte counts, busiest 15 first.
+fn net_text(now: u64, secs: f64, counts: std::collections::HashMap<u32, (u64, u64)>) -> String {
+    let mut v: Vec<(u32, (u64, u64))> = counts.into_iter().filter(|(p, _)| *p != 0).collect();
+    v.sort_by(|a, b| (b.1 .0 + b.1 .1).cmp(&(a.1 .0 + a.1 .1)));
+    let mut s = format!("{} {:.2}\n", now, secs);
+    for (pid, (i, o)) in v.into_iter().take(15) { s.push_str(&format!("{} {} {}\n", pid, i, o)); }
+    s
 }
 
 /// Pure: (fps, median ms, p99 ms, stutters) from present timestamps in QPC ticks over `secs`.
@@ -81,6 +117,7 @@ pub fn main() {
         extern "system" { fn QueryPerformanceFrequency(f: *mut i64) -> i32; }
         QueryPerformanceFrequency(&mut freq);
         let mut enabled = false;
+        let mut net_on = false;
         let mut last = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -95,9 +132,19 @@ pub fn main() {
                 let _ = std::fs::remove_file(out.join("frames-now.txt"));
             }
             WANT.store(want, Ordering::Relaxed);
+            let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let net_want = std::fs::read_to_string(dir.join("net-want")).ok().and_then(|s| s.trim().parse::<u64>().ok()).map_or(false, |t| now_s.saturating_sub(t) < 120);
+            if net_want != net_on {
+                let code = if net_want { EVENT_CONTROL_CODE_ENABLE_PROVIDER } else { EVENT_CONTROL_CODE_DISABLE_PROVIDER };
+                EnableTraceEx2(session, &KNET, code as u32, TRACE_LEVEL_INFORMATION as u8, u64::MAX, 0, 0, std::ptr::null());
+                net_on = net_want;
+                if !net_on { let _ = std::fs::remove_file(out.join("net-now.txt")); }
+            }
+            let counts = NET.lock().ok().and_then(|mut g| g.take()).unwrap_or_default();
             let secs = last.elapsed().as_secs_f64();
             last = std::time::Instant::now();
             let stamps: Vec<i64> = STAMPS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+            if net_on { let _ = std::fs::write(out.join("net-now.txt"), net_text(now_s, secs, counts)); }
             if want != 0 {
                 let (fps, med, p99, st) = stats(&stamps, freq as f64, secs);
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -111,6 +158,12 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn net_text_lists_the_busiest() {
+        let m: std::collections::HashMap<u32, (u64, u64)> = [(1u32, (10, 0)), (2, (500, 500)), (0, (9999, 9999))].into_iter().collect();
+        assert_eq!(super::net_text(5, 1.0, m), "5 1.00\n2 500 500\n1 10 0\n");
+    }
+
     #[test]
     fn frame_stats() {
         // 60 fps with one 100 ms hitch

@@ -119,6 +119,75 @@ fn post(url: &str, body: &str) -> Result<String, String> {
     Ok(out.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default())
 }
 
+// ---- on demand: the brain server runs only while it has questions ----
+// Josh, 16 Nov: the brain is there to make the PC faster, not to sit on 24 GB (about 15 GB of
+// RAM plus 18 GB of graphics memory for the 9B model) all day. So snifrig starts it for a batch
+// of questions, asks them back to back, and stops it once the queue has been empty for
+// IDLE_STOP_SECS. Judging whether the fixes worked (learn.rs, impact.rs) needs no brain.
+
+/// Stop the server after this long with nothing to ask.
+pub const IDLE_STOP_SECS: f64 = 90.0;
+/// Give the model this long to load before giving up on a start.
+pub const START_WAIT_SECS: f64 = 240.0;
+/// Do not try to start it more often than this.
+pub const RETRY_START_SECS: f64 = 900.0;
+/// The model needs about this much free graphics memory.
+pub const NEED_VRAM_MB: f64 = 19000.0;
+/// ...and the PC must have this much commit headroom (it adds about 15 GB).
+pub const MAX_COMMIT_PCT: f64 = 75.0;
+/// Leave the server alone (never start or stop it) while this file exists in the data dir.
+pub const MANUAL_FILE: &str = "brain-manual";
+
+fn reachable(url: &str) -> bool {
+    let hp = url.strip_prefix("http://").and_then(|r| r.split('/').next()).unwrap_or("127.0.0.1:8791");
+    hp.parse::<std::net::SocketAddr>().map_or(false, |a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
+}
+
+/// Room to start the model: fresh GPU reading with enough free memory, and commit headroom.
+fn can_start(dir: &Path) -> Result<(), String> {
+    let g = std::fs::read_to_string(dir.join("gpu.json")).unwrap_or_default();
+    let fresh = num_field(&g, "unix").map_or(false, |u| crate::now_unix() - u < 900.0);
+    let (used, total) = (num_field(&g, "used_mb").unwrap_or(0.0), num_field(&g, "total_mb").unwrap_or(0.0));
+    if !fresh || total <= 0.0 { return Err("no fresh graphics card reading".into()); }
+    if total - used < NEED_VRAM_MB { return Err(format!("graphics card has {:.1} GB free, needs {:.0}", (total - used) / 1024.0, NEED_VRAM_MB / 1024.0)); }
+    if let Some((pct, _)) = crate::sys::memory_status() { if pct > MAX_COMMIT_PCT { return Err(format!("memory {:.0}% committed", pct)); } }
+    Ok(())
+}
+
+fn run_cmd(dir: &Path, file: &str, default: &[&str]) -> Result<(), String> {
+    let custom = std::fs::read_to_string(dir.join(file)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut c = match &custom {
+        #[cfg(windows)]
+        Some(c) => { let mut x = std::process::Command::new("cmd.exe"); x.args(["/c", c]); x }
+        #[cfg(not(windows))]
+        Some(c) => { let mut x = std::process::Command::new("sh"); x.args(["-c", c]); x }
+        None => { let mut x = std::process::Command::new(default[0]); x.args(&default[1..]); x }
+    };
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
+    let st = c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map_err(|e| e.to_string())?;
+    if st.success() { Ok(()) } else { Err(format!("{} exited with {}", custom.as_deref().unwrap_or(default[0]), st)) }
+}
+
+#[cfg(windows)]
+const START_CMD: &[&str] = &["wsl.exe", "-d", "Ubuntu", "--exec", "podman", "start", "open-jev"];
+#[cfg(windows)]
+const STOP_CMD: &[&str] = &["wsl.exe", "-d", "Ubuntu", "--exec", "podman", "stop", "open-jev"];
+#[cfg(not(windows))]
+const START_CMD: &[&str] = &["podman", "start", "open-jev"];
+#[cfg(not(windows))]
+const STOP_CMD: &[&str] = &["podman", "stop", "open-jev"];
+
+/// Start the server (brain-start.txt in the data dir overrides the command).
+pub fn start_server(dir: &Path) -> Result<(), String> { run_cmd(dir, "brain-start.txt", START_CMD) }
+/// Stop the server (brain-stop.txt in the data dir overrides the command).
+pub fn stop_server(dir: &Path) -> Result<(), String> { run_cmd(dir, "brain-stop.txt", STOP_CMD) }
+
+fn note(dir: &Path, msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("brain-log.txt")) { let _ = writeln!(f, "{} {}", crate::now_unix() as u64, msg); }
+}
+
 struct Shared { queue: VecDeque<(String, String, String)>, queued: HashSet<String>, cache: HashMap<String, Verdict>, last_err: String }
 
 pub struct Brain { shared: Arc<Mutex<Shared>>, path: PathBuf }
@@ -130,17 +199,47 @@ impl Brain {
         let path = dir.join("brain-cache.json");
         let cache = load_cache(&path);
         let shared = Arc::new(Mutex::new(Shared { queue: VecDeque::new(), queued: HashSet::new(), cache, last_err: String::new() }));
-        let (sh, p) = (shared.clone(), path.clone());
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs_f64(MIN_GAP_SECS));
-            let job = sh.lock().ok().and_then(|mut g| g.queue.pop_front());
-            let Some((name, cmd, parent)) = job else { continue };
-            let res = post(&url, &request_body(&name, &cmd, &parent)).and_then(|b| parse_response(&b, crate::now_unix()).ok_or_else(|| "brain gave an unreadable answer".to_string()));
-            if let Ok(mut g) = sh.lock() {
-                g.queued.remove(&name);
-                match res {
-                    Ok(v) => { g.cache.insert(name, v); save_cache(&p, &g.cache); g.last_err.clear(); }
-                    Err(e) => { let _ = std::fs::write(p.with_file_name("brain-error.txt"), format!("{} {}: {}\n", crate::now_unix() as u64, name, e)); g.last_err = e; }
+        let (sh, p, d) = (shared.clone(), path.clone(), dir.to_path_buf());
+        std::thread::spawn(move || {
+            // Already up when snifrig starts (autostart, an earlier run): treat it as ours, so it
+            // is stopped once idle. brain-manual in the data dir leaves it to you.
+            let manual = || d.join(MANUAL_FILE).exists();
+            let mut ours = !manual() && reachable(&url);
+            let (mut idle_since, mut last_start) = (crate::now_unix(), -1e12f64);
+            loop {
+                std::thread::sleep(Duration::from_secs_f64(if ours { 2.0 } else { MIN_GAP_SECS }));
+                let now = crate::now_unix();
+                // Came up on its own (WSL started later and the container autostarts): adopt it.
+                if !ours && !manual() && reachable(&url) { ours = true; idle_since = now; }
+                let has_job = sh.lock().map(|g| !g.queue.is_empty()).unwrap_or(false);
+                if !has_job {
+                    if ours && !manual() && now - idle_since >= IDLE_STOP_SECS {
+                        match stop_server(&d) { Ok(()) => note(&d, "stopped the brain: nothing left to ask"), Err(e) => note(&d, &format!("could not stop the brain: {}", e)) }
+                        ours = false;
+                    }
+                    continue;
+                }
+                if !reachable(&url) {
+                    if manual() || now - last_start < RETRY_START_SECS { continue; }
+                    last_start = now;
+                    if let Err(why) = can_start(&d) { note(&d, &format!("questions waiting, brain not started: {}", why)); continue; }
+                    if let Err(e) = start_server(&d) { note(&d, &format!("could not start the brain: {}", e)); continue; }
+                    let t0 = crate::now_unix();
+                    while !reachable(&url) && crate::now_unix() - t0 < START_WAIT_SECS { std::thread::sleep(Duration::from_secs(3)); }
+                    if !reachable(&url) { note(&d, "started the brain but it did not come up; stopping it"); let _ = stop_server(&d); continue; }
+                    note(&d, &format!("started the brain for {} question(s) (took {:.0} s)", sh.lock().map(|g| g.queue.len()).unwrap_or(0), crate::now_unix() - t0));
+                    ours = true;
+                }
+                let job = sh.lock().ok().and_then(|mut g| g.queue.pop_front());
+                let Some((name, cmd, parent)) = job else { continue };
+                idle_since = crate::now_unix();
+                let res = post(&url, &request_body(&name, &cmd, &parent)).and_then(|b| parse_response(&b, crate::now_unix()).ok_or_else(|| "brain gave an unreadable answer".to_string()));
+                if let Ok(mut g) = sh.lock() {
+                    g.queued.remove(&name);
+                    match res {
+                        Ok(v) => { g.cache.insert(name, v); save_cache(&p, &g.cache); g.last_err.clear(); }
+                        Err(e) => { let _ = std::fs::write(p.with_file_name("brain-error.txt"), format!("{} {}: {}\n", crate::now_unix() as u64, name, e)); g.last_err = e; }
+                    }
                 }
             }
         });

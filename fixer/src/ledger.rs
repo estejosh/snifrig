@@ -87,7 +87,9 @@ pub fn recent_auto(dir: &Path) -> Vec<f64> {
 pub fn queue(dir: &Path, alert: &Alert, action: &Action, t: &Target, why: &str) -> Option<String> {
     let label = action.label();
     let mut items = load_pending(dir);
-    if items.iter().any(|p| p.pid == t.pid && p.action == label) {
+    // One open question per app and action: the same leak in a new python.exe is the same
+    // problem, not a new card (16 Nov: the same python leak was asked about again and again).
+    if items.iter().any(|p| p.action == label && (p.pid == t.pid || p.name.eq_ignore_ascii_case(&t.name))) {
         return None;
     }
     let unix = crate::now_unix();
@@ -302,7 +304,10 @@ mod tests {
         assert!(queue(&d, &a, &Action::Trim, &target(7), "why").is_some());
         assert!(queue(&d, &a, &Action::Trim, &target(7), "again").is_none());
         assert!(queue(&d, &a, &Action::Terminate, &target(7), "other action").is_some());
-        assert!(queue(&d, &a, &Action::Trim, &target(8), "other pid").is_some());
+        // Same app in a new process is the same problem: no second card.
+        assert!(queue(&d, &a, &Action::Trim, &target(8), "same app, other pid").is_none());
+        let other = Target { pid: 9, name: "y.exe".into(), ..Default::default() };
+        assert!(queue(&d, &a, &Action::Trim, &other, "other app").is_some());
         assert_eq!(load_pending(&d).len(), 3);
     }
 
@@ -310,7 +315,8 @@ mod tests {
     fn pending_capped_at_20_dropping_oldest() {
         let d = tmp("cap");
         for pid in 1..=25u32 {
-            assert!(queue(&d, &alert("k"), &Action::Trim, &target(pid), "w").is_some());
+            let t = Target { pid, name: format!("p{}.exe", pid), ..Default::default() };
+            assert!(queue(&d, &alert("k"), &Action::Trim, &t, "w").is_some());
         }
         let items = load_pending(&d);
         assert_eq!(items.len(), 20);

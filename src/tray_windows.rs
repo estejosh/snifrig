@@ -213,7 +213,8 @@ unsafe fn refresh(hwnd: HWND, add: bool) {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let head_ball = {
         let shown = &mut *std::ptr::addr_of_mut!(HEAD_SHOWN);
-        shown.retain(|x| now.saturating_sub(x.1) < 7200);
+        // Same window as the monitor's open issues (6 h): an unresolved slowdown is shown once.
+        shown.retain(|x| now.saturating_sub(x.1) < 21600);
         let last = &mut *std::ptr::addr_of_mut!(LAST_HEAD);
         let changed = *last != st.headline;
         *last = st.headline.clone();
@@ -279,11 +280,52 @@ unsafe fn open(file: &str, params: Option<&str>) {
 }
 
 unsafe fn open_report() {
-    let exe = dir().join("bin").join("snifrig.exe");
+    let bin = dir().join("bin");
+    let exe = if bin.join("snifrig.exe").exists() { bin.join("snifrig.exe") } else { bin.join("snifrigd.exe") };
     open("cmd.exe", Some(&format!("/k \"\"{}\" --once --dir \"{}\"\"", exe.display(), dir().display())));
 }
 
 static mut RESTARTS: Vec<u64> = Vec::new();
+static mut KILLS: Vec<u64> = Vec::new();
+static mut AWAKE_SINCE: u64 = u64::MAX;
+static mut LAST_TICK: u64 = 0;
+
+/// Called on every timer tick: a gap over a minute means the PC slept, so awake time restarts.
+unsafe fn note_tick() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if now.saturating_sub(LAST_TICK) > 60 || AWAKE_SINCE > now { AWAKE_SINCE = now; }
+    LAST_TICK = now;
+}
+
+/// Seconds since a status file was last written (its "unix" field); None if it is missing.
+fn age_of(file: &str) -> Option<u64> {
+    let s = std::fs::read_to_string(dir().join(file)).ok()?;
+    let u = snifrig::json_num(&s, "unix");
+    if u == 0 { return None; }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    Some(now.saturating_sub(u))
+}
+
+/// End a snifrig process that holds its lock but stopped working. At most 2 an hour in all, and
+/// written to watchdog-log.txt, so a fault that hangs it again is seen instead of looped on.
+unsafe fn kill_stuck(exe: &str, what: &str) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // Old files after sleep or hibernate are not a hang: only act once the PC has been awake
+    // (the tray's 15 s timer ticking without a gap) for 15 minutes.
+    if now.saturating_sub(AWAKE_SINCE) < 900 { return; }
+    let k = &mut *std::ptr::addr_of_mut!(KILLS);
+    k.retain(|&t| now - t < 3600);
+    if k.len() >= 2 { return; }
+    k.push(now);
+    use std::os::windows::process::CommandExt;
+    use std::io::Write;
+    // Not /T: the fixer's children are your scheduled jobs, which must keep running.
+    let ok = std::process::Command::new("taskkill").args(["/F", "/IM", exe]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .creation_flags(0x0800_0000).status().map_or(false, |s| s.success());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir().join("watchdog-log.txt")) {
+        let _ = writeln!(f, "{} {} had stopped answering; ended it ({}) so it restarts", now, what, if ok { "ok" } else { "taskkill failed" });
+    }
+}
 
 // Restart the hidden monitor if it died: status is stale, its mutex is free, and the user did not stop it. Max 3 per hour.
 /// Bring the fixer back if it is installed, licensed, not asked to stop, and not running.
@@ -293,7 +335,13 @@ unsafe fn fixer_watchdog() {
     // Stopped on purpose a moment ago (an update): give it two minutes before bringing it back.
     if std::fs::metadata(d.join("fix-stopped")).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map_or(false, |e| e.as_secs() < 120) { return; }
     let h = windows_sys::Win32::System::Threading::OpenMutexW(0x0010_0000, 0, wide("Global\\snifrig-fix").as_ptr());
-    if !h.is_null() { windows_sys::Win32::Foundation::CloseHandle(h); return; }
+    if !h.is_null() {
+        windows_sys::Win32::Foundation::CloseHandle(h);
+        // Running but silent: governor.json is rewritten every 10 s, so 10 minutes without it is a
+        // hang (a stuck disk, a deadlock). End it; the next check (15 s) starts a fresh one.
+        if age_of("governor.json").map_or(false, |a| a > 600) { kill_stuck("snifrig-fix.exe", "the fixer"); }
+        return;
+    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let r = &mut *std::ptr::addr_of_mut!(FIX_RESTARTS);
     r.retain(|&t| now - t < 3600);
@@ -319,7 +367,12 @@ static mut FIX_RESTARTS: Vec<u64> = Vec::new();
 unsafe fn watchdog() {
     if read_status().level != 2 || dir().join("stop").exists() { return; }
     let h = windows_sys::Win32::System::Threading::OpenMutexW(0x0010_0000, 0, wide("Global\\snifrig-monitor").as_ptr());
-    if !h.is_null() { windows_sys::Win32::Foundation::CloseHandle(h); return; }
+    if !h.is_null() {
+        windows_sys::Win32::Foundation::CloseHandle(h);
+        // Running but silent past its longest back-off (600 s): stuck. End it so it can come back.
+        if age_of("status.json").map_or(false, |a| a > 900) { kill_stuck("snifrigd.exe", "the monitor"); }
+        return;
+    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let r = &mut *std::ptr::addr_of_mut!(RESTARTS);
     r.retain(|&t| now - t < 3600);
@@ -450,7 +503,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_HOTKEY => { run_fix(&["quick"]); 0 }
         WM_TIMER => {
             let flag = dir().join("stop-tray");
-            if flag.exists() { let _ = std::fs::remove_file(&flag); DestroyWindow(hwnd); } else { watchdog(); fixer_watchdog(); refresh(hwnd, false); }
+            if flag.exists() { let _ = std::fs::remove_file(&flag); let _ = std::fs::write(dir().join("tray-off"), "1"); DestroyWindow(hwnd); } else { note_tick(); watchdog(); fixer_watchdog(); refresh(hwnd, false); }
             0
         }
         WM_COMMAND => {
@@ -475,8 +528,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if let Some(a) = cmds.get((c - 200) as usize) { let v: Vec<&str> = a.iter().map(|s| s.as_str()).collect(); run_fix(&v); }
                 }
                 c @ 110..=113 => run_fix(&["mode", MODES[(c - 110) as usize]]),
-                4 => { DestroyWindow(hwnd); }
-                5 => { let _ = std::fs::write(dir().join("stop"), "1"); DestroyWindow(hwnd); }
+                4 => { let _ = std::fs::write(dir().join("tray-off"), "1"); DestroyWindow(hwnd); }
+                5 => { let _ = std::fs::write(dir().join("stop"), "1"); let _ = std::fs::write(dir().join("tray-off"), "1"); DestroyWindow(hwnd); }
                 _ => {}
             }
             0
@@ -505,6 +558,8 @@ pub fn main() {
         let mn = wide(&if dir().display().to_string().eq_ignore_ascii_case(&snifrig::default_dir().display().to_string()) { "Global\\snifrig-tray".to_string() } else { format!("Global\\snifrig-tray-{}", dir().display().to_string().replace(|c: char| !c.is_ascii_alphanumeric(), "_")) });
         CreateMutexW(null(), 0, mn.as_ptr());
         if GetLastError() == 183 { return; }
+        // "tray-off" tells the fixer you closed the icon on purpose; running again clears it.
+        let _ = std::fs::remove_file(dir().join("tray-off"));
         let hi = GetModuleHandleW(null());
         let cls = wide("SnifrigTray");
         let wc = WNDCLASSW {

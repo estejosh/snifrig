@@ -156,7 +156,8 @@ impl Slow {
             if let Ok(exe) = std::env::current_exe() {
                 use std::os::windows::process::CommandExt;
                 use std::process::Stdio;
-                let exe = exe.with_file_name("snifrig.exe");
+                // This same program, whatever it is called: installs since 29 Oct run the monitor
+                // as snifrigd.exe, and asking for snifrig.exe there left gpu.json stale for weeks.
                 let _ = std::process::Command::new(exe).arg("--gpu-probe").arg("--dir").arg(&dir)
                     .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0800_0000).spawn();
             }
@@ -246,6 +247,12 @@ impl Slow {
             };
             let detail = if kind == "os-maintenance" || kind == "efficiency-mode" { detail } else { format!("{} Top CPU: {}.", detail, busy) };
             out.push(Evidence { t, kind, value: h.1, limit: h.2, minutes: (t - start) / 60.0, detail, who });
+        }
+        // What is going on right now (evidence above is written at most hourly): the fixer's disk
+        // guard reads this to act while the disk stays maxed out.
+        if let Some(d) = self.dir.as_deref() {
+            let now: Vec<String> = self.streak.iter().filter(|(k, v)| v.0 >= if **k == "gpu-throttle" { 1 } else { NEED }).map(|(k, _)| format!("\"{}\"", k)).collect();
+            let _ = std::fs::write(d.join("slow-now.json"), format!("{{\"unix\":{:.0},\"kinds\":[{}]}}\n", t, now.join(",")));
         }
         out
     }

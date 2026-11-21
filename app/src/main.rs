@@ -570,12 +570,28 @@ impl App {
 
     fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
         card(ui, |ui| {
-            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask" | "game_ask" | "model_differs" | "drivers_ready" | "drivers_slower");
+            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask" | "game_ask" | "model_differs" | "drivers_ready" | "drivers_slower" | "frozen" | "report");
             ui.horizontal(|ui| { chip(ui, if ours { "snifrig noticed" } else { "suggested by your AI assistant" }, BLUE); });
             ui.label(bold(s.summary(), 15.0).color(TEXT));
             ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
             ui.horizontal(|ui| {
-                if s.kind == "restart_desktop" {
+                if s.kind == "report" {
+                    if ui.add(egui::Button::new(RichText::new("Send it").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("Sends this PC's field report once. It lists which of snifrig's checks work here: no names, files, serial numbers or addresses.").clicked() {
+                        self.run("snifrig.exe", vec!["send-report".into(), "--yes".into()], "Sending the field report. Thank you.");
+                        self.dismiss_suggestion(s);
+                    }
+                    if ui.button("Don't send").clicked() { self.dismiss_suggestion(s); }
+                } else if s.kind == "frozen" {
+                    let pid = s.rule.strip_prefix("frozen:").unwrap_or("").to_string();
+                    if ui.add(egui::Button::new(RichText::new("Resume it").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("It picks up exactly where it was. If it is still leaking, memory fills up again.").clicked() {
+                        self.run("snifrig-fix.exe", vec!["frozen".into(), "resume".into(), pid.clone()], &format!("{} is running again.", s.app));
+                        self.dismiss_suggestion(s);
+                    }
+                    if ui.button("End it").on_hover_text("Closes it and frees its memory. Anything unsaved in it is lost.").clicked() {
+                        self.run("snifrig-fix.exe", vec!["frozen".into(), "end".into(), pid], &format!("{} was closed.", s.app));
+                        self.dismiss_suggestion(s);
+                    }
+                } else if s.kind == "restart_desktop" {
                     if ui.add(egui::Button::new(RichText::new("Restart desktop").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("The screen flashes for a second; your apps stay open. Windows asks you to confirm.").clicked() {
                         self.run("snifrig-fix.exe", vec!["desktop".into(), "restart".into()], "Restarting the desktop. Confirm in the Windows prompt.");
                         self.dismiss_suggestion(s);
