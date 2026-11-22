@@ -159,6 +159,7 @@ fn usage() {
     println!("  snifrig            run the monitor (writes status.json every 5 s)");
     println!("  snifrig why        why is it slow right now?");
     println!("  snifrig junk       what takes space for nothing (free scan)");
+    println!("  snifrig run -- CMD run a heavy job when it is its turn (also: can-i-start, queue)");
     println!("  --dir PATH         data folder (default {})", default_dir().display());
 }
 
@@ -166,6 +167,8 @@ pub fn run() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let flag = |n: &str| a.iter().position(|x| x == n).and_then(|i| a.get(i + 1)).cloned();
     let has = |n: &str| a.iter().any(|x| x == n);
+    // Before --help: the command after `run --` may carry its own flags.
+    if let Some(code) = crate::queue::cli(&a) { std::process::exit(code); }
     if has("--help") || has("-h") || a.first().map_or(false, |s| s == "help") { usage(); return; }
     if has("--version") { println!("snifrig {}", env!("CARGO_PKG_VERSION")); return; }
     let dir = flag("--dir").map(PathBuf::from).unwrap_or_else(default_dir);

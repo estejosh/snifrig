@@ -706,6 +706,7 @@ fn usage() {
     println!("  snifrig install                    start at login (hidden monitor + tray icon), start now");
     println!("  snifrig pause [MIN]                pause fixing (default 60 min); monitoring continues");
     println!("  snifrig resume                     resume fixing");
+    println!("  snifrig run [--name X] -- CMD      run a heavy job when it is its turn (also: can-i-start, queue)");
     println!("  snifrig webhook URL|off            POST alerts as JSON to URL (opt-in, e.g. n8n)");
     println!("  snifrig uninstall                  remove login startup and stop the monitor");
     println!("  snifrig license accept             record acceptance of {}", LIC_VER);
@@ -721,6 +722,8 @@ pub fn run() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let flag = |n: &str| a.iter().position(|x| x == n).and_then(|i| a.get(i + 1)).cloned();
     let has = |n: &str| a.iter().any(|x| x == n);
+    // Before --help: the command after `run --` may carry its own flags.
+    if let Some(code) = crate::queue::cli(&a) { std::process::exit(code); }
     if has("--help") || has("-h") || a.first().map(|s| s == "help").unwrap_or(false) { usage(); return; }
     let dir = flag("--dir").map(PathBuf::from).unwrap_or_else(default_dir);
     let _ = fs::create_dir_all(&dir);

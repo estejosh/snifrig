@@ -10,6 +10,8 @@ macro_rules! println { ($($t:tt)*) => {{ use std::io::Write as _; let _ = writel
 macro_rules! eprintln { ($($t:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stderr(), $($t)*); }} }
 macro_rules! print { ($($t:tt)*) => {{ use std::io::Write as _; let _ = write!(std::io::stdout(), $($t)*); }} }
 
+pub mod queue;
+
 #[cfg(windows)]
 #[path = "monitor_windows.rs"]
 mod imp;
