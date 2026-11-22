@@ -62,7 +62,7 @@ pub fn record(dir: &Path, alert: &Alert, action: &Action, target: Option<&Target
     );
     let path = dir.join("fixes.jsonl");
     if fs::metadata(&path).map(|m| m.len() > FIXES_CAP).unwrap_or(false) {
-        let _ = fs::rename(&path, dir.join("fixes.jsonl.old"));
+        crate::archive::roll(dir, &path);
     }
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());

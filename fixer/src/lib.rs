@@ -35,6 +35,8 @@ pub mod game;
 pub mod junk;
 pub mod disk;
 pub mod drivers;
+pub mod requests;
+pub mod archive;
 pub mod crashguard;
 pub mod drivehealth;
 pub mod syswatch;

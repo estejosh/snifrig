@@ -498,7 +498,7 @@ pub fn append_feedback(dir: &Path, f: &Feedback) {
 fn append_episode(dir: &Path, e: &Episode) {
     let path = dir.join("learn.jsonl");
     if std::fs::metadata(&path).map(|m| m.len() > LEARN_CAP).unwrap_or(false) {
-        let _ = std::fs::rename(&path, dir.join("learn.jsonl.old"));
+        crate::archive::roll(dir, &path);
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(e.json().as_bytes());

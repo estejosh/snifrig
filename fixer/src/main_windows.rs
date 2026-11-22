@@ -913,6 +913,76 @@ fn drivers_rollback(dir: &Path, which: &[&str]) -> Result<String, String> {
     Ok(msg)
 }
 
+// ---- Rule requests (see requests.rs) ----
+
+fn request_card(dir: &Path, r: &snifrig_fix::requests::Request) {
+    let p = snifrig_fix::requests::parse_plan(&r.plan).unwrap_or_default();
+    add_card(dir, "rule_request", &r.from, &format!("request:{}", r.id),
+        &format!("{} asked: {}\nPlan ({}): {}", r.from, r.text, if r.analyst.is_empty() { "AI" } else { &r.analyst }, snifrig_fix::requests::plan_summary(&p)));
+}
+
+fn request_cmd(dir: &Path, cmd: &[&str]) -> Result<String, String> {
+    use snifrig_fix::requests as rq;
+    let fmt = |r: &rq::Request| format!("{} [{}] from {}{}: {}{}", r.id, r.status, r.from, if r.app.is_empty() { String::new() } else { format!(" about {}", r.app) }, r.text,
+        if r.note.is_empty() { String::new() } else { format!("\n    {}", r.note) });
+    match cmd {
+        ["add", from, app, text @ ..] if !text.is_empty() => {
+            let app = if *app == "-" { "" } else { app };
+            let r = rq::add(dir, from, app, &text.join(" "), rq::evidence(dir, &app.to_lowercase()), now_unix())?;
+            Ok(format!("request {} recorded. An AI looks at it next (a connected session, or the local AI after {} minutes); then you decide on a card. Check it with: snifrig-fix request status {}", r.id, rq::SESSION_FIRST_SECS as u64 / 60, r.id))
+        }
+        ["pending"] => {
+            let v: Vec<rq::Request> = rq::load(dir).into_iter().filter(|r| r.status == "new" || r.status == "refused").collect();
+            if v.is_empty() { return Ok("No requests waiting for analysis.".into()); }
+            Ok(v.iter().map(|r| format!("{}{}", rq::brief(r), if r.status == "refused" { format!("\nThe last plan was refused: {}", r.note) } else { String::new() })).collect::<Vec<_>>().join("\n\n=====\n\n"))
+        }
+        ["plan", id, analyst, text @ ..] if !text.is_empty() => {
+            let r = rq::take_plan(dir, id, analyst, &text.join(" ").replace("\\n", "\n"))?;
+            if r.status == "planned" { request_card(dir, &r); }
+            Ok(match r.status.as_str() {
+                "planned" => format!("plan for {} passed snifrig's checks; it waits for the owner's OK on a card", r.id),
+                "refused" => format!("plan for {} refused: {}. Send a different plan.", r.id, r.note),
+                s => format!("request {} closed as {}: {}", r.id, s, r.note),
+            })
+        }
+        ["approve", id] => {
+            let mut r = rq::get(dir, id).ok_or("no request with that id")?;
+            if r.status != "planned" { return Err(format!("that request is {}, not waiting for approval", r.status)); }
+            let ch = rq::check(dir, &rq::parse_plan(&r.plan)?)?;
+            r.undo = rq::apply(dir, &ch)?;
+            r.status = "applied".into();
+            r.applied_at = now_unix();
+            r.note = "applied; snifrig measures for a day and takes it back if the PC got worse".into();
+            rq::save(dir, &r);
+            remove_card(dir, &format!("request:{}", r.id));
+            let alert = snifrig_fix::Alert { t: String::new(), key: format!("request:{}", r.id), msg: r.text.clone() };
+            ledger::record(dir, &alert, &Action::Report, None, "done", &format!("request from {} applied: {}", r.from, ch.join("; ").replace('\t', " ")));
+            Ok(format!("applied: {}", ch.join("; ").replace('\t', " ")))
+        }
+        ["decline", id] => {
+            let mut r = rq::get(dir, id).ok_or("no request with that id")?;
+            r.status = "declined".into();
+            r.note = "declined by the owner".into();
+            rq::save(dir, &r);
+            remove_card(dir, &format!("request:{}", r.id));
+            Ok(format!("declined {}", r.id))
+        }
+        ["undo", id] => {
+            let mut r = rq::get(dir, id).ok_or("no request with that id")?;
+            if r.undo.is_empty() { return Err("nothing to undo for that request".into()); }
+            let done = rq::revert(dir, &r.undo);
+            r.status = "reverted".into();
+            r.note = format!("taken back by the owner: {}", done.join("; "));
+            r.undo.clear();
+            rq::save(dir, &r);
+            Ok(r.note.clone())
+        }
+        ["status", id] => rq::get(dir, id).map(|r| format!("{}\nPlan:\n{}", fmt(&r), if r.plan.is_empty() { "(none yet)" } else { &r.plan })).ok_or("no request with that id".into()),
+        ["status"] | ["list"] => { let v = rq::load(dir); Ok(if v.is_empty() { "No requests yet.".into() } else { v.iter().rev().take(20).map(|r| fmt(r)).collect::<Vec<_>>().join("\n") }) }
+        _ => Err("request add <from> <app|-> <text> | pending | plan <id> <analyst> <plan> | approve <id> | decline <id> | undo <id> | status [id]".into()),
+    }
+}
+
 fn drivers_note(dir: &Path, msg: &str) {
     let alert = snifrig_fix::Alert { t: String::new(), key: "drivers".into(), msg: msg.into() };
     ledger::record(dir, &alert, &Action::Report, None, "done", msg);
@@ -2182,6 +2252,8 @@ fn watch(dir: &Path) {
     let mut session: Option<snifrig_fix::game::Session> = None;
     let mut want_pid = 0u32;
     let mut drv_feel = snifrig_fix::drivers::Feel::default();
+    let req_ai_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut req_ai_tried: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     let _ = std::fs::remove_file(dir.join("frames-want"));
     let mut game_ease = snifrig_fix::game::load_ease(dir);
     let (mut gpu_seen, mut gpu_full) = (0.0f64, 0u32);
@@ -2502,6 +2574,46 @@ fn watch(dir: &Path) {
                 }
             }
         }
+        if n % 60 == 45 {
+            use snifrig_fix::requests as rq;
+            let t = now_unix();
+            for mut r in rq::load(dir).into_iter().filter(|r| r.status == "applied") {
+                if r.before_n == 0.0 {
+                    let (bn, b) = drv_feel.rate(r.applied_at - 86400.0, r.applied_at);
+                    r.before_n = bn.max(1) as f64; r.before = b; rq::save(dir, &r);
+                } else if t - r.applied_at > 86400.0 {
+                    let after = drv_feel.rate(r.applied_at, t);
+                    if snifrig_fix::drivers::worse((r.before_n as usize, r.before), after) {
+                        let done = rq::revert(dir, &r.undo);
+                        r.status = "reverted".into();
+                        r.note = format!("the PC felt slow {:.0}% of the time after the change, {:.0}% before, so snifrig took it back: {}", after.1 * 100.0, r.before * 100.0, done.join("; "));
+                        r.undo.clear(); rq::save(dir, &r); note(dir, &format!("request:{}", r.id), "done", &r.note);
+                    } else if t - r.applied_at > 2.0 * 86400.0 {
+                        r.status = "kept".into();
+                        r.note = if after.0 >= 2000 && r.before_n >= 1000.0 { format!("kept: felt slow {:.0}% of the time after, {:.0}% before", after.1 * 100.0, r.before * 100.0) } else { "kept: not enough measurements to judge either way".into() };
+                        rq::save(dir, &r);
+                    }
+                }
+            }
+            if dir.join(rq::AI_FILE).exists() && !req_ai_busy.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(r) = rq::load(dir).into_iter().find(|r| r.status == "new" && t - r.unix > rq::SESSION_FIRST_SECS && t - req_ai_tried.get(&r.id).copied().unwrap_or(0.0) > 1800.0) {
+                    req_ai_tried.insert(r.id.clone(), t);
+                    req_ai_busy.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let (d, busy) = (dir.to_path_buf(), req_ai_busy.clone());
+                    std::thread::spawn(move || {
+                        match rq::ask_local_ai(&d, &r) {
+                            Ok(text) => match rq::take_plan(&d, &r.id, "local AI", &text) {
+                                Ok(x) if x.status == "planned" => request_card(&d, &x),
+                                Ok(_) => {}
+                                Err(e) => { let mut x = r.clone(); x.note = format!("local AI answered, but not in the plan format: {}", e); rq::save(&d, &x); }
+                            },
+                            Err(e) => { let mut x = r.clone(); x.note = format!("local AI: {}", e); rq::save(&d, &x); }
+                        }
+                        busy.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+            }
+        }
         if n % 3600 == 2700 && sys::idle_secs() > 600.0 && gov.game.is_none() && !sys::fullscreen_d3d() {
             let fresh = snifrig_fix::drivers::load(dir).map_or(false, |s| now_unix() - (s.unix as f64) < 20.0 * 3600.0);
             if !fresh && license::status(dir).licensed { let d = dir.to_path_buf(); std::thread::spawn(move || drivers_check(&d)); }
@@ -2814,6 +2926,7 @@ pub fn main() {
         ["drivers", "not-now"] => { let s = snifrig_fix::drivers::load(&dir).unwrap_or_default(); snifrig_fix::drivers::hold(&dir, &s.updates.iter().map(|u| u.id.clone()).collect::<Vec<_>>()); println!("ok, snifrig will not offer these updates again (newer ones are offered)"); }
         ["drivers", "status"] => { let l = std::fs::read_to_string(admin_state().join("drivers-install.log")).unwrap_or_default(); let v: Vec<&str> = l.lines().collect(); println!("{}", if v.is_empty() { "no driver installs yet".to_string() } else { v[v.len().saturating_sub(15)..].join("\n") }); }
         ["drivers", "check"] => drivers_check(&dir),
+        ["request", rest @ ..] => out(request_cmd(&dir, rest)),
         ["frames"] | ["frames", "status"] => println!("{}", if dir.join("frames-on").exists() { "frame measuring is on (snifrig-frames runs from the scheduled task 'snifrig frames')" } else { "frame measuring is off. snifrig-fix frames on turns it on (Windows asks once)." }),
         ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: snifrig holds off for 2 minutes now, to compare"); }
         ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }

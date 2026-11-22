@@ -570,7 +570,7 @@ impl App {
 
     fn suggestion_card(&mut self, ui: &mut egui::Ui, s: &data::Suggestion, snooze: bool) {
         card(ui, |ui| {
-            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask" | "game_ask" | "model_differs" | "drivers_ready" | "drivers_slower" | "frozen" | "report");
+            let ours = matches!(s.kind.as_str(), "restart_desktop" | "shutdown_wsl" | "minimize_game" | "popup_guard" | "jobs_handback" | "take_over_task" | "impact_ask" | "game_ask" | "model_differs" | "drivers_ready" | "drivers_slower" | "frozen" | "report" | "rule_request");
             ui.horizontal(|ui| { chip(ui, if ours { "snifrig noticed" } else { "suggested by your AI assistant" }, BLUE); });
             ui.label(bold(s.summary(), 15.0).color(TEXT));
             ui.label(RichText::new(&s.reason).size(12.5).color(MUTED));
@@ -608,6 +608,13 @@ impl App {
                         }
                         if ui.button("Leave them all as they are").clicked() { self.dismiss_suggestion(s); }
                     });
+                } else if s.kind == "rule_request" {
+                    let id = s.rule.trim_start_matches("request:").to_string();
+                    if ui.add(egui::Button::new(RichText::new("Approve").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("snifrig makes the change, measures for a day, and takes it back if the PC got worse.").clicked() {
+                        self.run("snifrig-fix.exe", vec!["request".into(), "approve".into(), id.clone()], "Applied. snifrig measures it for a day.");
+                        self.dismiss_suggestion(s);
+                    }
+                    if ui.button("Decline").clicked() { self.run("snifrig-fix.exe", vec!["request".into(), "decline".into(), id], "Declined."); self.dismiss_suggestion(s); }
                 } else if s.kind == "drivers_ready" {
                     if ui.add(egui::Button::new(RichText::new("Yes, when I am away").color(Color32::BLACK)).fill(ACCENT)).on_hover_text("The first time, Windows asks you to confirm the driver helper.").clicked() {
                         self.run("snifrig-fix.exe", vec!["drivers".into(), "update".into(), "all".into()], "snifrig installs them the next time you are away.");

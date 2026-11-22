@@ -42,6 +42,7 @@ impl Suggestion {
             "shutdown_wsl" => "WSL is using a lot of your CPU".into(),
             "drivers_ready" => "Driver updates from the manufacturers".into(),
             "drivers_slower" => "Your PC got slower after the driver update".into(),
+            "rule_request" => format!("A request from {}", self.app),
             "minimize_game" => format!("{} is hidden but still drawing", self.app),
             "impact_ask" => "Can I run a small test?".into(),
             "game_ask" => format!("How did {} run?", self.app),
