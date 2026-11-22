@@ -218,6 +218,9 @@ pub fn judge(d: &Drive, prev: Option<&Seen>, now: f64, uses: &[String]) -> (Vec<
     (out, Some(Seen { base_unix: base.0, base_written: base.1, media: h.media_errors, unsafe_shutdowns: h.unsafe_shutdowns }))
 }
 
+/// Free GB under which a volume of `total` GB counts as low.
+pub fn low_line(total: f64) -> f64 { (total * 0.05).clamp(10.0, 200.0).min(total * 0.5) }
+
 /// Free space over time per volume, sampled each minute; keeps the last 30 minutes.
 #[derive(Default)]
 pub struct Space { hist: HashMap<char, Vec<(f64, f64)>> }
@@ -239,8 +242,10 @@ impl Space {
             h.push((now, free));
             h.retain(|&(t, _)| now - t <= 1800.0);
             if total <= 0.0 { continue; }
-            // Low: under 5% of the volume, at least 10 GB and at most 50 GB (and never over half).
-            if free < (total * 0.05).clamp(10.0, 50.0).min(total * 0.5) { out.push(SpaceStep::Low { letter: l, free_gb: free, total_gb: total }); }
+            // Low: under 5% of the volume, at least 10 GB and at most 200 GB (and never over half).
+            // A 4 TB data drive warns under 200 GB free: builds, models and training runs write
+            // tens of GB at a time, so 50 GB (the old cap) came too late to act on.
+            if free < low_line(total) { out.push(SpaceStep::Low { letter: l, free_gb: free, total_gb: total }); }
             // Pace over the window: only a steady drop counts, not one big copy that finished.
             if let Some(&(t0, f0)) = h.iter().find(|&&(t, _)| now - t >= 600.0) {
                 let mins = (now - t0) / 60.0;
@@ -530,7 +535,12 @@ mod tests {
         let mut last = Vec::new();
         for m in 0..=12 { last = s.tick(m as f64 * 60.0, &[('C', 52.0 - m as f64, 2000.0)]); }
         assert!(last.iter().any(|x| matches!(x, SpaceStep::Filling { letter: 'C', .. })), "{:?}", last);
-        assert!(last.iter().any(|x| matches!(x, SpaceStep::Low { .. })), "40 GB of 2 TB is under the 50 GB cap");
+        assert!(last.iter().any(|x| matches!(x, SpaceStep::Low { .. })), "40 GB of 2 TB is under 5% (100 GB)");
+        // The line: 4 TB warns under 200 GB, 500 GB under 25, 100 GB under 10, 15 GB under 7.5.
+        assert_eq!((low_line(4000.0), low_line(500.0), low_line(100.0), low_line(15.0)), (200.0, 25.0, 10.0, 7.5));
+        // X: on 22 Nov: 43 GB of 4 TB free is low (the old 50 GB cap also caught it, but late).
+        assert!(Space::default().tick(0.0, &[('X', 43.0, 4000.0)]).iter().any(|x| matches!(x, SpaceStep::Low { letter: 'X', .. })));
+        assert!(Space::default().tick(0.0, &[('X', 250.0, 4000.0)]).is_empty());
         // A copy that finished (no recent drop) is not "filling".
         let mut s = Space::default();
         for m in 0..=12 { last = s.tick(m as f64 * 60.0, &[('D', if m < 3 { 50.0 } else { 40.0 }, 100.0)]); }

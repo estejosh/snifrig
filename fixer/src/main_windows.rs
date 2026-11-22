@@ -2409,12 +2409,18 @@ fn watch(dir: &Path) {
             // background program on disk is frozen (one click to resume) so the PC keeps working.
             let sysdrive = std::env::var("SystemDrive").ok().and_then(|s| s.chars().next()).unwrap_or('C').to_ascii_uppercase();
             let busiest = disk.top.iter().take(3).map(|t| format!("{} ({:.0} MB/s)", t.2, t.3)).collect::<Vec<_>>().join(", ");
-            for st in space.tick(now_unix(), &vols) {
+            let steps = space.tick(now_unix(), &vols);
+            // One "low" card per drive while it stays low; once it has room again the card may
+            // come back the next time it runs low.
+            for &(l, _, _) in &vols {
+                if !steps.iter().any(|s| matches!(s, snifrig_fix::drivehealth::SpaceStep::Low { letter, .. } if *letter == l)) { drive_said.remove(&format!("space:low:{}", l)); }
+            }
+            for st in steps {
                 use snifrig_fix::drivehealth::SpaceStep;
                 let sys_note = |l: char| if l == sysdrive { " This is the Windows drive: with no room for the page file, apps crash and the PC can freeze." } else { "" };
                 match st {
                     SpaceStep::Low { letter, free_gb, total_gb } => {
-                        let rule = format!("space:low:{}:{:.0}", letter, (now_unix() / 21600.0).floor());
+                        let rule = format!("space:low:{}", letter);
                         let msg = format!("{}: has {:.1} GB free of {:.0} GB.{} Open snifrig's clean-up (junk scan) to see what can go, or move big folders (models, outputs, builds) to another drive.", letter, free_gb, total_gb, sys_note(letter));
                         if drive_said.insert(rule.clone()) { add_card(dir, "note", &format!("{}:", letter), &rule, &msg); note(dir, "space:low", "done", &msg); }
                     }
