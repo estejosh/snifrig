@@ -24,7 +24,7 @@ const PENDING_CAP: usize = 20;
 const RECENT_AUTO_SECS: f64 = 7200.0;
 
 #[derive(Clone, Debug, Default)]
-pub struct Pending { pub id: String, pub unix: f64, pub key: String, pub msg: String, pub action: String, pub pid: u32, pub name: String, pub why: String }
+pub struct Pending { pub id: String, pub unix: f64, pub key: String, pub msg: String, pub action: String, pub pid: u32, pub name: String, pub why: String, pub what: String }
 
 fn read_text(p: &Path) -> String {
     fs::read_to_string(p).unwrap_or_default()
@@ -102,7 +102,10 @@ pub fn queue(dir: &Path, alert: &Alert, action: &Action, t: &Target, why: &str) 
         action: label,
         pid: t.pid,
         name: t.name.clone(),
-        why: why.to_string(),
+        // The numbers behind the alert, so the card says how bad it is, not just what kind.
+        why: match crate::whois::growth(&alert.msg) { Some(g) => format!("{} ({}).", why.trim_end_matches('.'), g), None => why.to_string() },
+        // What the program is and who starts it, so the user can decide (27 Nov: "DPM.exe?").
+        what: crate::whois::describe(dir, t.pid, &t.name, t.service.as_deref()),
     });
     save_pending(dir, &items);
     Some(id)
@@ -155,6 +158,7 @@ fn parse_item(o: &str) -> Option<Pending> {
         pid: num_field(o, "pid").unwrap_or(0.0) as u32,
         name: str_field(o, "name").unwrap_or_default(),
         why: str_field(o, "why").unwrap_or_default(),
+        what: str_field(o, "what").unwrap_or_default(),
     })
 }
 
@@ -177,7 +181,7 @@ pub fn save_pending(dir: &Path, items: &[Pending]) {
             s.push(',');
         }
         s.push_str(&format!(
-            "{{\"id\":\"{}\",\"unix\":{},\"key\":\"{}\",\"msg\":\"{}\",\"action\":\"{}\",\"pid\":{},\"name\":\"{}\",\"why\":\"{}\"}}",
+            "{{\"id\":\"{}\",\"unix\":{},\"key\":\"{}\",\"msg\":\"{}\",\"action\":\"{}\",\"pid\":{},\"name\":\"{}\",\"why\":\"{}\",\"what\":\"{}\"}}",
             esc(&p.id),
             p.unix,
             esc(&p.key),
@@ -185,7 +189,8 @@ pub fn save_pending(dir: &Path, items: &[Pending]) {
             esc(&p.action),
             p.pid,
             esc(&p.name),
-            esc(&p.why)
+            esc(&p.why),
+            esc(&p.what)
         ));
     }
     s.push_str("]}\n");
@@ -285,6 +290,7 @@ mod tests {
             pid: 42,
             name: "we,ird\".exe".into(),
             why: "a, \"b\"".into(),
+            what: "x is a \"test\"".into(),
         }];
         save_pending(&d, &items);
         let back = load_pending(&d);

@@ -20,7 +20,7 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 pub struct Held { pub pid: u32, pub name: String, pub level: u8, pub reason: String, pub since: f64 }
 
 #[derive(Clone, Default)]
-pub struct Pending { pub id: String, pub name: String, pub pid: u32, pub action: String, pub why: String, pub msg: String }
+pub struct Pending { pub id: String, pub name: String, pub pid: u32, pub action: String, pub why: String, pub msg: String, pub what: String }
 
 #[derive(Clone, Default)]
 pub struct Event { pub unix: f64, pub key: String, pub name: String, pub action: String, pub status: String, pub note: String }
@@ -223,7 +223,7 @@ pub fn load_state(dir: &Path, with_history: bool, old: &State) -> State {
         game: Some(gov.get("game").str().to_string()).filter(|g| !g.is_empty()),
         held: gov.get("demoted").arr().iter().map(|d| Held { pid: d.get("pid").num() as u32, name: d.get("name").str().into(), level: d.get("level").num() as u8, reason: d.get("reason").str().into(), since: d.get("since").num() }).collect(),
         suggestions: gov.get("suggestions").arr().iter().map(|d| (d.get("name").str().to_string(), d.get("count").num() as u32)).collect(),
-        pending: read_json(dir, "pending.json").get("items").arr().iter().map(|p| Pending { id: p.get("id").str().into(), name: p.get("name").str().into(), pid: p.get("pid").num() as u32, action: p.get("action").str().into(), why: p.get("why").str().into(), msg: p.get("msg").str().into() }).collect(),
+        pending: read_json(dir, "pending.json").get("items").arr().iter().map(|p| Pending { id: p.get("id").str().into(), name: p.get("name").str().into(), pid: p.get("pid").num() as u32, action: p.get("action").str().into(), why: p.get("why").str().into(), msg: p.get("msg").str().into(), what: p.get("what").str().into() }).collect(),
         events: Vec::new(),
         gpu: Gpu { ok: t - gpu.get("unix").num() < 900.0, temp_c: gpu.get("temp_c").num(), power_w: gpu.get("power_w").num(), limit_w: gpu.get("limit_w").num(), mhz: gpu.get("sm_mhz").num(), max_mhz: gpu.get("sm_max_mhz").num(), used_mb: gpu.get("used_mb").num(), total_mb: gpu.get("total_mb").num(), reasons: gpu.get("reasons").str().into() },
         brain: read(dir, "brain-cache.json").lines().filter_map(json::parse).map(|j| Brain { name: j.get("name").str().into(), kind: j.get("kind").str().into(), confidence: j.get("confidence").num() }).collect(),

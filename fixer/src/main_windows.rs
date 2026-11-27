@@ -2933,6 +2933,20 @@ pub fn main() {
         ["drivers", "status"] => { let l = std::fs::read_to_string(admin_state().join("drivers-install.log")).unwrap_or_default(); let v: Vec<&str> = l.lines().collect(); println!("{}", if v.is_empty() { "no driver installs yet".to_string() } else { v[v.len().saturating_sub(15)..].join("\n") }); }
         ["drivers", "check"] => drivers_check(&dir),
         ["request", rest @ ..] => out(request_cmd(&dir, rest)),
+        // What a program is (whois.rs): taught by the user ("teach") or an AI session ("learn").
+        ["whois", how @ ("teach" | "learn"), key, text @ ..] if !text.is_empty() => {
+            snifrig_fix::whois::teach(&dir, key, &text.join(" "), if *how == "teach" { "user" } else { "ai" });
+            println!("learned: {} = {}", key, text.join(" "));
+        }
+        ["whois", "unknown"] => {
+            let u = snifrig_fix::whois::unknown(&dir);
+            if u.is_empty() { println!("snifrig knows every program it has asked about."); }
+            for (k, from) in u { println!("{}\t{}", k, from); }
+        }
+        ["whois", who] => match who.parse::<u32>().ok().or_else(|| sys::snapshot(&mut Vec::new()).into_iter().find(|p| p.name.eq_ignore_ascii_case(who)).map(|p| p.pid)) {
+            Some(pid) => println!("{}", snifrig_fix::whois::describe(&dir, pid, &snifrig_fix::proc::image_name(pid).unwrap_or_else(|| who.to_string()), None)),
+            None => println!("{}", snifrig_fix::whois::learned(&dir, "", who).unwrap_or_else(|| format!("{} is not running and snifrig has not learned what it is.", who))),
+        },
         ["frames"] | ["frames", "status"] => println!("{}", if dir.join("frames-on").exists() { "frame measuring is on (snifrig-frames runs from the scheduled task 'snifrig frames')" } else { "frame measuring is off. snifrig-fix frames on turns it on (Windows asks once)." }),
         ["impact", "test"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::NOW_FILE), "1"); println!("asked: snifrig holds off for 2 minutes now, to compare"); }
         ["impact", "off"] => { let _ = std::fs::write(dir.join(snifrig_fix::impact::OFF_FILE), "1"); println!("impact tests are off"); }

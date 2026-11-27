@@ -115,6 +115,12 @@ fn build(pid: u32, svcs: &[(u32, String)]) -> Option<Target> {
 
 pub fn target(pid: u32) -> Option<Target> { build(pid, &services()) }
 
+/// The one Win32 service pid hosts, if it hosts exactly one.
+pub fn service_of(pid: u32) -> Option<String> {
+    let s: Vec<String> = services().into_iter().filter(|s| s.0 == pid).map(|s| s.1).collect();
+    (s.len() == 1).then(|| s[0].clone())
+}
+
 pub fn top_private(n: usize) -> Vec<Target> {
     let me = std::process::id();
     let mut pids = Vec::new();

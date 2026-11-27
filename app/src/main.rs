@@ -542,6 +542,8 @@ impl App {
                 ui.label(bold(&p.name, 15.0).color(TEXT));
                 chip(ui, action_label(&p.action), if p.action == "terminate" { BAD } else { BLUE });
             });
+            // What the program is first (who makes it, what starts it), then why snifrig is asking.
+            if !p.what.is_empty() { ui.label(RichText::new(&p.what).size(12.5).color(TEXT)); }
             ui.label(RichText::new(if p.why.is_empty() { &p.msg } else { &p.why }).size(12.5).color(MUTED));
             ui.horizontal(|ui| {
                 let ends = p.action == "terminate" || p.action.starts_with("restart");
