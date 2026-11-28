@@ -2382,6 +2382,8 @@ fn watch(dir: &Path) {
         if n % 60 == 30 && mode != Mode::Off { disk_probe_start(n % 300 == 30); }
         if (n == 20 || n % 3600 == 20) && mode != Mode::Off { drive_probe_start(); }
         if n % 60 == 45 { keep_alive(dir, &mut alive); }
+        // What runs, every 10 minutes: the program review (programs.rs) learns from it what is used.
+        if n % 600 == 310 { snifrig_fix::programs::note_seen(dir, &snifrig_fix::programs::win::running_paths(), now_unix()); }
         let act_now = matches!(mode, Mode::Ask | Mode::Auto) && !paused;
         if let Some(r) = DRIVE_PROBE.lock().ok().and_then(|mut g| g.take()) { drive_report(dir, r, &mut drive_said); }
         if let Some((vols, floods)) = disk_check(dir) {
@@ -2938,6 +2940,22 @@ pub fn main() {
             snifrig_fix::whois::teach(&dir, key, &text.join(" "), if *how == "teach" { "user" } else { "ai" });
             println!("learned: {} = {}", key, text.join(" "));
         }
+        // The program review (programs.rs): what is needed, used, extra; decisions; removal.
+        ["programs"] => print!("{}", snifrig_fix::programs::report(&dir, now_unix())),
+        ["programs", "tsv"] => print!("{}", snifrig_fix::programs::tsv(&dir, now_unix())),
+        ["programs", v @ ("keep" | "remove" | "needed"), name, why @ ..] => {
+            let by = if why.contains(&"--ai") { "ai" } else { "user" };
+            snifrig_fix::programs::set_verdict(&dir, name, v, &why.iter().filter(|w| **w != "--ai").copied().collect::<Vec<_>>().join(" "), by);
+            println!("noted: {} = {}", name, v);
+        }
+        ["programs", "uninstall", name] => match snifrig_fix::programs::uninstall_command(&dir, name) {
+            // The program's own uninstaller; Windows asks the user for permission when it needs it.
+            Some(c) => { use std::os::windows::process::CommandExt; match std::process::Command::new("cmd").args(["/c", "start", "", "/wait"]).raw_arg(&c).status() {
+                Ok(s) => println!("{}'s uninstaller finished ({})", name, s.code().unwrap_or(-1)),
+                Err(e) => { eprintln!("could not start {}'s uninstaller: {}", name, e); std::process::exit(1) }
+            } }
+            None => { eprintln!("{} has no uninstaller snifrig can find", name); std::process::exit(1) }
+        },
         ["whois", "unknown"] => {
             let u = snifrig_fix::whois::unknown(&dir);
             if u.is_empty() { println!("snifrig knows every program it has asked about."); }

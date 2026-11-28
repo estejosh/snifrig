@@ -40,6 +40,7 @@ pub mod archive;
 pub mod crashguard;
 pub mod drivehealth;
 pub mod whois;
+pub mod programs;
 pub mod syswatch;
 
 /// What the fixer can do, mildest first.
